@@ -63,3 +63,22 @@ this project are prefixed **`GOV-`**. Connection details are in `.claude/launch-
   prompts. The grant path is exit 0 with empty stdout.
 - **Measure before you control.** Phase 0 (GOV-01/02) is instrumentation only, and its traces
   are what tune the setpoint. Do not skip ahead to the control loop and guess at constants.
+- **Install is reversible and idempotent.** Running install twice is a no-op the second time;
+  uninstall leaves no file, hook, setting or process behind. Never blind-write the user's
+  `settings.json` - read, back up, merge, write atomically, and keep the backup so uninstall
+  can restore it exactly. What is being asked of a stranger here is to run a hook on every
+  subagent spawn, and the only thing that makes that reasonable is being able to undo it.
+- **Seams are one interface with one implementation.** `internal/transport`, `internal/budget`,
+  `internal/lease.Liveness`, `internal/signals` and `internal/config` exist so tier two
+  (design.md section 12) never has to be retrofitted. Do NOT write a second implementation of
+  any of them before tier two actually exists - if a change needs one to compile, it is
+  premature. Equally, do not collapse the interface away because there is only one impl.
+- **Defaults come from the machine, not from a constant.** `governor calibrate` measures this
+  host and writes the numbers. Nothing tuned on Peter's laptop ships as anyone else's default.
+- **macOS and Linux, both, from the start.** Anything platform-specific goes behind the
+  `Sampler` interface with a `_darwin.go` / `_linux.go` pair. Thermal has no Linux equivalent
+  and reports `unknown`, which is treated as nominal - never as a cut trigger.
+- **Every protocol message carries `v`.** An unrecognised version is answered, not ignored,
+  and the gate treats that answer like an unreachable daemon. During an upgrade there will be
+  a daemon of one version and gates of another; ungoverned spawns are acceptable, a stalled
+  session is not.
