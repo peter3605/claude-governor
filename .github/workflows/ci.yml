@@ -1,8 +1,14 @@
 name: ci
 
+# push only: a pull_request trigger would double every run, and check runs land on the
+# head SHA either way, so a PR shows these same results.
 on:
   push:
-  pull_request:
+
+# A new push supersedes the run it interrupted.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   check:
