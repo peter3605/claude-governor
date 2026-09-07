@@ -1,0 +1,59 @@
+name: ci
+
+# push only: a pull_request trigger would double every run, and check runs land on the
+# head SHA either way, so a PR shows these same results.
+on:
+  push:
+
+# A new push supersedes the run it interrupted.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    name: vet and test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26'
+      - name: gofmt
+        run: |
+          unformatted=$(gofmt -l ./cmd ./internal)
+          if [ -n "$unformatted" ]; then
+            echo "gofmt needed on:"; echo "$unformatted"; exit 1
+          fi
+      - run: go vet ./...
+      - run: go test ./...
+
+  build:
+    name: build ${{ matrix.goos }}/${{ matrix.goarch }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # darwin builds keep cgo on: the thermal shim (GOV-13) reads
+          # ProcessInfo.thermalState through cgo, so this must not be locked off.
+          - { runner: macos-latest, goos: darwin, goarch: arm64, cgo: '1' }
+          - { runner: macos-latest, goos: darwin, goarch: amd64, cgo: '1' }
+          # linux has no thermal API and needs no cgo, which keeps the binary static.
+          - { runner: ubuntu-latest, goos: linux, goarch: arm64, cgo: '0' }
+          - { runner: ubuntu-latest, goos: linux, goarch: amd64, cgo: '0' }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26'
+      - name: build
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: ${{ matrix.cgo }}
+        run: go build -o bin/governor-${{ matrix.goos }}-${{ matrix.goarch }} ./cmd/governor
+      - uses: actions/upload-artifact@v4
+        with:
+          name: governor-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: bin/governor-${{ matrix.goos }}-${{ matrix.goarch }}
