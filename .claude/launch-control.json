@@ -1,0 +1,37 @@
+{
+  "project": "claude-governor",
+  "prefix": "GOV",
+  "hub": "https://www.notion.so/3d1074d920fe81b6b40bcd952f1def9e",
+  "projectPageId": "3d4074d9-20fe-8163-bf9d-f0aa7f4d0d4f",
+  "stories": {
+    "database": "https://www.notion.so/f4f17e2c8b2e489b9b4a1cf324c3ac5e",
+    "dataSource": "collection://20111610-fb05-447d-bee2-faa40d009311"
+  },
+  "projects": {
+    "database": "https://www.notion.so/b980271106074cdaa26d921641305d45",
+    "dataSource": "collection://993502bc-6e35-4171-8f53-41c70c0d2fd1"
+  },
+  "views": {
+    "ready": "https://www.notion.so/f4f17e2c8b2e489b9b4a1cf324c3ac5e?v=3d1074d920fe8157a76f000c89a152ea",
+    "inProgress": "https://www.notion.so/f4f17e2c8b2e489b9b4a1cf324c3ac5e?v=3d1074d920fe81e58111000ca326388d",
+    "waitingExternal": "https://www.notion.so/f4f17e2c8b2e489b9b4a1cf324c3ac5e?v=3d1074d920fe811da8eb000c75b14c78",
+    "board": "https://www.notion.so/f4f17e2c8b2e489b9b4a1cf324c3ac5e?v=3d1074d920fe8173bfdf000cdef38cd2",
+    "yourTurn": "https://www.notion.so/f4f17e2c8b2e489b9b4a1cf324c3ac5e?v=3d1074d920fe818a80f3000c6247c43f",
+    "inReview": "https://www.notion.so/f4f17e2c8b2e489b9b4a1cf324c3ac5e?v=3d1074d920fe81748620000c586d8226",
+    "road": "https://www.notion.so/f4f17e2c8b2e489b9b4a1cf324c3ac5e?v=3d4074d920fe817190c8000c9d1d8de6"
+  },
+  "note": "Prefer query_data_sources in VIEW mode - it has no quota on this Notion plan. SQL mode is metered.",
+  "dependencies": "'Blocked by' is a RELATION (pass page URLs, not story IDs). 'Blocked by IDs' and 'Blocker status' are rollups - they render in Notion's UI but return opaque handles to the API, so resolve blockers by fetching the linked pages. Status=Ready already means unblocked.",
+  "git": {
+    "enabled": true,
+    "baseBranch": "main",
+    "mergeMethod": "squash",
+    "autoMerge": true,
+    "mergeIsDeploy": false,
+    "ciTimeoutMinutes": 15,
+    "extraChecks": [],
+    "notes": "No remote yet - the repo is local-only until GOV-04. Until a GitHub remote exists, /done should commit on the story branch, merge to main locally, and say plainly that no PR was opened rather than pretending CI passed."
+  },
+  "viewContract": "Every project has its own 'road' view, filtered to that project and nothing else. Commands MUST scope by views.road - never by a shared browse view, whose filters anyone can change in the Notion UI.",
+  "notice": "**Nothing here is built yet.** The spec is `docs/design.md` and it is the contract - read it before writing code.\n\n**Four facts in design.md §10 are UNCONFIRMED against the Claude Code version on this machine**: whether the subagent-spawning tool is matched as `Task` or `Agent`, the shape of its `tool_input`, whether `SubagentStart` fires for every spawn and can be correlated to `tool_use_id`, and the hook timeout ceiling. GOV-01 exists to settle all four. Do not build the gate on a guess - a wrong tool name means the hook silently never fires and everything downstream looks like it works.\n\n**The hot path is Go, and only Go.** The gate runs on every single subagent spawn inside a hook Claude Code is blocked on. Do not prototype it in Python or shell 'just to get moving' - the interpreter startup is the entire thing being avoided.\n\n**Fail open before anything else.** GOV-05 lands the fail-open path and its test before the daemon exists. A gate that can hang or crash without the spawn proceeding is worse than no governor, because it fails silently and the user blames Claude Code.\n\n**Never emit `permissionDecision: \"allow\"`.** It suppresses Peter's own permission prompts as a side effect. The grant path is exit 0 with empty stdout.\n\n**No sudo, ever.** `powermetrics` is off limits. Thermal comes from `ProcessInfo.thermalState` via a small shim (GOV-13).\n\nDeletion is restricted in ~/Repos for agent sessions: `rm` fails with 'Operation not permitted'. git's rename-based paths work fine, but a stale `.git/index.lock` can be left behind - `mv` it into `_to_delete/` rather than fighting it."
+}

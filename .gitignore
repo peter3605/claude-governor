@@ -1,0 +1,7 @@
+bin/
+dist/
+*.jsonl
+.claude/.current-story
+.claude/.nudged
+_to_delete/
+.DS_Store
