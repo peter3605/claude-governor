@@ -10,9 +10,10 @@ budget for the whole laptop; every session asks it before fanning out, and gets 
 number instead of guessing one.
 
 This document is the spec a session implements from. Where it says MUST, treat it as an
-invariant and write a test for it. Where it says "verify", the fact is not yet confirmed
-against this machine's Claude Code version — see [Unknowns](#unknowns) — and a session that
-needs it MUST confirm it first rather than assuming.
+invariant and write a test for it. The hook surface it builds on is **confirmed** against
+Claude Code 2.1.263 — see §10 for the conclusions and
+[hook-surface.md](hook-surface.md) for the raw evidence. §10.3 lists what remains unmeasured;
+a session that needs one of those MUST measure it first rather than assuming.
 
 ---
 
@@ -117,7 +118,8 @@ a test.
   "hooks": {
     "PreToolUse":    [{ "matcher": "Agent|Task",
                         "hooks": [{ "type": "command",
-                                    "command": "${CLAUDE_PLUGIN_ROOT}/bin/governor gate" }] }],
+                                    "command": "${CLAUDE_PLUGIN_ROOT}/bin/governor gate",
+                                    "timeout": 30 }] }],
     "SubagentStart": [{ "hooks": [{ "type": "command",
                                     "command": "${CLAUDE_PLUGIN_ROOT}/bin/governor confirm" }] }],
     "SubagentStop":  [{ "hooks": [{ "type": "command",
@@ -131,8 +133,14 @@ a test.
 ```
 
 The matcher is a regex covering both `Agent` and `Task` because the subagent-spawning tool
-has been named both across versions. Confirm which one this machine uses (§10) but keep the
-regex regardless — it costs nothing and survives the next rename.
+has been named both across versions. On 2.1.263 the payload's `tool_name` is **`Agent`**, and
+a `Task` matcher fires for it too (§10.1) — keep the regex regardless, it costs nothing and
+survives the next rename, but branch on `Agent` when reading the payload.
+
+`timeout` is set explicitly rather than inherited: the default was measured at over 150 s with
+no established ceiling (§10.1), which is not a number to build a wait window on. 30 s gives the
+20 s `wait_max` headroom. It bounds the *wait*, not the failure path — the 100 ms connect
+deadline in §4.4 is what protects the session from a wedged daemon.
 
 ### 4.2 Decision table
 
@@ -170,10 +178,22 @@ The tentative state exists because `PreToolUse` fires before the spawn and the s
 never happen — the user declines the permission prompt, the turn is interrupted, the model
 changes its mind. A tentative lease that is not confirmed within its TTL is reclaimed.
 
-Correlating the confirm to the right tentative lease needs a key that appears in both hook
-payloads. `tool_use_id` (PreToolUse) and `agent_id` (SubagentStart) are the candidates; if
-they cannot be correlated (§10), fall back to per-session FIFO — confirm the oldest tentative
-lease for that `session_id`, which is correct as long as spawns within a session are ordered.
+**Correlation is per-session FIFO.** This is settled, not a fallback: `SubagentStart` carries
+no `tool_use_id` and shares no per-spawn key with `PreToolUse` (§10.1). Confirm binds the
+oldest unconfirmed tentative lease for that `session_id`. Measured correct 4/4 against
+ground truth under a four-call burst, because `PreToolUse` and `SubagentStart` strictly
+interleave — but that ordering is observed, not promised, so the reaper is what makes a
+mispairing survivable rather than corrupting.
+
+Two measured hazards the implementation MUST handle:
+
+- `SubagentStart` also fires on **resume** (`SendMessage` to a running agent), so one agent can
+  produce several. **Confirm MUST be idempotent per `agent_id`**: a confirm for an `agent_id`
+  that already holds a confirmed lease is a no-op, not a second lease and not a FIFO pop.
+  `SubagentStop` likewise fires more than once; release MUST tolerate it.
+- A resumed subagent reaches the CPU with **no `PreToolUse(Agent)` at all**. The gate cannot
+  see it and v1 does not govern it. A confirm with an empty tentative queue MUST be dropped
+  quietly rather than treated as an error.
 
 ### 4.4 Performance budget
 
@@ -260,6 +280,11 @@ session cannot starve a quiet one.
 Only depth-0 fan-out consumes leases. Depth > 1 is denied outright. This is the simplest
 correct answer to the nested-deadlock failure (all slots held by agents themselves waiting
 for slots), and nested fan-out is rarely what was wanted.
+
+**Depth is read from the presence of a top-level `agent_id` in the `PreToolUse` payload**
+(absent ⇒ depth 0, present ⇒ the caller is itself a subagent). There is no depth field, and
+Claude Code does **not** refuse nested spawns on its own — measured `max_depth: 2`,
+`refused.depth_limit: 0` (§10.1). This invariant is entirely the governor's to enforce.
 
 ---
 
@@ -369,18 +394,90 @@ trustworthy. Ship it in Phase 1, not as polish.
 
 ---
 
-## 10. Unknowns — verify before Phase 1
+## 10. Hook surface — confirmed
 
-The hook surface has moved across Claude Code versions. Each of these is a five-minute check
-and getting one wrong costs a day. Register a throwaway `PreToolUse` hook that dumps stdin to
-a file, spawn one subagent, and read the result.
+**Confirmed against `claude --version` = `2.1.263 (Claude Code)` on macOS/arm64, 2026-09-07
+(GOV-01).** Raw payloads are in [hook-surface.md](hook-surface.md); this section is the
+conclusion only. Nothing below is inferred from documentation. A session that needs a
+detail not stated here MUST measure it and extend both files, not guess.
 
-1. **Tool name.** Is the subagent-spawning tool matched as `Task` or `Agent` on this version?
-2. **`tool_input` shape.** Not publicly documented. Which fields carry agent type and spawn depth?
-3. **`SubagentStart` reliability.** Does it fire for every granted spawn, and can `agent_id`
-   be correlated back to `tool_use_id`? If not, §4.3's FIFO fallback is the design.
-4. **Hook timeout ceiling.** Confirm it before committing to a 20 s block-and-wait. A shorter
-   ceiling shrinks the wait window and pushes load onto the deny path.
+### 10.1 The four answers
+
+**1. Tool name — `Agent`, and a `Task` matcher also fires.**
+`tool_name` on the wire is `Agent`. A hook registered with `matcher: "Task"` fired for it
+anyway; `Task` is carried as an alias. Both spellings are live *within this one version* —
+the same run reported the same tool as `Task` in its `permission_denials`. So: keep the
+`Agent|Task` regex in §4.1, and match on the **payload** value `Agent` in code. Registering
+only `Task` would have worked by luck; relying on the payload saying `Task` would not.
+
+**2. `tool_input` shape — `{description, prompt, subagent_type?, run_in_background}`.**
+`subagent_type` carries the agent type but is **optional** — it was absent on a nested spawn.
+`run_in_background` is a bool and background subagents cost the same CPU, so they take a
+lease like any other. **There is no depth field.**
+
+**Depth comes from the top-level `agent_id`, not from `tool_input`.** A `PreToolUse` whose
+payload has no top-level `agent_id` was issued by the main session (depth 0). One that has it
+was issued by a subagent (depth ≥ 1), and the value names the *parent*. That single test is
+all §6.3 needs. It also matters that Claude Code does **not** refuse nested spawns itself —
+measured `max_depth: 2`, `spawned_by_subagents: 1`, `refused.depth_limit: 0` — so the depth
+invariant is entirely the governor's to enforce.
+
+**3. `SubagentStart` — cannot be correlated by ID, and does not fire once per spawn.**
+
+`SubagentStart` carries `{session_id, transcript_path, cwd, prompt_id, agent_id, agent_type,
+hook_event_name}`. It carries **no `tool_use_id`**, and shares no other field with
+`PreToolUse` that is unique to one spawn (`prompt_id` is per turn, not per spawn). The
+`tool_use_id → agentId` binding does exist, but only in the `Agent` tool's **`PostToolUse`**
+`tool_response`, which for a foreground spawn arrives *after the agent has finished*.
+
+**Therefore §4.3's per-session FIFO fallback is the design, not a contingency.** It was
+validated, not merely assumed: forcing four `Agent` calls into a single assistant message and
+popping the oldest unconfirmed `tool_use_id` on each `SubagentStart` reproduced the
+`PostToolUse` ground-truth pairing 4/4, in both foreground and background runs. `PreToolUse`
+and `SubagentStart` strictly interleave — each `SubagentStart` lands 35–60 ms after its own
+`PreToolUse` and before the next one, even in a four-call burst. This ordering is *observed
+and unpromised*; the reaper (invariant 2) is what keeps a mispairing survivable.
+
+Worse than the missing ID, and the thing to design against:
+
+- **`SubagentStart` is a start-*or*-resume signal.** One spawn produced **two**
+  `SubagentStart` events with the same `agent_id` (and two `SubagentStop`s) — the second when
+  `SendMessage` resumed the agent. Confirm MUST be idempotent per `agent_id`, and release
+  MUST tolerate firing twice.
+- **`SendMessage` resumes a subagent with no `PreToolUse(Agent)` anywhere.** That is a live
+  subagent burning CPU that the gate never sees. v1 cannot govern it; the daemon should at
+  least not be confused by the confirm that follows. Do not claim the budget is airtight.
+
+Release keys off `agent_id`, which `SubagentStop` does carry — no correlation needed there.
+
+**4. Timeout ceiling — the configured `timeout` is honoured, in seconds, precisely.**
+Measured on one spawn with three competing hooks: `timeout: 120` was killed at **119.1 s**;
+`timeout: 900` and an unset timeout both ran a full 150 s uncut, and Claude Code *blocked on
+them the whole time* (run `duration_ms: 169493`, spawn then proceeded). A `deny` emitted after
+20 s was honoured, and so was one emitted after **75 s** with `timeout: 900`.
+
+**20 s block-and-wait is safe with room to spare.** Two riders: §4.1 MUST set `timeout`
+explicitly on the gate hook rather than inherit the default — the default was not cut at 60 s
+and its real ceiling was not established, so it is not a number to build on. And the ceiling
+bounds only the *wait*; the 100 ms connect deadline in §4.4 is unchanged and is what actually
+protects the session.
+
+### 10.2 Consequences already folded into this document
+
+§4.1 gains an explicit `timeout`. §4.3 states FIFO as the mechanism. §6.3 states that depth is
+read from `agent_id` and that the harness enforces nothing. §7 gains no new fields — the
+`tool_use_id` in `acquire` is still what the daemon keys a tentative lease on; it is simply
+never echoed back by `SubagentStart`.
+
+### 10.3 Still unmeasured
+
+Named so they are not mistaken for settled:
+
+- The default hook timeout's true ceiling (only that it exceeds 150 s).
+- Whether the observed `PreToolUse`/`SubagentStart` interleaving holds under machine load
+  heavy enough to slow the harness itself. Phase 0's traces are the place to watch for it.
+- Whether `SubagentStart` fires for a subagent restored by session resume.
+- Linux: every measurement above is macOS. Re-run the probe on Linux before trusting §10 there.
 
 ---
 
