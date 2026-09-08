@@ -104,6 +104,52 @@ func collectTree(roots []int32, children map[int32][]int32) []int32 {
 	return members
 }
 
+// cpuDelta returns how much CPU time a process accrued during the interval, and whether it
+// could be determined at all.
+//
+// Two cases. A process seen on the previous tick differences against its own last reading —
+// the ordinary path. A process NOT seen before is treated as new, and its whole cumulative
+// time counted, but only when that total could physically have been accrued inside the
+// interval: no machine burns more than one core-second per core per second. That test is what
+// keeps short-lived children — a compiler, a test process, a git subprocess, each visible for
+// a single tick — from scoring zero, which would make the descendant CPU this phase exists to
+// measure read far too low.
+//
+// The bound is physical rather than temporal on purpose, and that was learnt the hard way.
+// The obvious version asks CreateTime whether the process was born after the last tick. It
+// worked on macOS and failed silently on Linux, where gopsutil derives CreateTime from
+// /proc/stat's btime, which has ONE SECOND of granularity — so a process created 1.2 s after
+// the previous tick can read as older than it, and every short-lived child scores zero. CI
+// caught it: tree CPU and root-only CPU came back bit-identical with a core-saturating
+// grandchild running. Comparing against elapsed*cores needs no clock, no boot time and no
+// syscall, and is the same arithmetic on both platforms.
+//
+// The residual error is an older process that only now entered the tree, because its parent
+// became a root between ticks, and whose accumulated CPU happens to sit under the interval's
+// physical ceiling. It is counted once, in full, on that tick. Rare, bounded, and far cheaper
+// than missing every short-lived process on one of the two supported platforms.
+func cpuDelta(total, prev float64, hadPrev bool, elapsed float64, cores int) (float64, bool) {
+	if elapsed <= 0 || cores <= 0 {
+		return 0, false
+	}
+	var delta float64
+	switch {
+	case hadPrev:
+		delta = total - prev
+	case total <= elapsed*float64(cores):
+		delta = total
+	default:
+		// Present before this sampler started watching it. Counting its lifetime would be a
+		// spike that never happened; it is tracked from the next tick instead.
+		return 0, false
+	}
+	if delta < 0 {
+		// Negative means pid reuse: the counter belongs to a different process now.
+		return 0, false
+	}
+	return delta, true
+}
+
 // Host reports the fixed shape of the machine.
 //
 // PerformanceCores is not distinguishable from gopsutil on Apple silicon, so it is reported
@@ -231,21 +277,9 @@ func (s *hostSampler) tree(ctx context.Context) Tree {
 		if !s.primed || elapsed <= 0 {
 			continue
 		}
-		delta, known := 0.0, false
-		if prev, ok := s.cpuSecs[pid]; ok {
-			delta, known = total-prev, true
-		} else if created, err := p.CreateTimeWithContext(ctx); err == nil &&
-			time.UnixMilli(created).After(s.at) {
-			// A process that did not exist on the previous tick but was created after it:
-			// all of its CPU time was accrued inside this interval, so all of it counts.
-			// Without this, every short-lived child of an agent — which is most of what a
-			// build or a test run is — would contribute nothing on the one tick it is
-			// visible for, and the descendant CPU this story exists to measure would read
-			// far too low.
-			delta, known = total, true
-		}
-		if !known || delta < 0 {
-			// Negative means pid reuse: the counter belongs to a different process now.
+		prev, hadPrev := s.cpuSecs[pid]
+		delta, ok := cpuDelta(total, prev, hadPrev, elapsed, runtime.NumCPU())
+		if !ok {
 			continue
 		}
 		cores := delta / elapsed

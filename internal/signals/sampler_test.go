@@ -268,3 +268,64 @@ func selfRootName(t *testing.T) string {
 	}
 	return name
 }
+
+// TestCPUDelta covers the arithmetic the whole measurement rests on, including the case CI
+// caught on Linux and macOS did not.
+func TestCPUDelta(t *testing.T) {
+	const cores = 8
+	cases := []struct {
+		name      string
+		total     float64
+		prev      float64
+		hadPrev   bool
+		elapsed   float64
+		wantDelta float64
+		wantOK    bool
+	}{
+		{"seen before, ordinary difference", 10.5, 10.0, true, 1, 0.5, true},
+		{"seen before, idle", 10.0, 10.0, true, 1, 0, true},
+		{"pid reuse: counter went backwards", 0.2, 10.0, true, 1, 0, false},
+
+		// The regression. A short-lived child visible for one tick, whose whole lifetime
+		// fits inside the interval, must be counted. Under the CreateTime implementation
+		// this returned zero on Linux and the descendant CPU vanished.
+		{"new pid, a spinning child", 1.2, 0, false, 1.3, 1.2, true},
+		{"new pid, exactly at the physical ceiling", 8.0, 0, false, 1, 8.0, true},
+
+		// An older process that only now entered the tree. Counting its lifetime would be a
+		// spike that never happened.
+		{"new pid, older than the interval allows", 300, 0, false, 1, 0, false},
+
+		{"no elapsed time", 5, 0, false, 0, 0, false},
+		{"no cores", 5, 0, false, 1, 0, false},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			c := cores
+			if tc.name == "no cores" {
+				c = 0
+			}
+			delta, ok := cpuDelta(tc.total, tc.prev, tc.hadPrev, tc.elapsed, c)
+			if ok != tc.wantOK {
+				t.Fatalf("ok = %v, want %v", ok, tc.wantOK)
+			}
+			if ok && delta != tc.wantDelta {
+				t.Errorf("delta = %v, want %v", delta, tc.wantDelta)
+			}
+		})
+	}
+}
+
+// A short-lived process must be attributed on the single tick it is visible for, on every
+// platform. This is the property that regressed on Linux while passing on macOS, so it is
+// asserted against the arithmetic rather than against a live process tree — a live tree can
+// only ever test the platform the test is running on.
+func TestShortLivedChildIsNotLostOnAnyPlatform(t *testing.T) {
+	// One core saturated for the whole 1 s interval by a process born inside it.
+	delta, ok := cpuDelta(1.0, 0, false, 1.0, 8)
+	if !ok || delta != 1.0 {
+		t.Fatalf("a child born inside the interval scored delta=%v ok=%v; short-lived"+
+			" descendants are being dropped, which is most of what a build is", delta, ok)
+	}
+}
