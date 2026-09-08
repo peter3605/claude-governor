@@ -16,8 +16,24 @@ var required = []string{
 	"install", "uninstall", "doctor", "calibrate", "version",
 }
 
+// servers are the subcommands that do not return: they run until the process is signalled.
+//
+// They are still asserted to exist — a subcommand that vanishes from the binary is a hook
+// that silently stops firing, which is what this file is for — but they cannot be *run*
+// here. Running one hangs the test binary forever, and because it binds the real endpoint
+// on the way it also leaves a daemon holding the user's socket long after the test is
+// killed. That is not hypothetical: it happened once while GOV-06 was being written.
+var servers = map[string]bool{"daemon": true}
+
 func TestEverySubcommandExitsZero(t *testing.T) {
 	for _, name := range required {
+		if !registered(name) {
+			t.Errorf("governor %s: not in the command table", name)
+			continue
+		}
+		if servers[name] {
+			continue
+		}
 		var stdout, stderr bytes.Buffer
 		if code := run([]string{name}, &stdout, &stderr); code != 0 {
 			t.Errorf("governor %s: exit %d, want 0 (stderr: %s)", name, code, stderr.String())
@@ -25,16 +41,26 @@ func TestEverySubcommandExitsZero(t *testing.T) {
 	}
 }
 
+func registered(name string) bool {
+	for _, c := range commands {
+		if c.name == name {
+			return true
+		}
+	}
+	return false
+}
+
 // A stub must look like a grant, not a refusal: the gate's grant path is exit 0 with an
 // empty stdout, and anything on stdout is read by Claude Code as a hook decision.
 //
-// version and status are exempt because they are implemented and printing is their job.
-// Neither is wired to a hook, so neither stdout is ever read as a decision.
+// version and status are exempt because they are implemented and printing is their job,
+// and daemon because it does not return. None of the three is wired to a hook, so none of
+// their stdout is ever read as a decision.
 var implemented = map[string]bool{"version": true, "status": true}
 
 func TestStubsWriteNothingToStdout(t *testing.T) {
 	for _, name := range required {
-		if implemented[name] {
+		if implemented[name] || servers[name] {
 			continue
 		}
 		var stdout, stderr bytes.Buffer

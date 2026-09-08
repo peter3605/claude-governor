@@ -238,6 +238,15 @@ than blocking (measured: 128 queued, then `ECONNREFUSED`). A hung *connect* ther
 be produced portably from a real socket, and the connect deadline is exercised through the
 `transport.Dialer` seam with a dialer that blocks. That is one of the things the seam is for.
 
+The same fact has a consequence on the *daemon* side, confirmed against the real listener in
+GOV-06: a fan-out wider than the accept backlog produces `ECONNREFUSED` at some gates even
+though the daemon is healthy and listening. Those gates fail open, which is the correct
+outcome and needs no handling — but it bounds what the wait queue in section 6.2 can
+promise. **Block-and-wait (GOV-08) can only hold gates that got a connection**, so a burst
+larger than the backlog is partly ungoverned no matter how long the queue is willing to
+wait. Raising the backlog is not a fix worth reaching for; a burst that wide is already past
+the point where one more agent matters.
+
 ---
 
 ## 5. The control loop
