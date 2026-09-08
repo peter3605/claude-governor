@@ -26,7 +26,16 @@ jobs:
             echo "gofmt needed on:"; echo "$unformatted"; exit 1
           fi
       - run: go vet ./...
-      - run: go test ./...
+      # -race, not a plain `go test`: this repo's central invariant is a concurrency one —
+      # the lease table must never grant past the budget — and a COUNT assertion cannot see
+      # a data race. It lives on THIS job rather than the darwin one because macOS runner
+      # minutes bill at roughly ten times Linux.
+      #
+      # Do NOT add CGO_ENABLED=0 here to match the linux entries in the build matrix. Those
+      # are 0 deliberately, to keep the shipped binary static; copying that onto this job
+      # breaks the flag outright with `-race requires cgo`. Unset resolves to 1 here,
+      # because the runner has gcc.
+      - run: go test -race ./...
 
   build:
     name: build ${{ matrix.goos }}/${{ matrix.goarch }}
