@@ -272,7 +272,21 @@ func runDaemon(args []string, stdout, stderr io.Writer) int {
 // spend is added at this line and nothing downstream changes, because every reader already
 // takes the minimum over a set.
 func newDaemon(limit int, diag io.Writer) *daemon {
-	table := lease.NewTable(lease.Options{Liveness: lease.PIDLiveness{}})
+	return newDaemonWithLeases(limit, diag, lease.Options{})
+}
+
+// newDaemonWithLeases is newDaemon over a lease table configured by opt.
+//
+// It exists so that a test can shorten the TTLs. The tentative TTL is thirty seconds and the
+// confirmed one is half an hour, and a test that waited for either would be a test nobody
+// runs. Everything else about the daemon is identical, and the shipped defaults still come
+// from lease.NewTable — this cannot change them, only override them for a caller that says
+// so explicitly.
+func newDaemonWithLeases(limit int, diag io.Writer, opt lease.Options) *daemon {
+	if opt.Liveness == nil {
+		opt.Liveness = lease.PIDLiveness{}
+	}
+	table := lease.NewTable(opt)
 	return &daemon{
 		table:   table,
 		sources: []budget.Source{budget.LocalSource{N: limit, InUse: table.InUse}},

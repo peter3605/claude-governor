@@ -246,6 +246,51 @@ Two consequences:
 The second `SubagentStop` also reported the agent as still running in its own payload —
 `"background_tasks":[{"id":"aca0c17642a96d305","type":"subagent","status":"running",...}]`.
 
+### 8.1 `SubagentStart` does not fire in interactive sessions at all
+
+**Measured in GOV-09, from the live GOV-02 trace** — not from a probe, which is the point.
+Over the 5 h 20 m window in `~/.claude/governor/samples.jsonl` (68 agent records,
+`claude 2.1.263`, hooks installed 17:26:39Z):
+
+| | `SubagentStart` | `SubagentStop` |
+|---|---|---|
+| 2 headless `claude -p` probe sessions | 3 | 3 |
+| 25 ordinary interactive sessions | **0** | **62** |
+
+Sixty-two real subagent spawns across twenty-five interactive sessions, each carrying a
+genuine `agent_id`, and `SubagentStart` fired for none of them.
+
+Four things rule out the obvious instrument faults:
+
+- **Both hooks were registered, in the same file, on the same command.**
+  `~/.claude/settings.json` wires `SubagentStart` and `SubagentStop` to the identical
+  `governor trace agent`, which branches on nothing — it records whatever `hook_event_name`
+  the payload carries and always writes a record.
+- **It is not a stale binary.** The binary was replaced mid-window at 20:41Z; the
+  `SubagentStart` at 17:34Z carries `raw_keys` and so was recorded by the *newer* build. The
+  code path works under the binary that then saw zero starts for five hours.
+- **It is not sessions predating the install.** Sessions `4857c403` (21:20Z), `1fde424b`
+  (21:56Z) and `55878e4e` (18:50Z) all began well after 17:26:39Z, so all three certainly
+  loaded both hooks. Between them they emitted 17 `SubagentStop` and 0 `SubagentStart`.
+- **It is not the payload shape.** `SubagentStop` keysets are identical between probe and
+  interactive sessions but for `scratchpad_dir`, and both carry `agent_type`.
+
+The discriminator that survives is **headless `claude -p` versus interactive**. The mechanism
+is *not* established — this is an observed correlation over n=27 sessions on one host and one
+version, and nothing here explains *why*.
+
+**Consequence, and it is not small.** `confirm` is driven by `SubagentStart` (§4.3 of
+`design.md`), so in interactive use no lease is ever confirmed: none reaches `Confirmed`, no
+owner PID is ever bound, `PIDLiveness` is never consulted, and `SubagentStop` → `release`
+finds nothing to release because `byAgent` is only populated by `confirm`. Every lease
+instead sits tentative and is reclaimed at its 30 s TTL **while its agent is still running**,
+so the slot is handed out again and the budget silently over-subscribes. The lifecycle
+collapses from tentative → confirmed → released into "tentative, then reaped at 30 s".
+
+GOV-09 records this and does not fix it; the fix is its own story, since the candidate — bind
+the owner at `PreToolUse` from the gate's own ancestry walk, which GOV-07 already
+built — changes what a lease means rather than how it is collected.
+
 ## 9. Nested spawns are not refused by Claude Code
 
 Probe 5, verbatim from the run's `subagent_stats`:

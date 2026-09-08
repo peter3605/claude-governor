@@ -216,8 +216,23 @@ PreToolUse    → acquire TENTATIVE lease   ttl 30s, keyed by session_id
 SubagentStart → CONFIRM lease             bind agent_id + owning pid
 SubagentStop  → release
 SessionEnd    → release all for session
-reaper (2s)   → drop leases past ttl, or whose owning pid is gone
+reaper (2s)   → drop leases past ttl, whose SESSION is gone, or whose owning pid is gone
 ```
+
+> **`SubagentStart` does not fire in interactive sessions** on the version measured, so the
+> `confirm` step above does not happen in ordinary use and leases are reclaimed at the
+> tentative TTL while their agents still run. Measured in GOV-09; see `hook-surface.md`
+> §8.1. The lifecycle below is the design and remains correct; what is missing is a confirm
+> trigger that fires.
+
+**The reaper collects three things, not two.** A lease past its TTL; a lease of any state
+whose *session* is registered with a PID that is gone; and a confirmed lease whose own owner
+is gone. The middle one is what makes a `kill -9` survivable mid-fan-out: `OwnerPID` is bound
+at `confirm` and nowhere else, so a **tentative** lease has no owner to ask about and the
+third rule cannot see it. Without the session check, a session killed between its spawns
+leaves its tentative leases holding slots for the full 30 s while it is already gone. A
+session that registered **no** PID is left to its leases' TTLs — the owner walk reports
+unknown rather than guessing, and an unknown owner must never be treated as a dead one.
 
 The tentative state exists because `PreToolUse` fires before the spawn and the spawn may
 never happen — the user declines the permission prompt, the turn is interrupted, the model
