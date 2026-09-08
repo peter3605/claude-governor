@@ -30,7 +30,7 @@ type command struct {
 // commands is the full surface from design.md section 9. Everything not yet implemented is
 // a stub that exits 0 — the story that implements it replaces the stub in place.
 var commands = []command{
-	{"daemon", "run the budget daemon", stub("daemon")},
+	{"daemon", "run the budget daemon", runDaemon},
 	{"gate", "PreToolUse hook: acquire a lease for one subagent spawn", runGate},
 	{"confirm", "SubagentStart hook: bind a granted lease to a live agent", stub("confirm")},
 	{"release", "SubagentStop hook: return a lease to the pool", stub("release")},
