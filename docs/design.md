@@ -164,6 +164,24 @@ yourself rather than delegating it. Do not retry the Agent call.
 Name the number, name the cause, and give one concrete instruction. A vague refusal produces
 a retry loop.
 
+**Wired in GOV-07, with two narrowings.** There is no wait yet (GOV-08), so the middle row of
+the table does not occur: a refusal is immediate. And a deny is emitted only for a `reason`
+the gate recognises — the set is `{capacity}` in v1, and GOV-08 adds `depth`. A refusal
+whose reason this binary cannot interpret is treated exactly like an unreachable daemon and
+fails open. That is the narrowest opening in invariant 1 that still enforces anything: during
+an upgrade there will be a daemon of one version and gates of another, and a gate that
+honoured a policy it could not explain to the user would block spawns for a reason nobody
+can read. Ungoverned spawns are acceptable in that window; a wrongly blocked one is not.
+
+Every clause of the reason after the slot count is conditional, because a clause stating a
+fact the daemon did not send is a fabrication. `cpu` is null until GOV-12 lands the sampler
+and `thermal` is `unknown` on Linux by design, so the live text today reads:
+
+```
+Fleet at capacity (3/3 slots, thermal: nominal). Run this task inline yourself
+rather than delegating it. Do not retry the Agent call.
+```
+
 ### 4.3 Lease lifecycle
 
 ```
@@ -194,6 +212,22 @@ Two measured hazards the implementation MUST handle:
 - A resumed subagent reaches the CPU with **no `PreToolUse(Agent)` at all**. The gate cannot
   see it and v1 does not govern it. A confirm with an empty tentative queue MUST be dropped
   quietly rather than treated as an error.
+
+**Where the owning PID comes from** (settled in GOV-07). No lifecycle payload carries one —
+§10.1 and `hook-surface.md` §5 — so `confirm` and `session start` resolve it from the hook
+process's own ancestry. This is a **walk**, not `getppid()`, and the difference is
+load-bearing: Claude Code may run a hook through a shell, and a shell exits the moment the
+hook does. Binding a lease to it has `PIDLiveness` report the owner dead on the next reaper
+tick two seconds later, so every confirmed lease on the machine is collected while its agent
+is still running — the budget silently over-subscribes and the governor looks like it is
+doing nothing. The walk therefore climbs until it finds a process whose **argv[0]** is
+`claude` (the same rule as §5.1, and for the same measured reason), stops before pid 1, and
+reports **unknown** rather than guessing if it finds nothing. An unknown owner leaves the
+lease to its TTL; a wrong owner gets it reaped out from under a live agent, and those two
+mistakes are not the same size.
+
+A PID is never sent without its start time. PIDs are recycled, and a bare PID would keep a
+dead agent's lease alive for as long as some unrelated process held its number.
 
 ### 4.4 Performance budget
 
@@ -231,6 +265,39 @@ daemon that accepts and never answers, exit code 0 and empty stdout on all 70:
 The second row is the 90 ms socket deadline plus process start. Process start is ~12 ms and
 is outside the gate's control, so the end-to-end ceiling a hook should be held to is 120 ms,
 not 100 ms — that is the number the fail-open suite asserts.
+
+**Grant round-trip, measured in GOV-07** against a live daemon on a real socket, macOS,
+2026-09-08. The two rows answer different questions and must not be conflated: the first is
+the round trip this section bounds at p99 < 15 ms, which is the part the gate controls; the
+second additionally carries Go process start, which no work in this repo can reduce.
+
+| Case | n | p50 | p95 | p99 | max |
+|---|---|---|---|---|---|
+| grant round-trip, in process | 300 | 50–80 µs | 70–100 µs | **130–170 µs** | 830 µs |
+| grant end to end, real binary | 50 | 6.1 ms | 7–13 ms | see below | see below |
+
+The round-trip is roughly two orders of magnitude inside its bound, which is the expected
+shape: it is one unix write and one read against an in-memory table, and the budget exists
+to catch a daemon that has gone wrong rather than to constrain the happy path.
+
+**The first execution of a newly written binary costs ~240 ms**, and every later execution
+of that same file costs ~6 ms. Measured directly: six execs of an already-run binary gave
+6.4/5.8/5.1/5.4/5.2/5.0 ms, while six execs of a *byte-identical copy at a new path* gave
+243.5/12.3/10.4/8.9/7.8/7.4 ms. The cost is keyed to the file rather than to its contents —
+macOS validates a Mach-O's signature on first exec and caches the result per file — so it is
+paid once per install or upgrade and never again.
+
+Three consequences, none of them a defect in the gate:
+
+- It is **outside** the 100 ms budget, which is enforced inside `main` and so does not start
+  until the process is already running. The gate's own accounting is untouched.
+- It means the 120 ms end-to-end ceiling above is exceeded exactly once per installed
+  binary, on the first subagent spawn after an install or upgrade. That is well inside the
+  30 s hook timeout in §4.1, so it is a one-off stall rather than a failure.
+- §13.4 requires an upgrade to install via `rename(2)` rather than overwriting in place
+  (GOV-02). A renamed-in binary is a new file, so it *will* pay this cost on its first gate
+  invocation. That is the correct trade: the alternative, overwriting in place, invalidates
+  the signature of a running image and the kernel SIGKILLs every later execution.
 
 One platform fact, because it shapes how this is tested rather than how it behaves: on
 darwin a unix connect to a listener whose backlog is full is **refused immediately** rather

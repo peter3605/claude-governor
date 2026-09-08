@@ -138,7 +138,27 @@ decoded fields. Anything keying a lease or a policy on `agent_type` must treat e
 ```
 
 Neither carries a PID. `SessionStart` has no `prompt_id`. The daemon must learn the session's
-owning PID some other way — the hook process's own parent, not the payload.
+owning PID some other way — from the hook process's own ancestry, not the payload.
+
+**Refinement, GOV-07 (2026-09-08).** "The hook process's own parent" is too strong, and
+building on it would have been a silent budget bug. Claude Code may run a hook through a
+shell, and that shell exits the instant the hook does; a lease bound to it is reported dead
+by `PIDLiveness` on the next reaper tick, two seconds later, so every confirmed lease on the
+machine would be collected while its agent was still running. Nothing errors — the governor
+just stops governing.
+
+The owner is therefore found by **walking up** the ancestry to the first process whose
+`argv[0]` is `claude`, with three rules: stop before pid 1 (init never exits, so a lease
+owned by it can never be reaped for liveness, and on Linux an orphaned hook really is
+reparented there); give up after a bounded number of hops; and report **unknown** rather
+than substituting the parent, because an unknown owner merely waits out its TTL while a
+wrong one is reaped out from under a live agent.
+
+The `argv[0]` rule is the same one recorded in §12 and in `design.md` §5.1, and it is tested
+the way it actually occurs: the test executes a file named `2.1.263` with `argv[0]` set to
+`claude`. A test using a file *named* `claude` passes whether the code reads `argv[0]` or the
+executable name, which is exactly how GOV-02 shipped a sampler that found zero sessions on a
+machine running six.
 
 ## 6. `PostToolUse` on the `Agent` tool — the ground truth for correlation
 
