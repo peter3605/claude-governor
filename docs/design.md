@@ -202,6 +202,42 @@ Two measured hazards the implementation MUST handle:
 - No config file parsing, no JSON schema validation, no DNS on the hot path. Read stdin,
   open the socket, write one line, read one line, exit.
 
+The 100 ms is spent as **two nested deadlines**, settled in GOV-05:
+
+| | |
+|---|---|
+| socket deadline | 90 ms, on the dial *and* on the connection, one clock for both |
+| overall budget | 100 ms, enforced around the whole hook body |
+
+They are not the same number on purpose. The socket deadline is the mechanism; the overall
+budget is a backstop for the failures no socket deadline can see — chiefly a read of stdin
+that never returns, which happens before there is a socket to put a deadline on. Setting
+both to 100 ms makes them race, and a gate that had *lost* its read deadline would still
+pass its tests on the backstop, which is precisely the regression the suite exists to catch.
+The backstop returns an exit code; it must never be an `os.Exit` armed in a hook body.
+
+The deadline on the connection matters as much as the one on the dial. A daemon that accepts
+and then never writes leaves a plain read blocked forever, and by that point a connect-only
+deadline has already been satisfied.
+
+Measured on the real binary, macOS, 2026-09-08 — 50 runs with no daemon and 20 against a
+daemon that accepts and never answers, exit code 0 and empty stdout on all 70:
+
+| Case | p50 | p95 | max |
+|---|---|---|---|
+| no daemon (connect refused) | 13.3 ms | 15.7 ms | 19.7 ms |
+| daemon accepts, never answers | 105.1 ms | 112.5 ms | 113.1 ms |
+
+The second row is the 90 ms socket deadline plus process start. Process start is ~12 ms and
+is outside the gate's control, so the end-to-end ceiling a hook should be held to is 120 ms,
+not 100 ms — that is the number the fail-open suite asserts.
+
+One platform fact, because it shapes how this is tested rather than how it behaves: on
+darwin a unix connect to a listener whose backlog is full is **refused immediately** rather
+than blocking (measured: 128 queued, then `ECONNREFUSED`). A hung *connect* therefore cannot
+be produced portably from a real socket, and the connect deadline is exercised through the
+`transport.Dialer` seam with a dialer that blocks. That is one of the things the seam is for.
+
 ---
 
 ## 5. The control loop

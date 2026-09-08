@@ -31,7 +31,7 @@ type command struct {
 // a stub that exits 0 — the story that implements it replaces the stub in place.
 var commands = []command{
 	{"daemon", "run the budget daemon", stub("daemon")},
-	{"gate", "PreToolUse hook: acquire a lease for one subagent spawn", stub("gate")},
+	{"gate", "PreToolUse hook: acquire a lease for one subagent spawn", runGate},
 	{"confirm", "SubagentStart hook: bind a granted lease to a live agent", stub("confirm")},
 	{"release", "SubagentStop hook: return a lease to the pool", stub("release")},
 	{"session", "SessionStart/SessionEnd hook: register or drop a session", stub("session")},
