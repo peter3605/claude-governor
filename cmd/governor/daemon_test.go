@@ -203,6 +203,59 @@ func TestDaemonServesTheFullLeaseLifecycle(t *testing.T) {
 	}
 }
 
+// Every request carries principal, and the daemon decodes it on every operation.
+//
+// Nothing reads it in v1, which is exactly why it needs a test: a field no code path
+// consumes is the kind that gets deleted as dead weight, and retrofitting identity into an
+// already-shipped wire format costs far more than carrying it does now. This is the cheapest
+// moment it will ever cost.
+func TestEveryRequestCarriesPrincipal(t *testing.T) {
+	for _, op := range []string{"acquire", "confirm", "release", "session", "status"} {
+		line := fmt.Sprintf(
+			`{"v":1,"op":%q,"principal":{"user":"peter","team":null},"session":"abc123","agent_id":"ag_1","action":"start"}`, op)
+
+		var req request
+		if err := json.Unmarshal([]byte(line), &req); err != nil {
+			t.Fatalf("%s: decode: %v", op, err)
+		}
+		if req.Principal.User != "peter" {
+			t.Errorf("%s: principal.user decoded as %q, want %q", op, req.Principal.User, "peter")
+		}
+		if req.Principal.Team != nil {
+			t.Errorf("%s: principal.team decoded as %v, want null", op, req.Principal.Team)
+		}
+	}
+
+	// A team, when a tier-two broker eventually sets one, must survive the same decode.
+	var req request
+	if err := json.Unmarshal([]byte(`{"v":1,"op":"acquire","principal":{"user":"peter","team":"platform"}}`), &req); err != nil {
+		t.Fatalf("decode with a team: %v", err)
+	}
+	if req.Principal.Team == nil || *req.Principal.Team != "platform" {
+		t.Errorf("principal.team decoded as %v, want \"platform\"", req.Principal.Team)
+	}
+}
+
+// The daemon accepts a principal on every operation over the wire, not just in the struct.
+func TestDaemonAcceptsAPrincipalOnEveryOperation(t *testing.T) {
+	endpoint, _ := startTestDaemon(t, 4)
+	pr := map[string]any{"user": "peter", "team": nil}
+
+	for _, req := range []map[string]any{
+		{"v": protocolVersion, "op": "session", "action": "start", "principal": pr, "session": "s1", "pid": os.Getpid()},
+		{"v": protocolVersion, "op": "acquire", "principal": pr, "session": "s1", "tool_use_id": "toolu_01", "depth": 0},
+		{"v": protocolVersion, "op": "confirm", "principal": pr, "session": "s1", "agent_id": "ag_1", "pid": os.Getpid()},
+		{"v": protocolVersion, "op": "release", "principal": pr, "session": "s1", "agent_id": "ag_1"},
+		{"v": protocolVersion, "op": "status", "principal": pr},
+		{"v": protocolVersion, "op": "session", "action": "end", "principal": pr, "session": "s1"},
+	} {
+		r := call(t, endpoint, req)
+		if r.V != protocolVersion {
+			t.Errorf("%v: reply is v%d, want v%d", req["op"], r.V, protocolVersion)
+		}
+	}
+}
+
 func TestDaemonRefusesAtCapacity(t *testing.T) {
 	endpoint, _ := startTestDaemon(t, 2)
 
