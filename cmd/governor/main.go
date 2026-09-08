@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"io"
 	"os"
+
+	"github.com/peter3605/claude-governor/internal/signals"
 )
 
 // Version strings reported by `governor version`. The protocol version is the "v" field
@@ -25,15 +27,15 @@ type command struct {
 	run     func(args []string, stdout, stderr io.Writer) int
 }
 
-// commands is the full surface from design.md section 9. Everything but version is a stub
-// that exits 0 — the story that implements it replaces the stub in place.
+// commands is the full surface from design.md section 9. Everything not yet implemented is
+// a stub that exits 0 — the story that implements it replaces the stub in place.
 var commands = []command{
 	{"daemon", "run the budget daemon", stub("daemon")},
 	{"gate", "PreToolUse hook: acquire a lease for one subagent spawn", stub("gate")},
 	{"confirm", "SubagentStart hook: bind a granted lease to a live agent", stub("confirm")},
 	{"release", "SubagentStop hook: return a lease to the pool", stub("release")},
 	{"session", "SessionStart/SessionEnd hook: register or drop a session", stub("session")},
-	{"status", "print the current budget and its holders", stub("status")},
+	{"status", "print the current budget and its holders", runStatus},
 	{"mcp", "serve the advisory MCP tool over stdio", stub("mcp")},
 	{"statusline", "render the one-line status for a session", stub("statusline")},
 	{"install", "install the plugin, hooks and daemon", stub("install")},
@@ -71,6 +73,22 @@ func stub(name string) func([]string, io.Writer, io.Writer) int {
 		fmt.Fprintf(stderr, "governor %s: not implemented yet\n", name)
 		return 0
 	}
+}
+
+// runStatus prints what the governor currently knows about this host.
+//
+// Today that is the thermal state and nothing else: the daemon (GOV-06) and its sampler
+// (GOV-12) do not exist yet, so there is no budget, no lease table and no CPU reading to
+// report, and inventing placeholder numbers for them would be worse than omitting them.
+// When the daemon lands this becomes the client half of the status operation in design.md
+// section 7 and the rest of the fields arrive over the wire — the thermal line is the same
+// line either way, which is what makes it safe to read now.
+//
+// Output is one "key value" line per fact so the statusline (GOV-10) and doctor (GOV-20)
+// can parse it without a JSON dependency on a shape that is still growing.
+func runStatus(_ []string, stdout, _ io.Writer) int {
+	fmt.Fprintf(stdout, "thermal %s\n", signals.ReadThermal())
+	return 0
 }
 
 func runVersion(_ []string, stdout, _ io.Writer) int {

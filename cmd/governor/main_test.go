@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"strings"
 	"testing"
+
+	"github.com/peter3605/claude-governor/internal/signals"
 )
 
 // The command surface GOV-04 requires, from design.md section 9. A subcommand that
@@ -25,9 +27,14 @@ func TestEverySubcommandExitsZero(t *testing.T) {
 
 // A stub must look like a grant, not a refusal: the gate's grant path is exit 0 with an
 // empty stdout, and anything on stdout is read by Claude Code as a hook decision.
+//
+// version and status are exempt because they are implemented and printing is their job.
+// Neither is wired to a hook, so neither stdout is ever read as a decision.
+var implemented = map[string]bool{"version": true, "status": true}
+
 func TestStubsWriteNothingToStdout(t *testing.T) {
 	for _, name := range required {
-		if name == "version" {
+		if implemented[name] {
 			continue
 		}
 		var stdout, stderr bytes.Buffer
@@ -48,6 +55,25 @@ func TestVersionReportsAllThreeVersions(t *testing.T) {
 		if !strings.Contains(out, want) {
 			t.Errorf("governor version: output %q missing %q", out, want)
 		}
+	}
+}
+
+// The thermal state has to reach a human through the status operation, or the one signal
+// that matters most on a fanless chassis is unobservable until GOV-10 ships a statusline.
+func TestStatusReportsThermalState(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	if code := run([]string{"status"}, &stdout, &stderr); code != 0 {
+		t.Fatalf("governor status: exit %d, want 0 (stderr: %s)", code, stderr.String())
+	}
+	out := stdout.String()
+	if !strings.HasPrefix(out, "thermal ") {
+		t.Fatalf("governor status: output %q, want a \"thermal <state>\" line", out)
+	}
+	state := signals.Thermal(strings.TrimSpace(strings.TrimPrefix(out, "thermal ")))
+	switch state {
+	case signals.Nominal, signals.Fair, signals.Serious, signals.Critical, signals.Unknown:
+	default:
+		t.Fatalf("governor status: reported thermal %q, want one of the five named states", state)
 	}
 }
 

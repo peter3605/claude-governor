@@ -53,6 +53,16 @@ jobs:
           GOARCH: ${{ matrix.goarch }}
           CGO_ENABLED: ${{ matrix.cgo }}
         run: go build -o bin/governor-${{ matrix.goos }}-${{ matrix.goarch }} ./cmd/governor
+      # The "vet and test" job runs on ubuntu, so its `go test` exercises the no-cgo
+      # fallback and the thermal shim is never executed there — only compiled here. This
+      # step runs the suite once on the native macOS arch, where cgo is on and
+      # ProcessInfo.thermalState is real, so a shim that builds but returns nothing is
+      # caught. Native arm64 only: the amd64 job cross-compiles and cannot run its output.
+      - name: test (native, cgo on — exercises the thermal shim)
+        if: matrix.goos == 'darwin' && matrix.goarch == 'arm64'
+        env:
+          CGO_ENABLED: '1'
+        run: go test ./...
       - uses: actions/upload-artifact@v4
         with:
           name: governor-${{ matrix.goos }}-${{ matrix.goarch }}

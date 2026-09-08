@@ -21,6 +21,11 @@ check: vet test
 
 # What CI builds, minus the runner split: cgo is off here because a local cross-compile
 # cannot link another platform's C toolchain. CI builds darwin natively with cgo on.
+#
+# The darwin binaries this produces are thermally blind — no cgo means no
+# ProcessInfo.thermalState shim, so they report "unknown" on a Mac and look exactly like a
+# cool machine (design.md section 5.3). This target is a compile check for all four targets;
+# do NOT ship its darwin output. Release artefacts come from the macOS CI runner.
 cross:
 	@for t in darwin/arm64 darwin/amd64 linux/arm64 linux/amd64; do \
 		os=$${t%/*}; arch=$${t#*/}; \
