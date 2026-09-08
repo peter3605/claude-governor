@@ -236,6 +236,13 @@ itself, so root-only accounting measures the harness and misses the work. `signa
 carries `CPURoots` and `CPU` as two numbers rather than one, because the gap between them is
 the answer Phase 0 exists to produce.
 
+**Agent records carry the payload's top-level key names.** `agent_type` is optional (§10.1),
+so a record without one is ambiguous: it may be a faithful note that the harness sent no type,
+or it may be the hook silently dropping a field — a defect in the instrument rather than a
+finding about the system. Real traces produced both-looking records within an hour of
+installation. The key list settles it per record, offline, without re-running anything. Names
+only, never values: the payload carries the agent's prompt.
+
 ### 5.2 AIMD
 
 Borrowed from TCP congestion control, and the right shape for the same reason: reclaim
@@ -690,6 +697,16 @@ original bytes.
 Config is `${CLAUDE_PLUGIN_DATA}/config.json` carrying `"schema": 1`. Unknown keys warn and
 are preserved, never crash — a config written by a newer version must not brick an older
 binary. Migration happens on read; the write is atomic (temp file, rename).
+
+**Never overwrite the binary in place.** Measured in GOV-02, on macOS: `cp` onto the existing
+`bin/governor` invalidates its code signature, and the kernel then **SIGKILLs** every
+subsequent execution — `exit=137`, no output, no error message anywhere. That defeats the one
+guarantee the hooks make, because a process killed by a signal cannot exit 0 no matter how
+carefully it is written; the failure is external to the program. During an in-place upgrade
+this would land on every hook of every live session at once. Upgrade MUST write the new
+binary to a temporary name in the same directory and `rename(2)` it over the old one, exactly
+as the config write does — a rename swaps the directory entry and leaves running processes on
+the old inode, so nothing in flight is signed wrong.
 
 Every protocol message carries `"v"`. A daemon that does not support a gate's version replies
 `unsupported_version`, and the gate treats that reply exactly like an unreachable daemon: it

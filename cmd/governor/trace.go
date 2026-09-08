@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"sort"
 	"syscall"
 	"time"
 
@@ -120,6 +121,7 @@ func runTraceAgent(stderr io.Writer) int {
 	rec := trace.Record{
 		Kind: trace.KindAgent,
 		Agent: &trace.Agent{
+			RawKeys:   payloadKeys(payload),
 			Event:     p.HookEventName,
 			SessionID: p.SessionID,
 			AgentID:   p.AgentID,
@@ -132,6 +134,21 @@ func runTraceAgent(stderr io.Writer) int {
 		fmt.Fprintf(stderr, "governor trace agent: append: %v\n", err)
 	}
 	return 0
+}
+
+// payloadKeys returns the sorted top-level key names of a JSON object payload, or nil if the
+// payload is not an object. Key names only — the values include the agent's prompt.
+func payloadKeys(payload []byte) []string {
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(payload, &raw); err != nil {
+		return nil
+	}
+	keys := make([]string, 0, len(raw))
+	for k := range raw {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
 }
 
 // watchdog exits the process with status 0 after d, and returns a func that disarms it.

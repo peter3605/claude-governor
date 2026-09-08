@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -131,8 +132,10 @@ func TestTraceAgentRecordsThePayload(t *testing.T) {
 	want := trace.Agent{
 		Event: "SubagentStart", SessionID: "sess-1", AgentID: "agent-9",
 		AgentType: "Explore", PromptID: "p-3", CWD: "/tmp/project",
+		RawKeys: []string{"agent_id", "agent_type", "cwd", "hook_event_name",
+			"prompt_id", "session_id", "transcript_path"},
 	}
-	if *r.Agent != want {
+	if !reflect.DeepEqual(*r.Agent, want) {
 		t.Errorf("agent record\n got %+v\nwant %+v", *r.Agent, want)
 	}
 	if r.TS == "" {
@@ -159,6 +162,59 @@ func TestTraceAgentRecordsRepeatedStartsForOneAgent(t *testing.T) {
 	}
 	if n := len(bytes.Split(bytes.TrimSpace(b), []byte("\n"))); n != 2 {
 		t.Errorf("want 2 records for two starts of one agent, got %d", n)
+	}
+}
+
+// TestRawKeysDistinguishAnAbsentFieldFromADroppedOne is why RawKeys exists.
+//
+// A record with no agent_type is ambiguous on its own: GOV-01 measured subagent_type as
+// optional, so it may be a faithful record of what the harness sent — or it may be this hook
+// dropping a field, which is a defect in the instrument rather than a finding about the
+// system. Real traces have already shown both-looking records, and the key list is what
+// settles which is which without re-running anything.
+func TestRawKeysDistinguishAnAbsentFieldFromADroppedOne(t *testing.T) {
+	dir := traceStateDir(t)
+	// A payload genuinely without agent_type.
+	withStdin(t, `{"hook_event_name":"SubagentStop","session_id":"s","agent_id":"a","cwd":"/x"}`)
+	var stdout, stderr bytes.Buffer
+	if code := run([]string{"trace", "agent"}, &stdout, &stderr); code != 0 {
+		t.Fatalf("exit %d", code)
+	}
+	b, _ := os.ReadFile(filepath.Join(dir, "samples.jsonl"))
+	var r trace.Record
+	if err := json.Unmarshal(bytes.TrimSpace(b), &r); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if r.Agent.AgentType != "" {
+		t.Errorf("agent_type = %q, want empty", r.Agent.AgentType)
+	}
+	for _, k := range r.Agent.RawKeys {
+		if k == "agent_type" {
+			t.Fatal("raw_keys claims agent_type was in a payload that did not carry it")
+		}
+	}
+	if len(r.Agent.RawKeys) != 4 {
+		t.Errorf("raw_keys = %v, want the 4 keys the payload carried", r.Agent.RawKeys)
+	}
+}
+
+// Key names only. A hook payload carries the agent's prompt, and a trace that quietly
+// accumulated prompts would be a different and much more sensitive artefact than the one
+// this story asked for.
+func TestRawKeysRecordNamesNotValues(t *testing.T) {
+	dir := traceStateDir(t)
+	const secret = "SUPER-SECRET-PROMPT-TEXT"
+	withStdin(t, `{"hook_event_name":"SubagentStart","agent_id":"a","prompt":"`+secret+`"}`)
+	var stdout, stderr bytes.Buffer
+	if code := run([]string{"trace", "agent"}, &stdout, &stderr); code != 0 {
+		t.Fatalf("exit %d", code)
+	}
+	b, _ := os.ReadFile(filepath.Join(dir, "samples.jsonl"))
+	if bytes.Contains(b, []byte(secret)) {
+		t.Errorf("a payload value leaked into the trace:\n%s", b)
+	}
+	if !bytes.Contains(b, []byte(`"prompt"`)) {
+		t.Errorf("the key name was not recorded:\n%s", b)
 	}
 }
 

@@ -217,3 +217,70 @@ func itoa(i int) string {
 	}
 	return string(b)
 }
+
+// TestRawKeysDistinguishAbsentFromEmpty pins the decoding rule documented on Agent.RawKeys.
+//
+// It is here because the distinction is genuinely easy to get wrong: during GOV-02's own
+// verification an empty-valued agent_type was misread as this code dropping a field the
+// payload had carried. The three cases must stay separable, because a Phase 0 instrument that
+// cannot tell "the harness sent nothing" from "the harness sent empty" from "we lost it" is
+// not measuring anything trustworthy.
+func TestRawKeysDistinguishAbsentFromEmpty(t *testing.T) {
+	dir := stateDir(t)
+
+	// Key absent entirely.
+	if err := Append(Record{Kind: KindAgent, Agent: &Agent{
+		Event: "SubagentStop", AgentID: "a1",
+		RawKeys: []string{"agent_id", "hook_event_name"},
+	}}); err != nil {
+		t.Fatalf("append: %v", err)
+	}
+	// Key present, value empty.
+	if err := Append(Record{Kind: KindAgent, Agent: &Agent{
+		Event: "SubagentStop", AgentID: "a2",
+		RawKeys: []string{"agent_id", "agent_type", "hook_event_name"},
+	}}); err != nil {
+		t.Fatalf("append: %v", err)
+	}
+	// The ordinary case.
+	if err := Append(Record{Kind: KindAgent, Agent: &Agent{
+		Event: "SubagentStop", AgentID: "a3", AgentType: "Explore",
+		RawKeys: []string{"agent_id", "agent_type", "hook_event_name"},
+	}}); err != nil {
+		t.Fatalf("append: %v", err)
+	}
+
+	lines := readLines(t, filepath.Join(dir, "samples.jsonl"))
+	if len(lines) != 3 {
+		t.Fatalf("want 3 records, got %d", len(lines))
+	}
+
+	classify := func(line string) string {
+		var r Record
+		if err := json.Unmarshal([]byte(line), &r); err != nil {
+			t.Fatalf("unmarshal: %v", err)
+		}
+		inKeys := false
+		for _, k := range r.Agent.RawKeys {
+			if k == "agent_type" {
+				inKeys = true
+			}
+		}
+		switch {
+		case !inKeys && r.Agent.AgentType == "":
+			return "absent"
+		case inKeys && r.Agent.AgentType == "":
+			return "empty"
+		case inKeys:
+			return "set"
+		default:
+			return "dropped"
+		}
+	}
+
+	for i, want := range []string{"absent", "empty", "set"} {
+		if got := classify(lines[i]); got != want {
+			t.Errorf("record %d classified %q, want %q", i+1, got, want)
+		}
+	}
+}

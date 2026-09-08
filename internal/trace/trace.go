@@ -71,6 +71,25 @@ type Agent struct {
 	PromptID string `json:"prompt_id,omitempty"`
 	// CWD is the session's working directory, which is what attributes load to a project.
 	CWD string `json:"cwd,omitempty"`
+	// RawKeys is the sorted list of top-level keys the payload actually carried.
+	//
+	// It is here because without it an absent AgentType is ambiguous, and the ambiguity is
+	// not academic: GOV-01 measured subagent_type as optional, so a missing type may be a
+	// faithful record of what the harness sent — or it may be this hook silently dropping a
+	// field, which would be a defect in the instrument rather than a finding about the
+	// system. Names only, never values: a payload carries the agent's prompt.
+	//
+	// Reading it, since the three cases are easy to confuse and one of them already caused a
+	// false accusation against this code during GOV-02's own verification:
+	//
+	//	agent_type NOT in RawKeys, no AgentType  →  the harness sent no such field
+	//	agent_type in RawKeys, no AgentType      →  the harness sent the field, empty or null
+	//	agent_type in RawKeys, AgentType set     →  the ordinary case
+	//
+	// Both of the first two are real observations rather than losses. What RawKeys rules out
+	// is the fourth combination — a field present and non-empty on the wire but missing from
+	// the record — which is the only one that would mean this instrument is lying.
+	RawKeys []string `json:"raw_keys,omitempty"`
 }
 
 // Sample is one 1 Hz reading of the host.
