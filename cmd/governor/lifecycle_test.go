@@ -94,6 +94,11 @@ func askGate(t *testing.T, endpoint, session, toolUseID string) bool {
 
 // TestTheNPlusFirstSpawnIsRefused is this story's headline acceptance criterion.
 func TestTheNPlusFirstSpawnIsRefused(t *testing.T) {
+	// GOV-08 made the refusal arrive after a wait rather than immediately, so this sits
+	// through gateWaitMax unless it is shrunk. The wait itself is what wait_test.go is for;
+	// what this test asserts is unchanged — the N+1th spawn does not get a slot.
+	shortWait(t, 200*time.Millisecond)
+
 	const budget = 3
 	endpoint, d := startTestDaemon(t, budget)
 
@@ -113,6 +118,7 @@ func TestTheNPlusFirstSpawnIsRefused(t *testing.T) {
 // A refusal must not be sticky. Once a lease comes back the next spawn proceeds — without
 // this the first burst of the session would permanently poison the budget.
 func TestASpawnProceedsOnceASlotIsReturned(t *testing.T) {
+	shortWait(t, 200*time.Millisecond)
 	endpoint, _ := startTestDaemon(t, 1)
 
 	if !askGate(t, endpoint, "s1", "toolu_01") {

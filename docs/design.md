@@ -149,7 +149,7 @@ deadline in §4.4 is what protects the session from a wedged daemon.
 | Free slot in this session's share | exit 0, silent | nothing; normal permission flow continues |
 | No slot, one likely within `wait_max` | block, then grant | a brief stall, then the spawn proceeds |
 | Still no slot at the deadline | `deny` + reason | a refusal it can act on (below) |
-| Spawn depth > 1 | `deny` | nested fan-out refused (invariant, §6.3) |
+| Caller is itself a subagent | `deny`, at once | nested fan-out refused (invariant, §6.3) |
 | Daemon unreachable | exit 0, silent | nothing |
 
 Block-and-wait is preferred over deny wherever the wait fits inside the hook timeout,
@@ -164,11 +164,9 @@ yourself rather than delegating it. Do not retry the Agent call.
 Name the number, name the cause, and give one concrete instruction. A vague refusal produces
 a retry loop.
 
-**Wired in GOV-07, with two narrowings.** There is no wait yet (GOV-08), so the middle row of
-the table does not occur: a refusal is immediate. And a deny is emitted only for a `reason`
-the gate recognises — the set is `{capacity}` in v1, and GOV-08 adds `depth`. A refusal
-whose reason this binary cannot interpret is treated exactly like an unreachable daemon and
-fails open. That is the narrowest opening in invariant 1 that still enforces anything: during
+**Wired in GOV-07 and completed in GOV-08.** A deny is emitted only for a `reason` the gate
+recognises — the set is `{capacity, depth}`. A refusal whose reason this binary cannot
+interpret is treated exactly like an unreachable daemon and fails open. That is the narrowest opening in invariant 1 that still enforces anything: during
 an upgrade there will be a daemon of one version and gates of another, and a gate that
 honoured a policy it could not explain to the user would block spawns for a reason nobody
 can read. Ungoverned spawns are acceptable in that window; a wrongly blocked one is not.
@@ -181,6 +179,35 @@ and `thermal` is `unknown` on Linux by design, so the live text today reads:
 Fleet at capacity (3/3 slots, thermal: nominal). Run this task inline yourself
 rather than delegating it. Do not retry the Agent call.
 ```
+
+**The wait is acknowledged, and that is what makes it safe** (GOV-08). The gate cannot
+simply extend its read deadline to `wait_max` when it asks for a wait: a daemon that accepts
+and never answers is indistinguishable from a busy one until it replies, so that gate would
+stall *every* spawn on the machine for twenty seconds — the exact hang invariant 1 forbids,
+and a silent repeal of §4.4's 120 ms ceiling. So a daemon that parks a request says so
+immediately, on the socket, with an interim `{"reason":"waiting","wait_ms":N}` line (§7).
+The gate reads that line inside the unchanged 100 ms allowance and only then extends. The
+licence to wait comes from the daemon having answered, never from this binary having asked;
+a wedged daemon never sends it and fails open exactly as before. The grant path is untouched
+— one write, one read — so GOV-07's measured round trip still stands.
+
+Two consequences worth stating because they are easy to get wrong later. The gate holds
+**one reader** across both lines: a `bufio.Reader` fills in blocks, so reading the first line
+can pull the second in with it, and a fresh reader for the second would block on a socket
+with nothing left to send. And a second `waiting` line is refused rather than honoured, or a
+daemon could extend the wait indefinitely one line at a time.
+
+**Repeat denials are rate-limited and escalate** (GOV-08). The daemon counts a session's
+refusals in a 60 s sliding window and returns the count as `denials`; the gate's text gets
+firmer at 2 and names the count from 3 on, because repeating the identical sentence to a
+caller that has ignored it three times is not a strategy. Inside a 5 s cool-off a session
+that has just been refused is refused again *immediately* rather than parked. That protects
+the queue rather than the caller: otherwise a session retrying in a loop takes a place in the
+FIFO on every attempt and holds it for the whole of `wait_max`, crowding out sessions that
+asked once and are waiting properly.
+
+A parked acquire that ends in a grant is **not** counted as a denial. A session that waited
+patiently must not be shouted at on its next refusal.
 
 ### 4.3 Lease lifecycle
 
@@ -242,6 +269,13 @@ The 100 ms is spent as **two nested deadlines**, settled in GOV-05:
 |---|---|
 | socket deadline | 90 ms, on the dial *and* on the connection, one clock for both |
 | overall budget | 100 ms, enforced around the whole hook body |
+
+**The 100 ms is conditionally extendable, and only by the daemon** (GOV-08). Reading an
+interim `waiting` line (§4.2) pushes both deadlines out to cover the wait — the socket first,
+the backstop behind it by the same `ioMargin`, so the ordering below is preserved. Nothing
+else moves either one, and in particular the gate *asking* for a wait does not: until a reply
+has been read, every figure in the table below still applies. That is what keeps the measured
+rows underneath honest after block-and-wait landed.
 
 They are not the same number on purpose. The socket deadline is the mechanism; the overall
 budget is a backstop for the failures no socket deadline can see — chiefly a read of stdin
@@ -456,16 +490,42 @@ redistributed to sessions actually asking.
 FIFO across sessions. The next freed slot goes to whoever has waited longest, so a noisy
 session cannot starve a quiet one.
 
+**Built in GOV-08.** One queue for the whole daemon, not one per session, and the walk is
+strict: it stops at the first waiter it cannot satisfy rather than skipping to one it can,
+because skipping is how a session asking in a tight loop overtakes a session that has been
+waiting. Waiters are woken on release, on session end, and on the reaper tick — the last
+unconditionally, as a backstop, so a lost wake-up costs latency rather than a full `wait_max`
+spent beside a free slot. The queue decides *order*; max-min fair share (§6.1) will decide
+who may join it, and does not exist yet.
+
+A waiter that times out at the same instant as the pump grants it a lease keeps the lease
+rather than being refused beside it — the removal and the hand-over happen under one lock, so
+a granted lease always has exactly one owner. A client that disconnects before it can even be
+told it is waiting has its slot handed straight back, rather than left to a 30 s TTL.
+
 ### 6.3 Depth
 
-Only depth-0 fan-out consumes leases. Depth > 1 is denied outright. This is the simplest
-correct answer to the nested-deadlock failure (all slots held by agents themselves waiting
-for slots), and nested fan-out is rarely what was wanted.
+Only depth-0 fan-out consumes leases: **a spawn requested by a subagent is denied outright.**
+This is the simplest correct answer to the nested-deadlock failure (all slots held by agents
+themselves waiting for slots), and nested fan-out is rarely what was wanted.
 
 **Depth is read from the presence of a top-level `agent_id` in the `PreToolUse` payload**
 (absent ⇒ depth 0, present ⇒ the caller is itself a subagent). There is no depth field, and
 Claude Code does **not** refuse nested spawns on its own — measured `max_depth: 2`,
 `refused.depth_limit: 0` (§10.1). This invariant is entirely the governor's to enforce.
+
+**Corrected in GOV-08.** This section and the §4.2 table both used to say "depth > 1 is
+denied", which was unenforceable as written and denied nothing. The `depth` field on the wire
+is the *caller's* depth, fixed by the paragraph above at exactly two distinguishable values —
+0 for the main session and 1 for a subagent — so it is never greater than 1 and the rule
+never fired. The enforceable rule is the single test §10.1 already names: `agent_id` present
+means nested, and nested is refused. The daemon therefore denies at depth ≥ 1.
+
+The depth refusal is decided **before** the budget is consulted and is never parked. A nested
+spawn is not short of a slot, it is not allowed one, and holding it for twenty seconds to
+reach an answer that was already known would stall a session for nothing. Its reason text
+deliberately names no slot count, because a count invites a retry once the count moves, and
+for this caller it never will.
 
 ---
 
@@ -485,9 +545,15 @@ per connection. Deliberately boring — this is a hot path.
  "session":"abc123","tool_use_id":"toolu_01...","depth":0,"wait_ms":20000}
 // <- granted
 {"v":1,"ok":true,"lease":"L-0d41","budget":6,"in_use":4,"share":2,"source":"local"}
+// <- waiting (GOV-08: interim, sent immediately when the daemon parks the request;
+//    exactly one grant or refusal then follows on the same connection)
+{"v":1,"ok":false,"reason":"waiting","wait_ms":20000,"budget":6,"in_use":6}
 // <- refused
 {"v":1,"ok":false,"reason":"capacity","budget":6,"in_use":6,"cpu":0.94,
- "thermal":"fair","source":"local"}
+ "thermal":"fair","source":"local","denials":1}
+// <- refused, nested fan-out (§6.3); never preceded by a "waiting" line
+{"v":1,"ok":false,"reason":"depth","budget":6,"in_use":4,"cpu":null,
+ "thermal":"nominal","source":"local"}
 // <- version rejected (the gate treats this exactly like an unreachable daemon)
 {"v":1,"ok":false,"reason":"unsupported_version","supported":[1]}
 
@@ -510,6 +576,19 @@ per connection. Deliberately boring — this is a hot path.
 `source` and `sources` are plural because the budget is modelled as a *set* of sources
 reduced by `min()`, with exactly one entry in v1. That plural is the entire cost of the
 seam in section 12.
+
+The `waiting` line is the one message that is not the end of an exchange, and it is
+**compatible in both directions** — which is what let it be added without a version bump. A
+gate that cannot wait sends `wait_ms: 0`, is never parked, and never sees it; that is what
+GOV-07's gate does and what any older binary still does. A new gate against an older daemon
+is refused immediately for capacity and never waits. A daemon sends it only when it has
+decided to park, and always follows it with exactly one grant or refusal. A client that reads
+a *second* `waiting` line MUST treat the daemon as unreachable and fail open, or the wait can
+be extended indefinitely one line at a time.
+
+`denials` is how many times that session has been refused inside a 60 s window, counting the
+current refusal. It is counted at the daemon because every gate is a separate process that
+remembers nothing.
 
 
 The daemon MUST tolerate a malformed line by closing that connection only. One bad client

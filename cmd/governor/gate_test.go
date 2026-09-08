@@ -465,8 +465,11 @@ func TestGateSendsTheAcquireRequest(t *testing.T) {
 			if req.Depth != tt.wantDepth {
 				t.Errorf("depth = %d, want %d", req.Depth, tt.wantDepth)
 			}
-			if req.WaitMS != 0 {
-				t.Errorf("wait_ms = %d, want 0 until GOV-08 lands block-and-wait", req.WaitMS)
+			// GOV-08: the gate asks to be held rather than refused. The daemon is free to
+			// ignore it, and an older daemon does; what matters here is that the ask is on
+			// the wire and matches what the gate is actually prepared to wait for.
+			if want := int(gateWaitMax / time.Millisecond); req.WaitMS != want {
+				t.Errorf("wait_ms = %d, want %d", req.WaitMS, want)
 			}
 			// principal is unused in v1 and must still be on the wire: retrofitting identity
 			// into a shipped format is the expensive alternative (design.md section 7).

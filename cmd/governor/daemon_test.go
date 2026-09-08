@@ -34,6 +34,8 @@ type reply struct {
 	Budget    int             `json:"budget"`
 	InUse     int             `json:"in_use"`
 	Waiting   int             `json:"waiting"`
+	WaitMS    int             `json:"wait_ms"`
+	Denials   int             `json:"denials"`
 	Share     int             `json:"share"`
 	Source    string          `json:"source"`
 	Supported []int           `json:"supported"`
