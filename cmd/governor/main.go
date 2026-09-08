@@ -38,6 +38,7 @@ var commands = []command{
 	{"status", "print the current budget and its holders", runStatus},
 	{"mcp", "serve the advisory MCP tool over stdio", stub("mcp")},
 	{"statusline", "render the one-line status for a session", stub("statusline")},
+	{"trace", "Phase 0 instrumentation: record hook events and 1 Hz host samples", runTrace},
 	{"install", "install the plugin, hooks and daemon", stub("install")},
 	{"uninstall", "reverse install and restore the settings backup", stub("uninstall")},
 	{"doctor", "diagnose a broken install and name each fix", stub("doctor")},

@@ -216,6 +216,33 @@ Two measured hazards the implementation MUST handle:
 | Memory pressure | free pages + swap-in rate | secondary cut trigger |
 | Per-agent cost | CPU across the `claude` process tree ÷ confirmed leases | Phase 2 refinement |
 
+**Identifying a session process: match `argv[0]`, not the executable name.** Measured in
+GOV-02, and it is the kind of mistake that produces a plausible-looking trace of nothing.
+Claude Code installs itself as a version-numbered file — `~/.local/share/claude/versions/2.1.263`
+— and launches it with `argv[0]` set to `claude`. `ps -o comm=` therefore says `claude` while
+`gopsutil`'s `Process.Name()`, which is the executable's base name, says `2.1.263`. A sampler
+keyed on the executable name finds **zero** sessions on a machine running six, and fails
+silently: every record still writes and every field still parses, so the trace simply reads as
+a permanently idle machine.
+
+The match is exact and case-sensitive, which excludes two neighbours that would otherwise
+poison the signal — the Claude **desktop app** (`Claude`, `Claude Helper`, an Electron tree
+with its own substantial CPU) and the browser native host, which runs the *same* executable
+but with `argv[0]` set to the full versioned path.
+
+**Descendants are counted, and reported separately from the roots.** A build, a test run or a
+language server launched by an agent is a child of the session process, not a session process
+itself, so root-only accounting measures the harness and misses the work. `signals.Tree`
+carries `CPURoots` and `CPU` as two numbers rather than one, because the gap between them is
+the answer Phase 0 exists to produce.
+
+**Agent records carry the payload's top-level key names.** `agent_type` is optional (§10.1),
+so a record without one is ambiguous: it may be a faithful note that the harness sent no type,
+or it may be the hook silently dropping a field — a defect in the instrument rather than a
+finding about the system. Real traces produced both-looking records within an hour of
+installation. The key list settles it per record, offline, without re-running anything. Names
+only, never values: the payload carries the agent's prompt.
+
 ### 5.2 AIMD
 
 Borrowed from TCP congestion control, and the right shape for the same reason: reclaim
@@ -411,7 +438,8 @@ claude-governor/
 ├── install.sh                    curl-able bootstrap: fetch binary, then `governor install`
 ├── bin/governor                  one static binary
 │   ├── daemon gate confirm release session status mcp statusline
-│   └── install uninstall doctor calibrate version
+│   ├── install uninstall doctor calibrate version
+│   └── trace                     Phase 0 only — removed when the gate ships
 ├── internal/
 │   ├── transport/                endpoint URL → net.Conn. unix:// in v1, tcp:// later
 │   ├── budget/                   Source interface; LocalSource in v1; reduced by min()
@@ -425,6 +453,18 @@ claude-governor/
 state  → ${CLAUDE_PLUGIN_DATA}/   config.json, leases.db, samples.jsonl
 socket → unix:///~/.claude/governor/sock
 ```
+
+`governor trace` is Phase 0 (GOV-02) and is deliberately not part of the surface above it.
+It is `trace agent` (the `SubagentStart`/`SubagentStop` hook body), `trace sample` (the 1 Hz
+sampler), `trace ensure` (the `SessionStart` hook that lazily starts the sampler), and its own
+`trace install`/`trace uninstall` pair. It gates nothing and decides nothing; it only records
+to `samples.jsonl`.
+
+It is a separate command family rather than a temporary meaning for `gate`, `confirm` and
+`release` on purpose: giving those a second definition now would leave the stories that
+implement them properly (GOV-05, GOV-07) guessing which one they are replacing. `internal/trace`
+and the whole `trace` family are deleted when Phase 1 lands, and `governor install` (GOV-18)
+supersedes `trace install`.
 
 The five `internal/` packages are not architecture astronautics: each is one interface with
 exactly one implementation in v1, and each is a seam section 12 names. If a package needs a
@@ -627,11 +667,46 @@ Uninstall is only verifiable if this list is exhaustive, so it is normative.
 | `~/.claude/governor/sock` | daemon | uninstall |
 | `${CLAUDE_PLUGIN_DATA}/` (config, leases, samples) | daemon | uninstall `--purge` only |
 
+Phase 0 (GOV-02) adds the rows below. They are listed here rather than in a story note
+because this table is what makes uninstall verifiable, and a path that is touched but not
+listed is a path uninstall silently stops covering. All of them go when Phase 1 replaces the
+`trace` family.
+
+| Path | Written by | Removed by |
+|---|---|---|
+| `~/.claude/settings.json` (three `trace` hooks) | `trace install`, merged after backup | `trace uninstall`, surgically |
+| `~/.claude/settings.json.governor-trace-backup-<ts>` | `trace install` | `trace uninstall` |
+| `~/.claude/governor/samples.jsonl` | `trace agent`, `trace sample` | by hand — it is the measurement, and deleting it on uninstall would throw away the phase |
+| `~/.claude/governor/sampler.lock` | `trace sample` | by hand |
+| `~/.claude/governor/sampler.log` | `trace sample` | by hand |
+| `~/.local/share/claude-governor/bin/governor` | staged by hand in Phase 0 | by hand, until `install.sh` owns it |
+
+`trace uninstall` removes our hook entries **surgically** rather than restoring the backup
+wholesale, because a wholesale restore would destroy anything the user added to
+`settings.json` in the meantime. It then compares the result against the backup and, when
+nothing else changed, writes the backup's original bytes — so the ordinary case is
+byte-identical, formatting and key order included, not merely equivalent. There is a test for
+exactly that.
+
+One consequence worth stating: while the hooks are installed, `settings.json` carries Go's
+map key ordering rather than the user's. No value is altered, and uninstall restores the
+original bytes.
+
 ### 13.4 Config and upgrade
 
 Config is `${CLAUDE_PLUGIN_DATA}/config.json` carrying `"schema": 1`. Unknown keys warn and
 are preserved, never crash — a config written by a newer version must not brick an older
 binary. Migration happens on read; the write is atomic (temp file, rename).
+
+**Never overwrite the binary in place.** Measured in GOV-02, on macOS: `cp` onto the existing
+`bin/governor` invalidates its code signature, and the kernel then **SIGKILLs** every
+subsequent execution — `exit=137`, no output, no error message anywhere. That defeats the one
+guarantee the hooks make, because a process killed by a signal cannot exit 0 no matter how
+carefully it is written; the failure is external to the program. During an in-place upgrade
+this would land on every hook of every live session at once. Upgrade MUST write the new
+binary to a temporary name in the same directory and `rename(2)` it over the old one, exactly
+as the config write does — a rename swaps the directory entry and leaves running processes on
+the old inode, so nothing in flight is signed wrong.
 
 Every protocol message carries `"v"`. A daemon that does not support a gate's version replies
 `unsupported_version`, and the gate treats that reply exactly like an unreachable daemon: it

@@ -110,6 +110,24 @@ spawn in the turn.
 
 Carries `agent_id`, so release keys off `agent_id` directly and needs no correlation.
 
+**Addendum, GOV-02 (2026-09-08), from live traces rather than probes.** `agent_type` is
+present as a *key* on every `SubagentStop` observed on 2.1.263, but its **value is sometimes
+empty**. Three of eleven records captured across five concurrent real sessions carried
+`"agent_type"` in the payload with nothing in it, while `agent_id`, `session_id`, `prompt_id`
+and `cwd` were all populated.
+
+This is a third state that §10.1 did not name, and it is worth naming because it is easy to
+misdiagnose: the earlier finding was that `tool_input.subagent_type` can be *absent*, and an
+absent key and an empty value are not the same observation. Consumers must distinguish
+
+    key absent      → the harness sent no such field
+    key, no value   → the harness sent the field, empty
+    key with value  → the ordinary case
+
+which is why the Phase 0 agent record carries the payload's top-level key names alongside the
+decoded fields. Anything keying a lease or a policy on `agent_type` must treat empty as
+"unknown type" and not as a type named "".
+
 ## 5. `SessionStart` / `SessionEnd`
 
 ```json
@@ -299,3 +317,28 @@ cd <scratch>/work && claude -p "<prompt that forces a spawn>" \
 `--setting-sources ""` is what keeps the user's real configuration out of the result, and
 `--output-format json` is what yields `subagent_stats` and `permission_denials` as an
 independent check on what the hooks saw.
+
+
+---
+
+## 9. Not the hook surface, but adjacent: never overwrite the binary in place
+
+Found in GOV-02 while redeploying the Phase 0 binary, and recorded here because it presents as
+a hook failure and would otherwise be debugged as one.
+
+`cp` onto a running Mach-O executable on macOS invalidates its code signature. Every
+subsequent execution is **SIGKILLed by the kernel** — the process exits `137`, writes nothing
+to stdout or stderr, and leaves no message in any log:
+
+```
+$ cp bin/governor ~/.local/share/claude-governor/bin/governor
+$ echo '{...}' | ~/.local/share/claude-governor/bin/governor trace agent
+$ echo $?
+137
+```
+
+The hook is correct, its tests pass, and it still cannot exit 0, because the failure is
+external to the program. Replacing the file by `rename(2)` instead — write a temp file in the
+same directory, then rename over it — leaves running processes on the old inode and the new
+one correctly signed. `design.md` §13.4 now requires it of upgrade, which is the moment this
+would otherwise hit every hook of every live session at once.
