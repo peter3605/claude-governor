@@ -32,9 +32,9 @@ type command struct {
 var commands = []command{
 	{"daemon", "run the budget daemon", runDaemon},
 	{"gate", "PreToolUse hook: acquire a lease for one subagent spawn", runGate},
-	{"confirm", "SubagentStart hook: bind a granted lease to a live agent", stub("confirm")},
-	{"release", "SubagentStop hook: return a lease to the pool", stub("release")},
-	{"session", "SessionStart/SessionEnd hook: register or drop a session", stub("session")},
+	{"confirm", "SubagentStart hook: bind a granted lease to a live agent", runConfirm},
+	{"release", "SubagentStop hook: return a lease to the pool", runRelease},
+	{"session", "SessionStart/SessionEnd hook: register or drop a session", runSession},
 	{"status", "print the current budget and its holders", runStatus},
 	{"mcp", "serve the advisory MCP tool over stdio", stub("mcp")},
 	{"statusline", "render the one-line status for a session", stub("statusline")},

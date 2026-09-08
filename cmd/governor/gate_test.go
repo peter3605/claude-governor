@@ -45,7 +45,7 @@ func runGateFor(t *testing.T, endpoint, payload string, dialer transport.Dialer)
 
 	var stdout, stderr bytes.Buffer
 	start := time.Now()
-	code := gate(strings.NewReader(payload), &stderr, dialer, gateBudget)
+	code := gate(strings.NewReader(payload), &stdout, &stderr, dialer, gateBudget)
 	elapsed := time.Since(start)
 
 	if code != 0 {
@@ -264,7 +264,7 @@ func TestGateFailsOpenWhenStdinNeverCloses(t *testing.T) {
 
 	var stdout, stderr bytes.Buffer
 	start := time.Now()
-	code := gate(blockingReader{}, &stderr, transport.Dial{}, gateBudget)
+	code := gate(blockingReader{}, &stdout, &stderr, transport.Dial{}, gateBudget)
 	elapsed := time.Since(start)
 
 	if code != 0 {
@@ -281,20 +281,120 @@ func TestGateFailsOpenWhenStdinNeverCloses(t *testing.T) {
 	}
 }
 
-// TestGateIsSilentOnEveryAnswer pins the v1 boundary: the gate asks, and whatever comes
-// back, the spawn proceeds and stdout stays empty. GOV-07 and GOV-08 are what make a
-// refusal mean something, and this test is what will notice if that arrives early and
-// half-built.
-func TestGateIsSilentOnEveryAnswer(t *testing.T) {
-	for _, reply := range []string{
-		`{"v":1,"ok":true,"lease":"L-0d41","budget":6,"in_use":4,"share":2,"source":"local"}`,
-		`{"v":1,"ok":false,"reason":"capacity","budget":6,"in_use":6,"cpu":0.94,"thermal":"fair","source":"local"}`,
-	} {
-		t.Run(reply[:24], func(t *testing.T) {
-			endpoint := listenerFunc(t, func(c net.Conn, _ []byte) { c.Write([]byte(reply + "\n")) })
-			runGateFor(t, endpoint, samplePayload, transport.Dial{})
-		})
+// TestGateIsSilentOnAGrant is what is left of GOV-05's TestGateIsSilentOnEveryAnswer.
+//
+// That test pinned the v1 boundary — the gate asks and, whatever comes back, stays silent —
+// and said in its own comment that it was there to notice if GOV-07 arrived early and
+// half-built. GOV-07 is this story, so the half of it covering a refusal has moved to
+// TestGateDeniesWhenTheDaemonRefuses below. The grant half is unchanged and stays here,
+// because it is the more important of the two: silence *is* the grant, and a gate that
+// started writing something on the happy path would suppress the user's own permission
+// prompts on every spawn.
+func TestGateIsSilentOnAGrant(t *testing.T) {
+	reply := `{"v":1,"ok":true,"lease":"L-0d41","budget":6,"in_use":4,"share":2,"source":"local"}`
+	endpoint := listenerFunc(t, func(c net.Conn, _ []byte) { c.Write([]byte(reply + "\n")) })
+
+	diag := runGateFor(t, endpoint, samplePayload, transport.Dial{})
+	if !strings.Contains(diag, "L-0d41") {
+		t.Errorf("stderr = %q, want the granted lease named", diag)
 	}
+}
+
+// TestGateDeniesWhenTheDaemonRefuses is the enforcement, and the only path in this file
+// where the gate is not silent.
+//
+// It goes through runGateDeny rather than runGateFor because the two assert opposite things
+// about stdout, which is the entire difference GOV-07 introduced.
+func TestGateDeniesWhenTheDaemonRefuses(t *testing.T) {
+	reply := `{"v":1,"ok":false,"reason":"capacity","budget":6,"in_use":6,` +
+		`"cpu":0.94,"thermal":"fair","source":"local"}`
+	endpoint := listenerFunc(t, func(c net.Conn, _ []byte) { c.Write([]byte(reply + "\n")) })
+
+	out := runGateDeny(t, endpoint, samplePayload)
+
+	if got := out.HookSpecificOutput.HookEventName; got != "PreToolUse" {
+		t.Errorf("hookEventName = %q, want PreToolUse", got)
+	}
+	if got := out.HookSpecificOutput.PermissionDecision; got != "deny" {
+		t.Errorf("permissionDecision = %q, want deny", got)
+	}
+
+	// The reason reaches the model verbatim (docs/hook-surface.md section 10.2), and
+	// design.md section 4.2 requires it to name the number, name the cause, and give one
+	// concrete instruction. A vague refusal produces a retry loop.
+	reason := out.HookSpecificOutput.PermissionDecisionReason
+	for _, want := range []string{"6/6", "94%", "fair", "inline", "Do not retry"} {
+		if !strings.Contains(reason, want) {
+			t.Errorf("permissionDecisionReason = %q, missing %q", reason, want)
+		}
+	}
+}
+
+// A deny must never state a fact the daemon did not send. cpu is null until GOV-12 lands
+// the sampler and thermal is "unknown" on Linux by design, so both clauses are conditional
+// — and a reason that says "CPU 0%" on a machine nobody has measured is a fabrication that
+// a person reading the refusal has no way to catch.
+func TestGateDenyClaimsOnlyWhatTheDaemonSent(t *testing.T) {
+	reply := `{"v":1,"ok":false,"reason":"capacity","budget":4,"in_use":4,` +
+		`"cpu":null,"thermal":"unknown","source":"local"}`
+	endpoint := listenerFunc(t, func(c net.Conn, _ []byte) { c.Write([]byte(reply + "\n")) })
+
+	reason := runGateDeny(t, endpoint, samplePayload).HookSpecificOutput.PermissionDecisionReason
+
+	if !strings.Contains(reason, "4/4") {
+		t.Errorf("permissionDecisionReason = %q, want the slot count", reason)
+	}
+	for _, unwanted := range []string{"CPU", "thermal"} {
+		if strings.Contains(reason, unwanted) {
+			t.Errorf("permissionDecisionReason = %q, must not mention %q when the daemon sent none",
+				reason, unwanted)
+		}
+	}
+}
+
+// A refusal this binary cannot interpret is treated exactly like an unreachable daemon.
+//
+// This is the narrowest reading of invariant 1 that still enforces anything, and it is the
+// upgrade posture design.md section 7 settles: during an upgrade there will be a daemon of
+// one version and gates of another, and a gate that honoured a reason it did not understand
+// would block spawns on a policy it cannot explain to the user. Ungoverned spawns are
+// acceptable in that window; a wrongly blocked one is not.
+func TestGateFailsOpenOnARefusalItDoesNotUnderstand(t *testing.T) {
+	reply := `{"v":1,"ok":false,"reason":"quota_exhausted_tier_two","budget":6,"in_use":2,"source":"remote"}`
+	endpoint := listenerFunc(t, func(c net.Conn, _ []byte) { c.Write([]byte(reply + "\n")) })
+
+	diag := runGateFor(t, endpoint, samplePayload, transport.Dial{})
+	if !strings.Contains(diag, "does not recognise") {
+		t.Errorf("stderr = %q, want it to name the unrecognised reason", diag)
+	}
+}
+
+// runGateDeny runs the gate against a refusing daemon and returns the decoded decision. It
+// asserts the parts of the contract a deny shares with a grant — exit 0, inside the
+// latency ceiling — and that stdout carries exactly one well-formed decision.
+func runGateDeny(t *testing.T, endpoint, payload string) denyOutput {
+	t.Helper()
+	t.Setenv(transport.EndpointEnv, endpoint)
+
+	var stdout, stderr bytes.Buffer
+	start := time.Now()
+	code := gate(strings.NewReader(payload), &stdout, &stderr, transport.Dial{}, gateBudget)
+	elapsed := time.Since(start)
+
+	// A deny is still exit 0. The decision travels on stdout; a non-zero exit would be a
+	// hook error, which is a different thing entirely and is not what a refusal means.
+	if code != 0 {
+		t.Errorf("exit code = %d, want 0 even for a deny (stderr: %s)", code, stderr.String())
+	}
+	if elapsed > failOpenCeiling {
+		t.Errorf("took %v, want under %v", elapsed.Round(time.Millisecond), failOpenCeiling)
+	}
+
+	var out denyOutput
+	if err := json.Unmarshal(stdout.Bytes(), &out); err != nil {
+		t.Fatalf("stdout = %q, want one PreToolUse decision object: %v", stdout.String(), err)
+	}
+	return out
 }
 
 // TestGateSendsTheAcquireRequest checks what actually goes on the wire. Nothing reads it
