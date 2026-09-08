@@ -8,18 +8,37 @@ import (
 )
 
 // Default TTLs. Both are backstops, not the primary mechanism, and they are deliberately
-// far apart.
+// far apart. Both were checked against measured timings in GOV-09; the numbers are below,
+// because a constant that cannot say where it came from is a constant nobody dares change.
 //
 // A tentative lease is reclaimed quickly because the thing it is waiting for — the spawn
 // PreToolUse announced — either happens within moments or never happens at all: the user
 // declines the permission prompt, the turn is interrupted, the model changes its mind.
 // Without this reclaim, every abandoned spawn would consume a slot permanently.
 //
+// THE TENTATIVE TTL IS MEASURED. hook-surface.md section 7 timed PreToolUse to its own
+// SubagentStart at 35–60 ms, with four spawns forced into one assistant message and
+// serialised ~0.9 s apart. Thirty seconds is roughly 500x the observed gap, which is the
+// right kind of margin for a backstop: it has to outlive a legitimately slow spawn, because
+// reclaiming a lease out from under a spawn that is merely slow hands the same slot out
+// twice.
+//
 // A confirmed lease is reclaimed slowly because the cost of the two mistakes is not
 // symmetric. Reaping a live agent's lease double-counts the budget and over-subscribes the
 // machine; keeping a dead one costs one slot until the TTL expires. Liveness is what
 // actually collects confirmed leases (a session that died takes its leases with it); the
-// TTL only catches an agent whose SubagentStop was lost while its session kept running.
+// TTL only catches an agent whose SubagentStop was lost while its session kept running, or
+// an owner that lingers as a zombie, which liveness cannot see through.
+//
+// THE CONFIRMED TTL IS BOUNDED, NOT MEASURED, and the distinction is honest rather than
+// pedantic. GOV-09 set out to calibrate it against the SubagentStart timings GOV-02
+// recorded and found there are almost none to calibrate against: SubagentStart does not fire
+// in ordinary interactive sessions on Claude Code 2.1.263 (hook-surface.md section 8.1), so
+// leases are rarely confirmed and this TTL rarely governs anything. What evidence exists
+// bounds an agent's life well under a minute — 1.7 s to 8.3 s across the probe sessions that
+// did emit both events, and a p99 of 43 s across 26 Agent tool calls timed in the
+// transcripts. Half an hour is ~40x the longest of those. It stays generous on purpose, and
+// it stays a guess about the tail rather than a measurement of it.
 const (
 	DefaultTentativeTTL = 30 * time.Second
 	DefaultConfirmedTTL = 30 * time.Minute
@@ -290,8 +309,8 @@ func (t *Table) StartSession(s Session) {
 	t.sessions[s.ID] = s
 }
 
-// Reap drops leases that have outlived their TTL, and confirmed leases whose owner is gone.
-// It returns how many it dropped.
+// Reap drops leases that have outlived their TTL, leases whose registered session is gone,
+// and confirmed leases whose own owner is gone. It returns how many it dropped.
 //
 // Invariant 2 (design.md section 3): leases expire on their own. The stop hooks are assumed
 // never to fire — leaks are the default outcome here, not the edge case — so this is the
@@ -301,10 +320,12 @@ func (t *Table) Reap() int {
 	defer t.mu.Unlock()
 
 	now := t.opt.Now()
+	dead := t.deadSessionsLocked()
 	dropped := 0
 	for _, l := range t.snapshotLeasesLocked() {
 		switch {
 		case !l.ExpiresAt.IsZero() && now.After(l.ExpiresAt):
+		case dead[l.Session]:
 		case l.State == Confirmed && t.opt.Liveness != nil && !t.opt.Liveness.Alive(*l):
 		default:
 			continue
@@ -312,7 +333,55 @@ func (t *Table) Reap() int {
 		t.dropLocked(l)
 		dropped++
 	}
+	// A session whose process is gone is not coming back, and leaving it registered would
+	// have the reaper stat a dead PID every two seconds forever and have status keep
+	// reporting a holder that no longer exists.
+	for id := range dead {
+		delete(t.sessions, id)
+		delete(t.pending, id)
+	}
 	return dropped
+}
+
+// deadSessionsLocked names the registered sessions whose own process is gone.
+//
+// This is what makes a SIGKILLed session's *tentative* leases collectable (GOV-09). A
+// tentative lease has no owner of its own — OwnerPID is bound at Confirm and nowhere else —
+// so the confirmed-lease liveness check below cannot see it, and before this it waited out
+// the full tentative TTL while its session was already gone. Mid-fan-out is exactly the
+// state where that matters: some leases confirmed, one still tentative, and the session
+// killed between the two.
+//
+// The normal path for this is SessionEnd calling ReleaseSession. This is the path for when
+// there is no normal path — kill -9, a crashed session, a machine that slept — which is the
+// case the reaper exists for in the first place.
+//
+// It asks Liveness about a synthesised Lease carrying the session's own PID rather than
+// widening the interface to take a Session. The seam has one method for one question, "is
+// this holder still running?", and a session is just another holder; adding a second method
+// would be a change to the tier-two contract for no gain, since a heartbeat implementation
+// answers both from the same table.
+func (t *Table) deadSessionsLocked() map[string]bool {
+	if t.opt.Liveness == nil {
+		return nil
+	}
+	var dead map[string]bool
+	for id, s := range t.sessions {
+		// A session that registered no PID is left to its leases' TTLs. The owner walk
+		// reports unknown rather than guessing (design.md section 4.3), and an unknown
+		// owner must never be treated as a dead one.
+		if s.PID <= 0 {
+			continue
+		}
+		if t.opt.Liveness.Alive(Lease{Session: id, OwnerPID: s.PID, OwnerStarted: s.PIDStarted}) {
+			continue
+		}
+		if dead == nil {
+			dead = map[string]bool{}
+		}
+		dead[id] = true
+	}
+	return dead
 }
 
 // dropLocked removes one lease and every index pointing at it.
