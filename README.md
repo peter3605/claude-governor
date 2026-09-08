@@ -16,4 +16,28 @@ load and thermal pressure, and every session asks it before spawning.
 - **Tells the model the number.** An MCP tool lets a session ask how many agents it may run,
   so it plans a right-sized fan-out instead of being refused into shape.
 
-Status: **designed, not built.** See [`docs/design.md`](docs/design.md).
+Status: **Phase 0 — measuring.** The control loop is designed but not built; what runs today
+is instrumentation only. See [`docs/design.md`](docs/design.md).
+
+## Phase 0
+
+Before anything is governed, the machine is measured, so that the setpoint and the ceiling
+come from traces rather than from a number that felt about right on one laptop.
+
+```sh
+make build
+governor trace install      # merges three hooks into ~/.claude/settings.json, after a backup
+governor trace status       # where the log is, and whether the sampler is up
+governor trace uninstall    # removes them again, restoring the original bytes
+```
+
+That installs a `SubagentStart`/`SubagentStop` hook that records each subagent, and a
+`SessionStart` hook that lazily starts a 1 Hz sampler. Both append newline-delimited JSON to
+`~/.claude/governor/samples.jsonl`. Nothing gates, blocks or denies anything, the hooks exit 0
+whatever happens, and the sampler stops on its own once no session has been running for five
+minutes.
+
+Each sample carries host CPU, load average, free memory and thermal state, plus the CPU of
+the `claude` process tree split two ways — the session processes alone, and those plus every
+descendant. The gap between the two is the point: it separates what the agents burn from what
+they launched.
