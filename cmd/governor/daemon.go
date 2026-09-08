@@ -28,11 +28,14 @@ import (
 // single host (section 12.2) — a restart loses every lease and the reaper cleans up in
 // seconds.
 //
+// GOV-08 added the wait queue (section 6.2) and the depth limit (section 6.3), so an
+// acquire with no room now has three possible answers rather than one: refuse, refuse
+// because the caller is itself a subagent, or hold the connection open until a slot frees.
+//
 // What is deliberately NOT here: the control loop. The budget is a constant in this story
 // on purpose, because a moving budget debugged against a moving lease table is two unknowns
-// at once (GOV-14 lands AIMD). Also absent are the wait queue and max-min fair share
-// (section 6.1, 6.2) and the depth limit (section 6.3) — this story serves the five
-// operations and keeps the lease table honest under concurrency.
+// at once (GOV-14 lands AIMD). Max-min fair share (section 6.1) is also still absent: the
+// wait queue below decides *order* and does not yet decide who may join it.
 
 // defaultBudget is how many concurrent agents the daemon allows until the control loop
 // exists.
@@ -45,6 +48,28 @@ const defaultBudget = 4
 
 // reapInterval is how often expired and orphaned leases are collected (design.md 4.3).
 const reapInterval = 2 * time.Second
+
+// maxFanOutDepth is the deepest caller the governor will take a lease for (design.md
+// section 6.3).
+//
+// Zero means only the main session may fan out. The wire field is the *caller's* depth,
+// derived by the gate from the presence of a top-level agent_id in the PreToolUse payload,
+// which is the only depth signal the hook surface carries (docs/hook-surface.md section 2):
+// absent means the main session is spawning, present means a subagent is. So there are
+// exactly two distinguishable values and this constant picks between them.
+//
+// The point is the nested deadlock: if a subagent could take a lease, every slot could be
+// held by an agent that is itself waiting for a slot to spawn children, and the machine
+// deadlocks at full budget with nothing running. Refusing outright is the simplest correct
+// answer, and a nested fan-out is rarely what was wanted in the first place.
+const maxFanOutDepth = 0
+
+// maxParkedWait caps how long a client can ask to be held for, whatever it sends.
+//
+// The gate asks for 20 s (design.md section 4.2) and the gate hook's own timeout is 30 s
+// (section 4.1). This exists so that a buggy or hostile client cannot pin a connection and
+// a queue place for longer than any real gate would.
+const maxParkedWait = 30 * time.Second
 
 // connDeadline bounds one client's whole exchange.
 //
@@ -113,6 +138,30 @@ type refuseReply struct {
 	CPU     *float64        `json:"cpu"`
 	Thermal signals.Thermal `json:"thermal"`
 	Source  string          `json:"source"`
+	// Denials is how many times this session has been refused inside denyWindow, counting
+	// this one. The gate escalates its reason text on it. It is counted here rather than in
+	// the gate because each gate is a separate process that remembers nothing, and this is
+	// the only place that can see a session's refusals across all of them.
+	Denials int `json:"denials"`
+}
+
+// waitingReply is the interim answer to an acquire the daemon has decided to park
+// (design.md section 7). It is followed by a grantReply or a refuseReply on the same
+// connection.
+//
+// It exists for the gate's benefit, not the daemon's, and it is what makes block-and-wait
+// compatible with invariant 1. A gate cannot safely wait twenty seconds for an answer it
+// has no evidence is coming, because a wedged daemon is indistinguishable from a busy one
+// until it replies. This line is that evidence: it says "I am alive, I have your request,
+// and you will have an answer within wait_ms". Only after reading it does the gate extend
+// its own deadline past the 100 ms of section 4.4.
+type waitingReply struct {
+	V      int    `json:"v"`
+	OK     bool   `json:"ok"`
+	Reason string `json:"reason"`
+	WaitMS int    `json:"wait_ms"`
+	Budget int    `json:"budget"`
+	InUse  int    `json:"in_use"`
 }
 
 // versionReply answers a request in a protocol version this binary does not speak.
@@ -172,6 +221,10 @@ type daemon struct {
 	table   *lease.Table
 	sources []budget.Source
 	thermal func() signals.Thermal
+	// waits is the FIFO of parked acquires (design.md section 6.2).
+	waits *waitQueue
+	// denials is what the refusal text escalates on, and what the wait's rate limit reads.
+	denials *denyLog
 	// diag is where a handler's complaints go. It is never the reply: a client that sends
 	// rubbish is told nothing, because there is nothing useful to tell it and a broker that
 	// echoes attacker-controlled input is a broker that can be used to write to a log.
@@ -224,6 +277,8 @@ func newDaemon(limit int, diag io.Writer) *daemon {
 		table:   table,
 		sources: []budget.Source{budget.LocalSource{N: limit, InUse: table.InUse}},
 		thermal: signals.ReadThermal,
+		waits:   &waitQueue{},
+		denials: newDenyLog(nil),
 		diag:    diag,
 	}
 }
@@ -282,6 +337,11 @@ func (d *daemon) reap(ctx context.Context) {
 			if n := d.table.Reap(); n > 0 {
 				fmt.Fprintf(d.diag, "governor daemon: reaped %d lease(s)\n", n)
 			}
+			// Unconditionally, not only when something was reaped. This is the backstop for
+			// a wake-up that was somehow missed on the release path; a waiter should never
+			// sit through its whole wait next to a free slot because of a lost signal.
+			d.pump()
+			d.denials.sweep()
 		}
 	}
 }
@@ -319,14 +379,40 @@ func (d *daemon) handle(conn net.Conn) {
 		return
 	}
 
-	out, err := json.Marshal(d.dispatch(req))
+	reply := d.dispatch(req)
+
+	// A parked acquire is answered twice: once immediately to say it has been parked, and
+	// once when it resolves. The interim line must reach the client BEFORE the wait starts,
+	// because it is the client's only evidence that waiting is safe — sending it afterwards
+	// would be sending it too late to be worth anything.
+	if p, ok := reply.(*parkedAcquire); ok {
+		if !d.write(conn, p.interim) {
+			p.cancel()
+			return
+		}
+		// The exchange is now legitimately longer than one round trip.
+		if err := conn.SetDeadline(time.Now().Add(p.wait + connDeadline)); err != nil {
+			p.cancel()
+			return
+		}
+		reply = p.resolve()
+	}
+
+	d.write(conn, reply)
+}
+
+// write marshals one reply and sends it, reporting whether the client got it.
+func (d *daemon) write(conn net.Conn, reply any) bool {
+	out, err := json.Marshal(reply)
 	if err != nil {
 		fmt.Fprintf(d.diag, "governor daemon: encode reply: %v\n", err)
-		return
+		return false
 	}
 	if _, err := conn.Write(append(out, '\n')); err != nil {
 		fmt.Fprintf(d.diag, "governor daemon: write reply: %v\n", err)
+		return false
 	}
+	return true
 }
 
 // dispatch answers one well-formed request. The return is any because each operation has
@@ -355,18 +441,98 @@ func (d *daemon) dispatch(req request) any {
 	}
 }
 
-// acquire takes a tentative lease if the budget has room.
+// parkedAcquire is an acquire the daemon is holding rather than answering. handle writes
+// interim, then blocks in resolve for the final answer, or calls cancel if the client went
+// away before the wait could even be announced.
+type parkedAcquire struct {
+	interim waitingReply
+	wait    time.Duration
+	resolve func() any
+	cancel  func()
+}
+
+// acquire takes a tentative lease if the budget has room, and decides what to do when it
+// does not: refuse the caller outright, refuse it for capacity, or park it.
 func (d *daemon) acquire(req request) any {
 	limit, quotas := budget.Min(context.Background(), d.sources)
+	src := sourceName(quotas)
 
-	l, ok := d.table.Acquire(req.Session, req.Depth, limit)
-	if !ok {
+	// The depth limit comes first, and deliberately never waits. A nested spawn is not
+	// short of a slot, it is not allowed one, and parking it for twenty seconds before
+	// saying so would stall a session to reach an answer that was already known.
+	if req.Depth > maxFanOutDepth {
 		return refuseReply{
-			V: protocolVersion, Reason: "capacity",
-			Budget: limit, InUse: d.table.InUse(), Source: sourceName(quotas),
+			V: protocolVersion, Reason: "depth",
+			Budget: limit, InUse: d.table.InUse(), Source: src,
 			CPU: nil, Thermal: d.thermal(),
 		}
 	}
+
+	if l, ok := d.table.Acquire(req.Session, req.Depth, limit); ok {
+		return d.granted(l, limit, src)
+	}
+
+	wait := time.Duration(req.WaitMS) * time.Millisecond
+	if wait > maxParkedWait {
+		wait = maxParkedWait
+	}
+	// A client that cannot wait, and a client that has just been refused, are both answered
+	// now. The second is the rate limit: without it a session retrying in a loop would take
+	// a place in the FIFO on every attempt and hold it for the whole of wait_max, crowding
+	// out sessions that asked once and are waiting properly.
+	if wait <= 0 || d.denials.throttled(req.Session) {
+		return d.refuseForCapacity(req.Session, limit, src)
+	}
+
+	w := &waiter{session: req.Session, depth: req.Depth, granted: make(chan lease.Lease, 1)}
+	d.waits.enqueue(w)
+	// A slot may have freed between the failed Acquire above and the enqueue. Pumping here
+	// closes that window without anything having to poll for it.
+	d.pump()
+	select {
+	case l := <-w.granted:
+		// It was never really a wait. Answer as an ordinary grant rather than sending an
+		// interim line the client would have to read for nothing.
+		return d.granted(l, limit, src)
+	default:
+	}
+
+	return &parkedAcquire{
+		interim: waitingReply{
+			V: protocolVersion, Reason: "waiting",
+			WaitMS: int(wait / time.Millisecond),
+			Budget: limit, InUse: d.table.InUse(),
+		},
+		wait: wait,
+		resolve: func() any {
+			timer := time.NewTimer(wait)
+			defer timer.Stop()
+			select {
+			case l := <-w.granted:
+				// The pump removed it from the queue before handing over the lease.
+				return d.granted(l, limit, src)
+			case <-timer.C:
+				if l, got := d.waits.drop(w); got {
+					// Granted at the very moment the wait expired. The lease exists and
+					// this caller owns it, so honour it rather than refusing a spawn that
+					// already holds a slot.
+					return d.granted(l, limit, src)
+				}
+				return d.refuseForCapacity(req.Session, limit, src)
+			}
+		},
+		cancel: func() {
+			if l, got := d.waits.drop(w); got {
+				// The client is gone and this lease will never be confirmed. Hand the slot
+				// back now instead of letting it wait out its TTL.
+				d.table.Drop(l.ID)
+			}
+		},
+	}
+}
+
+// granted builds the reply for a lease that has been taken, however it was taken.
+func (d *daemon) granted(l lease.Lease, limit int, src string) grantReply {
 	return grantReply{
 		V: protocolVersion, OK: true, Lease: l.ID,
 		Budget: limit, InUse: d.table.InUse(),
@@ -376,7 +542,49 @@ func (d *daemon) acquire(req request) any {
 		// of the policy, not a placeholder — when allocation lands it changes this number
 		// rather than adding the field.
 		Share:  limit,
-		Source: sourceName(quotas),
+		Source: src,
+	}
+}
+
+// refuseForCapacity builds a capacity refusal and counts it against the session.
+//
+// The count is what the gate's reason text escalates on. It is taken here, at the moment of
+// refusal, rather than anywhere the request merely passed through — a parked acquire that
+// ends in a grant must not count as a denial, or a session that waited patiently would be
+// shouted at on its next refusal.
+func (d *daemon) refuseForCapacity(session string, limit int, src string) refuseReply {
+	return refuseReply{
+		V: protocolVersion, Reason: "capacity",
+		Budget: limit, InUse: d.table.InUse(), Source: src,
+		CPU: nil, Thermal: d.thermal(),
+		Denials: d.denials.record(session),
+	}
+}
+
+// pump hands freed slots to the longest-waiting callers, in order.
+//
+// The FIFO is strict: the walk stops at the first waiter that cannot be satisfied rather
+// than skipping over it to one that can. Skipping would let a session asking for slots in a
+// tight loop overtake a session that has been waiting, which is the starvation design.md
+// section 6.2 exists to prevent.
+//
+// It holds the queue lock across the acquire so that a slot cannot be taken by a fresh
+// acquire in between deciding a waiter can have it and handing it over.
+func (d *daemon) pump() {
+	d.waits.mu.Lock()
+	defer d.waits.mu.Unlock()
+
+	for len(d.waits.q) > 0 {
+		w := d.waits.q[0]
+		limit, _ := budget.Min(context.Background(), d.sources)
+		l, ok := d.table.Acquire(w.session, w.depth, limit)
+		if !ok {
+			return
+		}
+		d.waits.q = d.waits.q[1:]
+		// Never blocks: granted is buffered, and a waiter is removed from the queue at the
+		// same time as it is written to, so it is written to at most once.
+		w.granted <- l
 	}
 }
 
@@ -400,6 +608,10 @@ func (d *daemon) release(req request) any {
 	// SubagentStop fires more than once for the same agent, so "held nothing" is a normal
 	// answer rather than a failure.
 	ok := d.table.Release(req.Session, req.AgentID)
+	if ok {
+		// The slot that just came free belongs to whoever has waited longest for it.
+		d.pump()
+	}
 	r := ackReply{V: protocolVersion, OK: ok, InUse: d.table.InUse()}
 	if !ok {
 		r.Reason = "no_lease"
@@ -423,6 +635,9 @@ func (d *daemon) session(req request) any {
 		// SessionEnd is what stops a dead session's leases from waiting out their TTL.
 		n := d.table.ReleaseSession(req.Session)
 		fmt.Fprintf(d.diag, "governor daemon: session %s ended, released %d lease(s)\n", req.Session, n)
+		if n > 0 {
+			d.pump()
+		}
 		return ackReply{V: protocolVersion, OK: true, InUse: d.table.InUse()}
 	default:
 		return ackReply{V: protocolVersion, Reason: "unknown_action", InUse: d.table.InUse()}
@@ -447,8 +662,8 @@ func (d *daemon) status() statusReply {
 	}
 	return statusReply{
 		V: protocolVersion, Budget: limit, InUse: snap.InUse,
-		// There is no wait queue in v1 (design.md section 6.2), so nobody is ever waiting.
-		Waiting: 0,
+		// Parked acquires, from the FIFO of design.md section 6.2.
+		Waiting: d.waits.len(),
 		// Null until the daemon has a sampler (GOV-12). Zero would read as an idle machine.
 		CPU:      nil,
 		Thermal:  d.thermal(),

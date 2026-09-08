@@ -213,7 +213,7 @@ func owningSessionPID(diag io.Writer) (int, int64) {
 // It is the gate's shape without the decision: same budget, same backstop, same silence on
 // stdout. It returns the process exit code, which is always 0.
 func lifecycleHook(stdin io.Reader, stderr io.Writer, dialer transport.Dialer, budget time.Duration, build builder) int {
-	return withBudget(stderr, budget, func(diag io.Writer, deadline time.Time) {
+	return withBudget(stderr, budget, func(diag io.Writer, clock *budgetClock) {
 		var p lifecyclePayload
 		if !decodePayload(stdin, diag, &p) {
 			return
@@ -223,7 +223,7 @@ func lifecycleHook(stdin io.Reader, stderr io.Writer, dialer transport.Dialer, b
 			return
 		}
 		var ack hookAck
-		if !exchange(diag, dialer, deadline, req, &ack) {
+		if !exchange(diag, dialer, clock.Deadline(), req, &ack) {
 			return
 		}
 		if ack.V != protocolVersion {
@@ -234,6 +234,50 @@ func lifecycleHook(stdin io.Reader, stderr io.Writer, dialer transport.Dialer, b
 		fmt.Fprintf(diag, "governor %s: ok=%v reason=%q lease=%q in_use=%d\n",
 			req.Op, ack.OK, ack.Reason, ack.Lease, ack.InUse)
 	})
+}
+
+// budgetClock is the hook's wall-clock allowance, and the only thing in a hook body that is
+// allowed to move.
+//
+// It moves for exactly one reason (GOV-08): the daemon has told the gate, on the socket,
+// that it is parking the request and will answer within wait_ms. Until that line arrives
+// the allowance is the 100 ms of design.md section 4.4, so every failure that does not
+// involve a live daemon — no socket, no listener, a listener that accepts and never
+// answers — still fails open on the same ceiling it always did. The extension is licensed
+// by evidence, never by intent: asking for a wait does not buy one.
+type budgetClock struct {
+	mu       sync.Mutex
+	deadline time.Time
+	// moved carries one token per extension. Buffered and non-blocking, so an extension
+	// never blocks the worker on the watchdog reading it.
+	moved chan struct{}
+}
+
+func newBudgetClock(deadline time.Time) *budgetClock {
+	return &budgetClock{deadline: deadline, moved: make(chan struct{}, 1)}
+}
+
+// Deadline is the instant the allowance currently expires.
+func (b *budgetClock) Deadline() time.Time {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.deadline
+}
+
+// ExtendTo pushes the deadline out to t. It never pulls it in: a clock that could be
+// shortened would be a second way to fail a spawn.
+func (b *budgetClock) ExtendTo(t time.Time) {
+	b.mu.Lock()
+	if !t.After(b.deadline) {
+		b.mu.Unlock()
+		return
+	}
+	b.deadline = t
+	b.mu.Unlock()
+	select {
+	case b.moved <- struct{}{}:
+	default:
+	}
 }
 
 // withBudget runs fn under a wall-clock budget and returns 0 whatever happens.
@@ -247,8 +291,9 @@ func lifecycleHook(stdin io.Reader, stderr io.Writer, dialer transport.Dialer, b
 // There is deliberately no os.Exit here. An armed exit that a test forgets to disarm
 // reports a pass for every test that never ran, which is a mistake this repo has already
 // made once (GOV-02).
-func withBudget(stderr io.Writer, budget time.Duration, fn func(diag io.Writer, deadline time.Time)) int {
-	deadline := time.Now().Add(budget)
+func withBudget(stderr io.Writer, budget time.Duration, fn func(diag io.Writer, clock *budgetClock)) int {
+	start := time.Now()
+	clock := newBudgetClock(start.Add(budget))
 
 	// Diagnostics go through a writer that can be switched off, so that work still in
 	// flight when the budget expires cannot write to stderr after this function has
@@ -265,15 +310,33 @@ func withBudget(stderr io.Writer, budget time.Duration, fn func(diag io.Writer, 
 				fmt.Fprintf(diag, "governor: recovered: %v\n", r)
 			}
 		}()
-		fn(diag, deadline)
+		fn(diag, clock)
 	}()
 
-	select {
-	case <-done:
-	case <-time.After(time.Until(deadline)):
-		fmt.Fprintf(diag, "governor: budget of %v expired, failing open\n", budget)
+	for {
+		deadline := clock.Deadline()
+		timer := time.NewTimer(time.Until(deadline))
+		select {
+		case <-done:
+			timer.Stop()
+			return 0
+		case <-clock.moved:
+			// The daemon is parking the request. Re-arm on the new deadline.
+			timer.Stop()
+		case <-timer.C:
+			// Re-read rather than trusting the fired timer: an extension racing the
+			// expiry must win, because the alternative is failing open on a request the
+			// daemon has already promised to answer.
+			if clock.Deadline().After(deadline) {
+				continue
+			}
+			// The allowance reported is the one that actually expired, which is the
+			// original budget unless the daemon bought an extension by parking.
+			fmt.Fprintf(diag, "governor: budget of %v expired, failing open\n",
+				deadline.Sub(start).Round(time.Millisecond))
+			return 0
+		}
 	}
-	return 0
 }
 
 // decodePayload reads one bounded hook payload from stdin into v.
@@ -301,10 +364,37 @@ func decodePayload(stdin io.Reader, diag io.Writer, v any) bool {
 // Every failure means the same thing to every caller — fail open — so they are reported to
 // stderr and reduced to a single false.
 func exchange(diag io.Writer, dialer transport.Dialer, deadline time.Time, req any, out any) bool {
+	conn, r, ok := dialAndSend(diag, dialer, deadline, req)
+	if !ok {
+		return false
+	}
+	defer conn.Close()
+	if err := readLineInto(r, out); err != nil {
+		fmt.Fprintf(diag, "governor: read response: %v\n", err)
+		return false
+	}
+	return true
+}
+
+// dialAndSend opens the socket, writes one request, and returns the connection with the
+// reader to take replies from. The connection deadline is set to the same instant as the
+// dial's, and the caller closes the connection.
+//
+// It is split out of exchange for the gate alone (GOV-08): a parked acquire is answered
+// twice, and only the gate has a reason to read a second line.
+//
+// The reader is returned rather than made per read, and that is load-bearing rather than
+// tidy. A bufio.Reader fills from the socket in blocks, so reading the first line can
+// easily pull the second into the buffer with it — the daemon's two writes are two syscalls
+// but not necessarily two reads. A fresh reader for the second line would find that buffer
+// discarded and block on a socket with nothing left to send, and the gate would sit there
+// until its grace expired and then fail open. The failure is invisible in any test where
+// the daemon is slow enough to send the lines separately, which is most of them.
+func dialAndSend(diag io.Writer, dialer transport.Dialer, deadline time.Time, req any) (net.Conn, *bufio.Reader, bool) {
 	endpoint, err := transport.DefaultEndpoint()
 	if err != nil {
 		fmt.Fprintf(diag, "governor: resolve endpoint: %v\n", err)
-		return false
+		return nil, nil, false
 	}
 
 	ioDeadline := deadline.Add(-ioMargin)
@@ -315,35 +405,35 @@ func exchange(diag io.Writer, dialer transport.Dialer, deadline time.Time, req a
 	conn, err := dialer.Dial(ctx, endpoint)
 	if err != nil {
 		fmt.Fprintf(diag, "governor: dial %s: %v\n", endpoint, err)
-		return false
+		return nil, nil, false
 	}
-	defer conn.Close()
 
 	if err := conn.SetDeadline(ioDeadline); err != nil {
 		fmt.Fprintf(diag, "governor: set deadline: %v\n", err)
-		return false
+		conn.Close()
+		return nil, nil, false
 	}
 
 	line, err := json.Marshal(req)
 	if err != nil {
 		fmt.Fprintf(diag, "governor: encode request: %v\n", err)
-		return false
+		conn.Close()
+		return nil, nil, false
 	}
 	if _, err := conn.Write(append(line, '\n')); err != nil {
 		fmt.Fprintf(diag, "governor: write request: %v\n", err)
-		return false
+		conn.Close()
+		return nil, nil, false
 	}
-	if err := readLineInto(conn, out); err != nil {
-		fmt.Fprintf(diag, "governor: read response: %v\n", err)
-		return false
-	}
-	return true
+	return conn, bufio.NewReaderSize(io.LimitReader(conn, maxResponse), 4096), true
 }
 
 // readLineInto reads exactly one newline-terminated JSON line, bounded in both time (the
-// connection deadline, set by the caller) and size.
-func readLineInto(conn net.Conn, out any) error {
-	r := bufio.NewReaderSize(io.LimitReader(conn, maxResponse), 4096)
+// connection deadline, set by the caller) and size (the limited reader it was built over).
+//
+// The reader is passed in rather than made here so that a caller reading two lines reads
+// them from the same buffer. See dialAndSend.
+func readLineInto(r *bufio.Reader, out any) error {
 	line, err := r.ReadString('\n')
 	if err != nil {
 		// A reply with no trailing newline is still a reply if the daemon then closed the

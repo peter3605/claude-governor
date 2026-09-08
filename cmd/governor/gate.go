@@ -1,9 +1,11 @@
 package main
 
 import (
+	"bufio"
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"strings"
 	"time"
@@ -28,9 +30,14 @@ import (
 // recognises. Everything else, including a refusal this version cannot interpret, still
 // fails open.
 //
-// What is still NOT here: block-and-wait and the depth limit (GOV-08). wait_ms goes out as
-// zero because there is no code here to perform a wait, and asking for one the gate cannot
-// serve would be a request the daemon honours by holding the session open.
+// GOV-08 added the wait and the depth limit. The wait is the part that had to be built
+// carefully, because the obvious implementation breaks invariant 1: extending the read
+// deadline to wait_max whenever the gate *asks* for a wait means a daemon that accepts and
+// never answers stalls every spawn for twenty seconds, which is precisely the hang this
+// file exists to prevent. So the extension is licensed by evidence instead. The daemon that
+// parks a request says so on the socket immediately, and only that line — arriving inside
+// the unchanged 100 ms allowance — buys the longer read. A wedged daemon never sends it and
+// fails open on the same ceiling it always did.
 
 // gateBudget is the whole wall-clock allowance for one gate invocation, covering reading
 // stdin, connecting, writing and reading the reply. design.md section 4.4 sets the connect
@@ -50,6 +57,25 @@ var gateBudget = 100 * time.Millisecond
 // last resort for the failures no socket deadline can see — chiefly a read of stdin that
 // never returns, which happens before there is a socket at all.
 const ioMargin = 10 * time.Millisecond
+
+// gateWaitMax is how long the gate will let the daemon hold a spawn before it insists on an
+// answer (design.md section 4.2). A stall costs no tokens and the model never has to reason
+// about it, so waiting is preferred over denying wherever the wait fits.
+//
+// 20 s is measured-safe rather than chosen: GOV-01 held a hook for 150 s uncut and had a
+// deny honoured at 75 s, and design.md section 4.1 sets the gate hook's own timeout to 30 s
+// explicitly so this sits inside a number that was measured rather than inherited.
+//
+// A var, not a const, so tests can shrink it. Nothing else may write it.
+var gateWaitMax = 20 * time.Second
+
+// waitGrace is how far past its own promised deadline the gate lets the daemon be.
+//
+// The daemon answers a parked acquire at wait_ms whatever happens, so this covers only the
+// scheduling and the write, not any part of the wait itself. It is generous because the
+// alternative to reading the answer is failing open on a spawn the daemon has already
+// decided about.
+const waitGrace = 500 * time.Millisecond
 
 // maxPayload bounds the hook payload read from stdin. The payload carries the agent's
 // prompt, so it is not small, but it is not unbounded either; a truncated read fails to
@@ -95,6 +121,12 @@ type acquireResponse struct {
 	// claim a CPU figure it was not given.
 	CPU     *float64        `json:"cpu"`
 	Thermal signals.Thermal `json:"thermal"`
+	// WaitMS is set only on the interim "waiting" line, and is what the daemon has
+	// committed to answering within.
+	WaitMS int `json:"wait_ms"`
+	// Denials is how many times this session has been refused inside the daemon's window,
+	// counting this one. It is what the reason text escalates on.
+	Denials int `json:"denials"`
 }
 
 // hookPayload is the PreToolUse payload, measured in GOV-01 and recorded in
@@ -132,9 +164,17 @@ type denyBody struct {
 // The set is closed on purpose. A refusal whose reason this binary does not recognise is
 // treated exactly like an unreachable daemon, because during an upgrade there will be a
 // daemon of one version and gates of another, and the posture in that window is settled:
-// ungoverned spawns are acceptable, a wrongly blocked one is not. GOV-08 adds "depth" here
-// when it lands the depth limit.
-var refusalsThisVersionHonours = map[string]bool{"capacity": true}
+// ungoverned spawns are acceptable, a wrongly blocked one is not.
+//
+// "waiting" is deliberately absent. It is not a refusal at all — it is the daemon saying it
+// has parked the request — and it is handled before this map is consulted. A daemon that
+// sent it as a final answer would be treated as unreachable, which is the correct reading
+// of a promise that was never kept.
+var refusalsThisVersionHonours = map[string]bool{"capacity": true, "depth": true}
+
+// waitingReason is the interim line's reason. Seeing it is the only thing that lets the
+// gate spend longer than design.md section 4.4's allowance.
+const waitingReason = "waiting"
 
 func runGate(_ []string, stdout, stderr io.Writer) int {
 	return gate(os.Stdin, stdout, stderr, transport.Dial{}, gateBudget)
@@ -144,15 +184,15 @@ func runGate(_ []string, stdout, stderr io.Writer) int {
 // for a refusal, which is carried on stdout rather than in the exit status
 // (docs/hook-surface.md section 10.2).
 func gate(stdin io.Reader, stdout, stderr io.Writer, dialer transport.Dialer, budget time.Duration) int {
-	return withBudget(stderr, budget, func(diag io.Writer, deadline time.Time) {
-		gateOnce(stdin, stdout, diag, dialer, deadline)
+	return withBudget(stderr, budget, func(diag io.Writer, clock *budgetClock) {
+		gateOnce(stdin, stdout, diag, dialer, clock)
 	})
 }
 
 // gateOnce asks the daemon for a lease and acts on the answer. Every error it can produce
 // means the same thing to the caller — fail open — so they are reported to stderr and
 // otherwise swallowed.
-func gateOnce(stdin io.Reader, stdout, diag io.Writer, dialer transport.Dialer, deadline time.Time) {
+func gateOnce(stdin io.Reader, stdout, diag io.Writer, dialer transport.Dialer, clock *budgetClock) {
 	var p hookPayload
 	if !decodePayload(stdin, diag, &p) {
 		return
@@ -169,8 +209,15 @@ func gateOnce(stdin io.Reader, stdout, diag io.Writer, dialer transport.Dialer, 
 		return
 	}
 
+	conn, replies, ok := dialAndSend(diag, dialer, clock.Deadline(), acquireRequestFor(p))
+	if !ok {
+		return
+	}
+	defer conn.Close()
+
 	var resp acquireResponse
-	if !exchange(diag, dialer, deadline, acquireRequestFor(p), &resp) {
+	if err := readLineInto(replies, &resp); err != nil {
+		fmt.Fprintf(diag, "governor gate: read response: %v\n", err)
 		return
 	}
 
@@ -182,6 +229,12 @@ func gateOnce(stdin io.Reader, stdout, diag io.Writer, dialer transport.Dialer, 
 		fmt.Fprintf(diag, "governor gate: daemon speaks protocol v%d, this binary speaks v%d: failing open\n",
 			resp.V, protocolVersion)
 		return
+	}
+
+	if !resp.OK && resp.Reason == waitingReason {
+		if !awaitParked(diag, conn, replies, clock, &resp) {
+			return
+		}
 	}
 
 	if resp.OK {
@@ -217,6 +270,54 @@ func gateOnce(stdin io.Reader, stdout, diag io.Writer, dialer transport.Dialer, 
 	fmt.Fprintf(diag, "governor gate: refused (%d/%d in use)\n", resp.InUse, resp.Budget)
 }
 
+// awaitParked reads the second line of a parked acquire, having first bought the time to do
+// it with.
+//
+// The order here is the whole safety argument, and it is worth being explicit about. The
+// deadline is extended only *after* the daemon's interim line has been read, so the licence
+// to wait comes from the daemon having answered, not from this binary having asked. Every
+// failure that does not involve a live, answering daemon has already fallen open on the
+// unchanged 100 ms allowance by the time this function is reached.
+//
+// The wait is bounded by what the gate is willing to give, not by what the daemon asks for:
+// a daemon that answers "waiting, 10 minutes" gets gateWaitMax and no more.
+func awaitParked(diag io.Writer, conn net.Conn, replies *bufio.Reader, clock *budgetClock, resp *acquireResponse) bool {
+	wait := gateWaitMax
+	if promised := time.Duration(resp.WaitMS) * time.Millisecond; promised > 0 && promised < wait {
+		wait = promised
+	}
+	fmt.Fprintf(diag, "governor gate: daemon parked this spawn, waiting up to %v\n", wait)
+
+	socketDeadline := time.Now().Add(wait + waitGrace)
+	// The backstop stays behind the socket deadline by the same margin it always has, so
+	// the socket is still the mechanism and the select is still the last resort.
+	clock.ExtendTo(socketDeadline.Add(ioMargin))
+	if err := conn.SetDeadline(socketDeadline); err != nil {
+		fmt.Fprintf(diag, "governor gate: extend deadline: %v: failing open\n", err)
+		return false
+	}
+
+	*resp = acquireResponse{}
+	if err := readLineInto(replies, resp); err != nil {
+		// The daemon promised an answer and did not produce one. That is a broken daemon,
+		// and a broken daemon means the spawn proceeds.
+		fmt.Fprintf(diag, "governor gate: read parked response: %v: failing open\n", err)
+		return false
+	}
+	if resp.V != protocolVersion {
+		fmt.Fprintf(diag, "governor gate: parked reply speaks protocol v%d, this binary speaks v%d: failing open\n",
+			resp.V, protocolVersion)
+		return false
+	}
+	if !resp.OK && resp.Reason == waitingReason {
+		// Two interim lines is not a protocol this binary speaks, and honouring a second
+		// one would let a daemon extend the wait indefinitely one line at a time.
+		fmt.Fprintf(diag, "governor gate: daemon parked the request twice: failing open\n")
+		return false
+	}
+	return true
+}
+
 // denyReason is the text that reaches the model verbatim (docs/hook-surface.md section
 // 10.2), in the shape design.md section 4.2 specifies.
 //
@@ -228,6 +329,15 @@ func gateOnce(stdin io.Reader, stdout, diag io.Writer, dialer transport.Dialer, 
 // daemon did not send is a fabrication. CPU is null until GOV-12 lands the sampler, and
 // thermal is "unknown" on Linux by design.
 func denyReason(resp acquireResponse) string {
+	if resp.Reason == "depth" {
+		// Nothing conditional to say: this refusal does not depend on load, and naming a
+		// slot count would invite a retry once the count moved. It never will for this
+		// caller (design.md section 6.3).
+		return "Nested subagent spawns are refused: this Agent call comes from a subagent, " +
+			"and only the main session may fan out. Do this task inline in the agent you " +
+			"are already in. Do not retry the Agent call."
+	}
+
 	var b strings.Builder
 	fmt.Fprintf(&b, "Fleet at capacity (%d/%d slots", resp.InUse, resp.Budget)
 	if resp.CPU != nil {
@@ -236,9 +346,33 @@ func denyReason(resp acquireResponse) string {
 	if resp.Thermal != "" && resp.Thermal != signals.Unknown {
 		fmt.Fprintf(&b, ", thermal: %s", resp.Thermal)
 	}
-	b.WriteString("). Run this task inline yourself rather than delegating it. " +
-		"Do not retry the Agent call.")
+	b.WriteString("). ")
+	b.WriteString(escalation(resp.Denials))
 	return b.String()
+}
+
+// escalation is the instruction half of a capacity deny, firmer each time the same session
+// is refused inside the daemon's window.
+//
+// It escalates because the first text demonstrably does not always work: the failure this
+// guards against is a model reading "no" as "not yet" and spending the budget it was just
+// denied on asking again. Repeating the identical sentence to a caller that has ignored it
+// three times is not a strategy. The count comes from the daemon, which is the only place
+// that can see a session's refusals across separate gate processes.
+func escalation(denials int) string {
+	switch {
+	case denials <= 1:
+		return "Run this task inline yourself rather than delegating it. " +
+			"Do not retry the Agent call."
+	case denials == 2:
+		return "This is the 2nd refusal for this session. The queue is full, not slow — " +
+			"waiting will not help. Run this task inline yourself, now, and do not call " +
+			"the Agent tool again this turn."
+	default:
+		return fmt.Sprintf("This session has been refused %d times. Every retry has cost "+
+			"tokens and changed nothing. Stop delegating: do all of the remaining work "+
+			"inline in this turn and do not call the Agent tool again.", denials)
+	}
 }
 
 // acquireRequestFor builds the wire request from the hook payload.
@@ -254,8 +388,9 @@ func acquireRequestFor(p hookPayload) acquireRequest {
 		Session:   p.SessionID,
 		ToolUseID: p.ToolUseID,
 		Depth:     depth,
-		// Zero until GOV-08 lands block-and-wait. Asking for a wait the gate has no code to
-		// perform would be a request the daemon honours by holding the session open.
-		WaitMS: 0,
+		// What the gate is willing to be held for. The daemon parks the request for at most
+		// this long and answers either way; a gate that cannot perform a wait sends zero,
+		// which is what GOV-07 did and what an older binary still does.
+		WaitMS: int(gateWaitMax / time.Millisecond),
 	}
 }

@@ -97,9 +97,10 @@ func NewTable(opt Options) *Table {
 // all decide yes — which is exactly the invariant the 200-call concurrency test exists to
 // catch. Holding one lock across both is the whole of the fix.
 //
-// depth is recorded but not enforced. Denying nested fan-out is a later story (design.md
-// section 6.3); carrying the value now means that story changes a policy rather than a
-// wire format.
+// depth is recorded here and enforced by the caller. The daemon refuses a nested spawn
+// before it ever reaches this function (design.md section 6.3), so a lease in this table is
+// always depth 0; the field is kept because a lease that cannot say what it was taken for is
+// harder to debug than one that can.
 func (t *Table) Acquire(session string, depth, limit int) (Lease, bool) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -233,6 +234,25 @@ func (t *Table) Release(session, agentID string) bool {
 		// to do nothing at all: dropping the lease would free a slot still in use, and
 		// dropping the index would leave a live lease that no release can ever reach. Left
 		// alone, the lease stays correct and the reaper remains its backstop.
+		return false
+	}
+	t.dropLocked(l)
+	return true
+}
+
+// Drop removes one lease by ID, whatever state it is in. It reports whether there was one.
+//
+// This is the hand-back path (GOV-08): the wait queue can grant a lease to a caller that has
+// gone away between being handed it and being told, and that slot should return to the pool
+// now rather than waiting out a TTL. It is deliberately not part of the release path, which
+// keys off agent_id and has a session to check against; a lease that was never confirmed has
+// neither.
+func (t *Table) Drop(id string) bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	l, ok := t.byID[id]
+	if !ok {
 		return false
 	}
 	t.dropLocked(l)
