@@ -7,6 +7,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -65,7 +66,7 @@ func TestCollectTreeTerminatesOnACycle(t *testing.T) {
 //
 // The sampler is pointed at this test binary's own process name, and a chain of real child
 // processes is spawned beneath it with a busy grandchild. If descendants are being counted,
-// the tree CPU rises well above the root-only CPU.
+// the tree CPU rises above the root-only CPU.
 func TestSamplerCountsDescendantCPU(t *testing.T) {
 	if testing.Short() {
 		t.Skip("spawns processes and burns a second of CPU")
@@ -82,11 +83,25 @@ func TestSamplerCountsDescendantCPU(t *testing.T) {
 
 	// A grandchild, so the walk has to recurse rather than just look at direct children:
 	// sh -c spawns a subshell that spins.
-	busy := exec.Command("/bin/sh", "-c", "sh -c 'while :; do :; done' & sleep 3; kill %1 2>/dev/null")
+	//
+	// GOV-B04: both halves of the cleanup below are load-bearing, and both used to be wrong.
+	// The spinner is deliberately NOT this process's child, so killing busy.Process reaps the
+	// wrapper and leaves the spinner orphaned onto PID 1, saturating a core for as long as the
+	// machine is up. `kill %1` did not save it either — job control is off in a non-interactive
+	// sh, so the job spec never resolved. Twenty-six leaked spinners and a load average of 188
+	// were measured after a handful of runs. A test that permanently degrades the machine it
+	// measures is the same bug this story is about, one level up: it manufactures exactly the
+	// contention that made the old absolute assertion fail. Setpgid puts the wrapper and its
+	// descendants in one process group so a single negative-PID signal takes the whole tree.
+	busy := exec.Command("/bin/sh", "-c", "sh -c 'while :; do :; done' & sleep 3; kill $! 2>/dev/null")
+	busy.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	if err := busy.Start(); err != nil {
 		t.Fatalf("start busy child: %v", err)
 	}
 	defer func() {
+		if pgid, err := syscall.Getpgid(busy.Process.Pid); err == nil {
+			_ = syscall.Kill(-pgid, syscall.SIGKILL)
+		}
 		_ = busy.Process.Kill()
 		_, _ = busy.Process.Wait()
 	}()
@@ -104,13 +119,25 @@ func TestSamplerCountsDescendantCPU(t *testing.T) {
 	if got.Tree.Procs <= got.Tree.Roots {
 		t.Fatalf("descendants were not collected: Procs=%d Roots=%d", got.Tree.Procs, got.Tree.Roots)
 	}
-	// The spinning grandchild saturates a core. Root-only accounting cannot see it.
+	// The assertion that actually tests what GOV-02 built. Both halves are measured in the
+	// same window on the same machine, so it holds whatever else the host is doing: the root
+	// here is this sleeping test binary, and any CPU at all reaching the spinning grandchild
+	// puts the tree above it. It is also the floor — CPU > CPURoots is exactly "descendant
+	// CPU was greater than zero", expressed relatively rather than as a constant.
+	//
+	// GOV-B04: an absolute floor (`got.Tree.CPU < 0.5`) used to follow this line, asserting
+	// that the grandchild won half a core during the sample window. That is a fact about the
+	// machine's spare capacity, not about the sampler. Measured: at 4x oversubscription (32
+	// busy loops on 8 cores) the old form failed 2/2 reporting tree CPU 0.261 and 0.258 —
+	// which is the ~8/33 fair share the scheduler owes the spinner, arriving exactly on
+	// schedule, not a sampler fault. At 1x it passed, so the constant encodes how busy the
+	// host happens to be. Removed rather than loosened: any fixed fraction is the same bug
+	// with a different constant, and on a contended CI runner it would surface as an
+	// intermittent regression in code that is correct. The relative assertion above held
+	// throughout both, which is why it is the one worth keeping.
 	if got.Tree.CPU <= got.Tree.CPURoots {
 		t.Fatalf("tree CPU (%.3f) did not exceed root-only CPU (%.3f) with a busy grandchild running;"+
 			" descendant CPU is not being summed", got.Tree.CPU, got.Tree.CPURoots)
-	}
-	if got.Tree.CPU < 0.5 {
-		t.Fatalf("tree CPU %.3f is implausibly low with a core-saturating grandchild", got.Tree.CPU)
 	}
 	if got.Tree.RSSBytes == 0 {
 		t.Error("tree RSS is zero, which no live process tree is")
