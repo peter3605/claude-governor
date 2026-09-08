@@ -243,8 +243,10 @@ Tune `setpoint` against the Phase 0 traces, not by feel.
 
 ### 5.3 Thermal
 
-On Apple silicon this is the signal that matters most and the one most likely to be done
-badly. `powermetrics` gives far more detail and requires `sudo`, which kills the install
+On Apple silicon this was expected to be the signal that matters most, and it is certainly the
+one most likely to be done badly. It has since been measured and demoted to a backstop — see
+*Measured, and it did not move* below before you design against it. `powermetrics` gives far
+more detail and requires `sudo`, which kills the install
 story — it MUST NOT be a dependency. `ProcessInfo.thermalState` is public API, needs no
 privileges, and returns `nominal | fair | serious | critical`. A ~20-line Swift or cgo shim
 exposes it to Go.
@@ -252,6 +254,46 @@ exposes it to Go.
 Anything other than `nominal` takes `B` to `B_min` immediately, with hysteresis on the way
 back up: require `nominal` for three consecutive ticks before the additive increase resumes,
 so the budget does not oscillate against the thermal governor.
+
+**Built (GOV-13).** The shim is cgo, inline Objective-C in `internal/signals/thermal_darwin.go`
+under `//go:build darwin && cgo`, linking `Foundation` and nothing else — no subprocess, no
+`sudo`, no third-party dependency. `internal/signals/thermal_other.go` carries the complement
+constraint and returns `unknown`, which is what makes "degrades rather than fails to build"
+structural rather than aspirational: off darwin the shim is not compiled at all, so no host
+needs a C toolchain to build the governor.
+
+`Thermal.Elevated()` is the only place the cut rule is written down. It is true for `fair`,
+`serious` and `critical`, and false for `nominal`, for `unknown`, and for any state a future
+macOS adds that this version cannot name. Callers ask `Elevated()`; a caller that writes
+`thermal != nominal` itself reintroduces exactly the bug §13.5 warns about, and pins every
+Linux budget at `B_min` forever.
+
+**Measured, and it did not move (GOV-13).** Ten minutes of saturating 8-core FP load on the
+M1 Air (8 cores / 4 P-cores, fanless), loadavg peaking at 66, and `thermalState` never left
+`nominal`. Corroborated three ways: an independent Swift read of the same API returned 0, the
+raw notify key `com.apple.system.thermalpressurelevel` read 0 throughout, and `pmset -g therm`
+recorded no thermal or performance warning level. The shim is not the problem — it agrees
+exactly with the platform. The API is simply conservative on Apple silicon.
+
+Injecting a level to force the other states needs privileges, so it was not attempted; the
+`fair` / `serious` / `critical` branches are covered by testing the raw-value mapping directly
+instead (`thermalFromRaw`), which is why that mapping is split out of the cgo file.
+
+This demotes the opening claim of this section. Thermal is a **backstop, not the controller**:
+it is real, it is free to read, and when it fires the budget should floor immediately — but on
+this chassis it does not fire under exactly the load this project exists to manage. CPU
+utilisation and run-queue depth do the actual work in §5.2, which makes the setpoint tuning in
+GOV-15 the thing that determines whether the governor is any good. Do not tune the loop
+expecting thermal to intervene, and do not read a steady `nominal` as evidence the machine is
+comfortable. One machine, one run — but the direction is clear enough to design against.
+
+**The cgo constraint has a release consequence.** `CGO_ENABLED=0` on darwin builds cleanly and
+is thermally blind — it reports `unknown` on a Mac, silently, and looks precisely like a cool
+machine. `make cross` builds exactly that binary, because a local cross-compile cannot link
+another platform's C toolchain; it is for checking that the four targets still compile, and its
+darwin output MUST NOT be shipped. The released darwin binaries are the ones CI builds natively
+on a macOS runner with `CGO_ENABLED=1` (GOV-19). `governor status` is the check: on a Mac it
+must not say `unknown`.
 
 ### 5.4 Attributed cost (Phase 2 refinement, not v1)
 
