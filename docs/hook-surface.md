@@ -642,3 +642,86 @@ external to the program. Replacing the file by `rename(2)` instead — write a t
 same directory, then rename over it — leaves running processes on the old inode and the new
 one correctly signed. `design.md` §13.4 now requires it of upgrade, which is the moment this
 would otherwise hit every hook of every live session at once.
+
+---
+
+## 14. Not the hook surface, but adjacent: the `statusLine` command's stdin
+
+Measured for GOV-10. The statusline is not a hook — it is the `statusLine` key in
+`settings.json` — but it is the same shape of contract: Claude Code runs a command, writes
+JSON to its stdin, and reads its stdout. It is recorded here because it is the only other
+place this binary is executed by the harness, and because §10 of design.md says facts about
+that harness get measured rather than assumed.
+
+**Method differs from §0, and the difference matters.** The statusline is a TUI surface and
+does not run under `claude -p`, so the `cat > file` probe used for the hooks cannot reach it.
+These facts were instead read out of the shipped binary
+(`/Users/peterho/.local/share/claude/versions/2.1.265`, `claude --version` → `2.1.265`,
+2026-09-09) — the payload construction, the invocation, and the embedded documentation string
+the `statusline-setup` agent is given. That is weaker evidence than a captured payload: it is
+this version's source of truth rather than an observation of it, and it should be re-checked
+against a real capture if any of it ever appears to be wrong.
+
+### 14.1 The payload
+
+Every field below is present in the object the harness builds for the statusline. The ones
+GOV-10 relies on are `session_id` and nothing else.
+
+```jsonc
+{
+  "session_id": "string",        // always present
+  "session_name": "string",      // optional, set via /rename
+  "prompt_id": "string",         // optional
+  "transcript_path": "string",
+  "cwd": "string",
+  "scratchpad_dir": "string",    // optional
+  "permission_mode": "string",
+  "agent_id": "string",          // optional
+  "agent_type": "string",
+  "model":       {"id": "string", "display_name": "string"},
+  "workspace":   {"current_dir": "string", "project_dir": "string", "added_dirs": ["string"],
+                  "git_worktree": "string", "repo": {"host": "…", "owner": "…", "name": "…"}},
+  "version": "string",
+  "output_style": {"name": "string"},
+  "context_window": {"total_input_tokens": 0, "total_output_tokens": 0,
+                     "context_window_size": 0, "current_usage": {…} | null,
+                     "used_percentage": 0 | null, "remaining_percentage": 0 | null},
+  "cost": {"total_cost_usd": 0, "total_duration_ms": 0, "total_api_duration_ms": 0,
+           "total_lines_added": 0, "total_lines_removed": 0},
+  "exceeds_200k_tokens": false,
+  "fast_mode": false,
+  "effort": {"level": "…"},      // optional
+  "thinking": {"enabled": true},
+  "rate_limits": {…},            // optional
+  "vim": {"mode": "…"},          // optional
+  "agent": {"name": "…"},        // optional
+  "remote": {"session_id": "…"}, // optional
+  "pr": {…}, "worktree": {…}     // optional
+}
+```
+
+### 14.2 Four facts about the invocation
+
+1. **There is no `hook_event_name`.** Every hook payload in §1–§5 carries one; this does not.
+   A binary that dispatches on that field cannot dispatch a statusline, which is why
+   `governor statusline` takes its identity from its subcommand argument alone.
+
+2. **A non-zero exit discards the output entirely.** The harness checks the status first and
+   only then reads stdout. So a statusline that fails must still exit 0 and say what went
+   wrong *in the line* — exiting non-zero does not show the user an error, it shows them
+   nothing. This is the opposite of the gate's contract in §10.2 and the reason
+   `governor statusline` never propagates a failure into its exit code.
+
+3. **stdout is trimmed, split on newlines, blank lines dropped, and rejoined.** Multi-line
+   output is therefore supported. `governor statusline` emits one line regardless.
+
+4. **stderr is captured to the debug log and never displayed.** Diagnostics are safe to write
+   there, on the same bargain the hooks make.
+
+Two settings suppress the statusline entirely and are worth knowing when one appears not to
+run: `disableAllHooks` (which covers statusLine execution as well as hooks, despite the name)
+and an unaccepted workspace trust prompt.
+
+**`COLUMNS` was not observed to be set** for the child process. A statusline that treated an
+absent `COLUMNS` as a width of zero would render as the empty string on every such machine,
+so it is read as "unknown, do not truncate" rather than as a width.
