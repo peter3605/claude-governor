@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -261,8 +262,15 @@ func gateOnce(stdin io.Reader, stdout, diag io.Writer, dialer transport.Dialer, 
 		return
 	}
 
-	conn, replies, ok := dialAndSend(diag, dialer, clock.Deadline(), acquireRequestFor(p))
-	if !ok {
+	conn, replies, err := dialAndSend(dialer, clock.Deadline(), acquireRequestFor(p))
+	if err != nil {
+		fmt.Fprintf(diag, "governor gate: %v\n", err)
+		if errors.Is(err, errNoDaemon) {
+			// Nothing is listening. This spawn is already ungoverned — the decision was
+			// made the instant the dial failed — so the start is for the next one, and
+			// nothing below waits for it (GOV-11).
+			lazilyStartDaemon(diag)
+		}
 		return
 	}
 	defer conn.Close()

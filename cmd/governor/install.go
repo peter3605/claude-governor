@@ -123,7 +123,7 @@ func resolvePaths() (paths, error) {
 // measurement, and throwing it away on uninstall would throw away the phase. The directory
 // itself is removed only once it is empty, so a machine that still has its samples keeps
 // them and everything else goes.
-var stateFiles = []string{"sock", "statusline.json", daemonPIDFile, daemonLogFile}
+var stateFiles = []string{"sock", "statusline.json", daemonPIDFile, daemonLogFile, daemonStartFile}
 
 // ---------------------------------------------------------------------------
 // the plugin's files

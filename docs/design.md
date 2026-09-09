@@ -381,6 +381,48 @@ larger than the backlog is partly ungoverned no matter how long the queue is wil
 wait. Raising the backlog is not a fix worth reaching for; a burst that wide is already past
 the point where one more agent matters.
 
+### 4.5 Lazy daemon start
+
+Section 2 has always called the daemon "lazily started by the gate". GOV-11 made that true:
+before it, only `governor install` started one, so a daemon that went away — a reboot, a
+crash, a `pkill` — left the machine ungoverned until a human noticed the status line. That is
+the project's own worst failure mode, because nothing fails: the hooks still pass, sessions
+still run, and the budget has simply stopped applying.
+
+A gate that fails to **dial** starts one. The rules are all narrowing:
+
+| | |
+|---|---|
+| Trigger | the dial itself failed (`errNoDaemon`), never a daemon that answered badly |
+| Ordering | the gate has already failed open; the start is for the **next** spawn |
+| Waiting | none. Fire, detach, exit — nothing on the hot path waits for a bind |
+| Precondition | the state directory already exists, or the governor is not installed |
+| Rate limit | `daemon.start`'s mtime, 5 s, recorded **before** the fork, not after |
+| Identity | `os.Executable()`'s basename must be `governor`, or it refuses |
+
+Three of those are worth the words:
+
+- **A daemon that accepted the connection is a daemon.** Answering late, answering rubbish,
+  or answering in an unknown protocol version all fail open, and all mean there is already a
+  process on that socket. Forking at it would lose the bind race and would do so on every
+  spawn for as long as the first one stays wedged.
+- **The rate limit records the attempt, not the success.** A daemon that cannot start fails
+  the fork every time, so a marker written only on success would bound nothing — which is the
+  one case the marker exists for.
+- **The race between two gates is not defended against, on purpose.** A fan-out against a
+  dead daemon puts several gates here at once and each forks. `transport.Listen` already
+  probes an existing socket before unlinking it and refuses to bind when something answers,
+  so the losers exit into the daemon log rather than stealing the socket. A lock file would
+  be a second mechanism that has to agree with the one already doing the work.
+
+The identity check is a safety property rather than a test convenience, though it is both.
+The gate spawns *itself* under another subcommand, so whatever it spawns has to be the
+governor; executing a program this binary cannot identify is strictly worse than leaving the
+machine ungoverned. It also makes the package's own tests safe by construction — under
+`go test`, `os.Executable()` is the test binary, and running that with `daemon` would run the
+suite again, recursively. That is the same shape as the trap GOV-21 hit when `doctor` ran
+`<hooked binary> version` under the test runner.
+
 ---
 
 ## 5. The control loop
@@ -978,6 +1020,7 @@ Uninstall is only verifiable if this list is exhaustive, so it is normative.
 | `~/.claude/governor/daemon.pid` | daemon | uninstall |
 | `~/.claude/governor/daemon.log` | install, when it starts the daemon | uninstall |
 | `~/.claude/governor/statusline.json` | `statusline`, when the directory already exists | uninstall |
+| `~/.claude/governor/daemon.start` | the gate, when it lazily starts a daemon and the directory already exists | uninstall |
 | `~/.claude/governor/` | daemon (`transport.Listen`) | uninstall, only once it is empty; `--purge` regardless |
 | `~/.claude/plugins/data/claude-governor-skills-dir/` (`${CLAUDE_PLUGIN_DATA}`: config) | Claude Code creates it; the governor writes config.json | uninstall `--purge` only |
 
@@ -1014,6 +1057,15 @@ by hand, or a `doctor` run outside a plugin context — `config.json` resolves t
 directory above, beside the socket, rather than to a location of its own. One directory holds
 all of the governor's state, and a second home for the config would be a path uninstall
 silently stops covering.
+
+`daemon.start` is the rate limit on lazy daemon starts (GOV-11), and it follows the same
+rule as `statusline.json` for the same reason: it is written only when the state directory
+already exists, because a gate that recreated the directory would put a file back moments
+after uninstall removed it. Its modification time is the whole of its meaning — the timestamp
+inside it is for a person reading the directory, not for the code. Both files are named
+relative to the socket the gate actually failed to reach rather than to the default state
+directory, so a second governor on `GOVERNOR_ENDPOINT` rate-limits beside its own socket
+instead of over the first one's.
 
 `statusline.json` is a one-second cache of the last status reply (GOV-10). The statusline is
 run on every assistant message in every session, so without it the busiest thing the governor
