@@ -162,6 +162,18 @@ type hookPayload struct {
 // side to fail on.
 var agentIDShape = regexp.MustCompile(`^[0-9a-f]{17}$`)
 
+// spawnToolNames are the tool names that can put a subagent on the CPU, and therefore the
+// names a PreToolUse matcher has to cover for the gate to fire at all.
+//
+// It is a list rather than a copy of governsSpawn's switch because the two answer different
+// questions and only one of them is about matchers. governsSpawn decides what happens once
+// a payload has arrived — for SendMessage that depends on the recipient — whereas a matcher
+// is compared against the tool name alone, before any payload exists. `governor doctor`
+// reads this list to check the registered matcher (GOV-20); TestEverySpawnToolNameIsGoverned
+// binds the two together, so a name added to one and not the other is a red test rather than
+// a matcher that silently stops covering a spawn path.
+var spawnToolNames = []string{"Agent", "Task", "SendMessage"}
+
 // governsSpawn reports whether this payload puts a subagent on the CPU, and if not, why.
 //
 // The set of paths is the one GOV-28 measured rather than the one the tool names suggest

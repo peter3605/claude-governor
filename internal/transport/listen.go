@@ -45,6 +45,14 @@ func (Listen) Listen(ctx context.Context, endpoint string) (net.Listener, error)
 		return nil, fmt.Errorf("endpoint %q has no socket path", endpoint)
 	}
 
+	// Named rather than left to the kernel, which answers a path this long with EINVAL —
+	// surfacing as "bind: invalid argument", which reads like a bad argument to this
+	// function rather than like a path a few characters too long.
+	if len(path) > MaxSocketPath {
+		return nil, fmt.Errorf("socket path %q is %d bytes, past this platform's limit of %d: set %s to a shorter directory",
+			path, len(path), MaxSocketPath, StateDirEnv)
+	}
+
 	// 0700: the socket carries this user's session and lease state and v1 is single-user.
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return nil, fmt.Errorf("create state directory for %q: %w", path, err)

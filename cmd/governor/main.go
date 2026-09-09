@@ -43,7 +43,7 @@ var commands = []command{
 	{"trace", "Phase 0 instrumentation: record hook events and 1 Hz host samples", runTrace},
 	{"install", "install the plugin, hooks and daemon", stub("install")},
 	{"uninstall", "reverse install and restore the settings backup", stub("uninstall")},
-	{"doctor", "diagnose a broken install and name each fix", stub("doctor")},
+	{"doctor", "diagnose a broken install and name each fix", runDoctor},
 	{"calibrate", "measure this host and write its defaults", stub("calibrate")},
 	{"version", "print binary, protocol and config schema versions", runVersion},
 }

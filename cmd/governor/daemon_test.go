@@ -47,10 +47,11 @@ type reply struct {
 	Sessions  []sessionStat   `json:"sessions"`
 }
 
-// unixPathMax is the practical ceiling on a unix socket path. sockaddr_un.sun_path is 104
-// bytes on darwin and 108 on linux, and a test whose temp directory pushes past it should
-// say so rather than fail as if the daemon were broken.
-const unixPathMax = 100
+// unixPathMax is the ceiling a test's temp directory has to stay under, taken from the
+// real sockaddr_un limit transport now names rather than guessed at a second time. A test
+// whose temp directory pushes past it should say so rather than fail as if the daemon were
+// broken.
+const unixPathMax = transport.MaxSocketPath - 3
 
 // startTestDaemon runs a daemon on a real socket and returns its endpoint.
 //

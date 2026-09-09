@@ -8,10 +8,11 @@ import (
 	"testing"
 )
 
-// unixPathMax is the practical ceiling on a unix socket path: sockaddr_un.sun_path is 104
-// bytes on darwin and 108 on linux. A test whose temp directory pushes past it should say
-// so rather than fail as if the code were broken.
-const unixPathMax = 100
+// unixPathMax is the ceiling a test's temp directory has to stay under. It is the real
+// sockaddr_un limit this package now names, less a little room for the filename a test
+// appends: a test whose temp directory pushes past it should skip rather than fail as if
+// the code were broken.
+const unixPathMax = MaxSocketPath - 3
 
 func tempEndpoint(t *testing.T) (string, string) {
 	t.Helper()
@@ -190,3 +191,22 @@ func TestDefaultEndpointFollowsTheStateDirectory(t *testing.T) {
 
 var _ Listener = Listen{}
 var _ Dialer = Dial{}
+
+// TestListenNamesAPathPastTheSocketLimit.
+//
+// The kernel's answer to an over-long sun_path is EINVAL, which surfaces as "bind: invalid
+// argument" — indistinguishable at a glance from a genuinely bad argument, and this repo has
+// already spent time on that once (see sockDir in cmd/governor). The error says what is
+// actually wrong and which variable moves it.
+func TestListenNamesAPathPastTheSocketLimit(t *testing.T) {
+	path := filepath.Join(t.TempDir(), strings.Repeat("d", MaxSocketPath), "sock")
+	_, err := Listen{}.Listen(context.Background(), "unix://"+path)
+	if err == nil {
+		t.Fatalf("listened on a %d-byte path, want a refusal", len(path))
+	}
+	for _, want := range []string{"past this platform's limit", StateDirEnv} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q does not mention %q", err, want)
+		}
+	}
+}
