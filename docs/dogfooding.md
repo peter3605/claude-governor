@@ -8,6 +8,11 @@ week of impressions is exactly the evidence this repo does not accept anywhere e
 **Status: week in progress. Started 2026-09-09.** The Results section below is empty on
 purpose and is filled in at the end, not as it goes.
 
+Installed 2026-09-09 on macOS arm64 (Darwin 25.4.0), Claude Code 2.1.265, through
+`governor install` and not by hand. `governor doctor` reported 8/8 immediately afterwards, a
+second `install` changed nothing and did not restart the daemon, and the day-zero checks
+below were run before the week's ordinary use began.
+
 ---
 
 ## What is being dogfooded
@@ -85,6 +90,43 @@ with opposite consequences for GOV-14.
   wrong one of two simultaneous callers.
 - **Denials are counted in a 60 s sliding window** per session (`denyWindow`), so `denials=K`
   is a burst count, not a session total.
+
+---
+
+## Day zero, 2026-09-09
+
+Not results — the checks that establish the instrument is real before a week is spent
+against it. Each was driven through the shipped binary and the actual harness, never in
+process.
+
+**Lazy start recovers a dead daemon.** The daemon was killed with `SIGTERM` the way a reboot
+or a crash would, and `doctor` went to `FAIL daemon … every spawn on this machine is
+ungoverned`. A fresh `claude -p` session then made one Agent call: that gate found no socket,
+failed open (the subagent ran ungoverned, which is correct — the start is for the *next*
+spawn), wrote `daemon.start` at 18:58:29, and forked a daemon. `doctor` was back to 8/8 with
+no human involved. This is the clause GOV-21 left unbuilt, working on the real machine.
+
+**The next fan-out was governed.** A three-agent parallel fan-out from a second session
+produced exactly the log this note is meant to be read from:
+
+```
+2026-09-09T18:59:09-04:00 budget peak in_use=1/4
+2026-09-09T18:59:11-04:00 budget peak in_use=2/4
+2026-09-09T18:59:12-04:00 budget peak in_use=3/4
+```
+
+Three agents, three slots, no fourth line, no park, no deny — and `in use 0` afterwards, so
+every lease came back on `SubagentStop`. The budget did not bind, which at three agents
+against four is exactly right and is the first data point rather than a result.
+
+**Two pre-existing conditions on this machine, recorded because they colour the week.** The
+`statusLine` in `settings.json` pointed at a binary that no longer existed (a leftover from
+before GOV-21 moved the plugin path); `governor install` overwrote it with the correct path
+and backed up the original, so this is now fixed. The five Phase 0 `trace` hooks are still
+registered in `settings.json` and still appending to a 43 MB `samples.jsonl`. They are left
+alone deliberately — removing Phase 0 instrumentation is not this story's call — but they
+mean `SubagentStart`, `SubagentStop` and `SessionStart` each run two binaries this week, and
+that overhead is not the governor's.
 
 ---
 
