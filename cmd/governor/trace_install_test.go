@@ -158,7 +158,11 @@ func TestUninstallKeepsChangesMadeAfterInstall(t *testing.T) {
 	edited := readSettings(t, path)
 	edited["statusLine"] = map[string]any{"type": "command", "command": "/bin/echo hi"}
 	hooks := edited["hooks"].(map[string]any)
-	hooks["Stop"] = []any{map[string]any{
+	// Deliberately an event this installer does NOT register, so that the assertions below
+	// can be absolute: the whole key must survive, and every one of our own events must be
+	// gone entirely. A user hook sharing an event WITH ours is a different property and has
+	// its own test (TestUninstallLeavesOtherHooksOnTheSameEvent).
+	hooks["Notification"] = []any{map[string]any{
 		"hooks": []any{map[string]any{"type": "command", "command": "/usr/bin/say done"}},
 	}}
 	b, _ := json.MarshalIndent(edited, "", "  ")
@@ -177,10 +181,10 @@ func TestUninstallKeepsChangesMadeAfterInstall(t *testing.T) {
 	}
 	remaining, _ := got["hooks"].(map[string]any)
 	if remaining == nil {
-		t.Fatal("hooks key removed although an unrelated Stop hook remained")
+		t.Fatal("hooks key removed although an unrelated Notification hook remained")
 	}
-	if remaining["Stop"] == nil {
-		t.Error("unrelated Stop hook was removed")
+	if remaining["Notification"] == nil {
+		t.Error("unrelated Notification hook was removed")
 	}
 	for _, e := range traceEvents {
 		if remaining[e.event] != nil {

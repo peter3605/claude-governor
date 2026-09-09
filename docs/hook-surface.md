@@ -246,50 +246,92 @@ Two consequences:
 The second `SubagentStop` also reported the agent as still running in its own payload —
 `"background_tasks":[{"id":"aca0c17642a96d305","type":"subagent","status":"running",...}]`.
 
-### 8.1 `SubagentStart` does not fire in interactive sessions at all
+### 8.1 `SubagentStart` fires per `Agent`-tool spawn, interactive or not
 
-**Measured in GOV-09, from the live GOV-02 trace** — not from a probe, which is the point.
-Over the 5 h 20 m window in `~/.claude/governor/samples.jsonl` (68 agent records,
-`claude 2.1.263`, hooks installed 17:26:39Z):
+**This section previously said the opposite, and it was wrong.** It is left here as a
+correction rather than quietly rewritten, because the wrong version was believed for long
+enough to be filed as a launch blocker (GOV-27) and to have a fix designed against it.
+
+**What GOV-09 measured, which was correct.** Over a 5 h 20 m window in
+`~/.claude/governor/samples.jsonl` (`claude 2.1.263`, hooks installed 17:26:39Z):
 
 | | `SubagentStart` | `SubagentStop` |
 |---|---|---|
 | 2 headless `claude -p` probe sessions | 3 | 3 |
 | 25 ordinary interactive sessions | **0** | **62** |
 
-Sixty-two real subagent spawns across twenty-five interactive sessions, each carrying a
-genuine `agent_id`, and `SubagentStart` fired for none of them.
+**What GOV-09 concluded, which was not.** That the discriminator was headless versus
+interactive — so `confirm` never runs in ordinary use, no lease is ever bound, and every
+lease is reaped at its 30 s tentative TTL while its agent is still running.
 
-Four things rule out the obvious instrument faults:
+**The confound.** The table counts sessions, not spawns. Cross-referencing the same window
+against the transcripts in `~/.claude/projects` shows the 25 interactive sessions made
+**three `Agent` tool calls between them** — and all three belong to the two probe sessions.
+There were 26 `Agent` calls in *all* 267 transcripts on the machine, ever. The interactive
+sessions were not failing to emit `SubagentStart` for their spawns; they were almost never
+using the tool that this governor gates. Headless-versus-interactive and
+uses-the-`Agent`-tool were perfectly correlated in that sample because the probe sessions
+existed precisely to exercise it.
 
-- **Both hooks were registered, in the same file, on the same command.**
-  `~/.claude/settings.json` wires `SubagentStart` and `SubagentStop` to the identical
-  `governor trace agent`, which branches on nothing — it records whatever `hook_event_name`
-  the payload carries and always writes a record.
-- **It is not a stale binary.** The binary was replaced mid-window at 20:41Z; the
-  `SubagentStart` at 17:34Z carries `raw_keys` and so was recorded by the *newer* build. The
-  code path works under the binary that then saw zero starts for five hours.
-- **It is not sessions predating the install.** Sessions `4857c403` (21:20Z), `1fde424b`
-  (21:56Z) and `55878e4e` (18:50Z) all began well after 17:26:39Z, so all three certainly
-  loaded both hooks. Between them they emitted 17 `SubagentStop` and 0 `SubagentStart`.
-- **It is not the payload shape.** `SubagentStop` keysets are identical between probe and
-  interactive sessions but for `scratchpad_dir`, and both carry `agent_type`.
+**The direct measurement, GOV-27, 2026-09-08.** Six `Agent` spawns driven from one
+**ordinary interactive session** (`545d79a1`, this repo, not a probe), in two fan-outs of
+three:
 
-The discriminator that survives is **headless `claude -p` versus interactive**. The mechanism
-is *not* established — this is an observed correlation over n=27 sessions on one host and one
-version, and nothing here explains *why*.
+```
+23:31:29.609  SubagentStart  acfd08ff14c716632
+23:31:29.609  PostToolUse    toolu_01Q9er… → acfd08ff14c716632  async_launched
+23:31:32.146  SubagentStop   acfd08ff14c716632
+…
+23:33:55.434  SubagentStart  a0d77362854958368
+23:33:55.434  PostToolUse    toolu_01EAYK… → a0d77362854958368  async_launched
+23:34:18.490  SubagentStop   a0d77362854958368
+```
 
-**Consequence, and it is not small.** `confirm` is driven by `SubagentStart` (§4.3 of
-`design.md`), so in interactive use no lease is ever confirmed: none reaches `Confirmed`, no
-owner PID is ever bound, `PIDLiveness` is never consulted, and `SubagentStop` → `release`
-finds nothing to release because `byAgent` is only populated by `confirm`. Every lease
-instead sits tentative and is reclaimed at its 30 s TTL **while its agent is still running**,
-so the slot is handed out again and the budget silently over-subscribes. The lifecycle
-collapses from tentative → confirmed → released into "tentative, then reaped at 30 s".
+Six spawns, **six `SubagentStart`, six `PostToolUse`, six `SubagentStop`** — 1:1:1, in an
+interactive session. `SubagentStart` fires for an `Agent`-tool spawn whether the session is
+headless or interactive. The lifecycle of §4.3 is intact and `confirm` runs in ordinary use.
 
-GOV-09 records this and does not fix it; the fix is its own story, since the candidate — bind
-the owner at `PreToolUse` from the gate's own ancestry walk, which GOV-07 already
-built — changes what a lease means rather than how it is collected.
+**Verified end to end, not just from the log.** With the daemon running and the real
+`gate` / `confirm` / `release` hooks wired, a three-agent interactive fan-out produced:
+
+```
+in_use=1 tentative=1              ← three PreToolUse acquires
+in_use=2 tentative=2
+in_use=3 tentative=3
+in_use=3 tentative=2 confirmed=1  ← three SubagentStart confirms
+in_use=3 tentative=1 confirmed=2
+in_use=3 tentative=0 confirmed=3  ← all three agents running, all three slots held
+in_use=2 confirmed=2              ← three SubagentStop releases
+in_use=1 confirmed=1
+in_use=0
+```
+
+`in_use` equalled the number of agents actually running for the whole fan-out, and the
+daemon logged **zero reaps**: every lease was returned by its own `SubagentStop`, none by a
+TTL or by liveness. The over-subscription this section used to predict does not occur.
+
+**What the other 63 stops were, and why it matters more than this did.** They came from a
+spawn path that emits `SubagentStop` but no `PreToolUse` on `Agent` — strongly correlated
+with `Skill` invocations, of which there were 48 in the same window. Those subagents never
+pass the gate, so they never take a lease, and the governor does not see them at all. That
+is a real governance gap and a much larger one than the bug this section used to describe:
+on this machine the gated path accounted for 3 of 70 observed subagent stops. It is filed as
+its own story rather than fixed here.
+
+**Two incidental facts settled by the same run.**
+
+- **Hooks are re-read during a session, not only at its start.** The `PostToolUse` and
+  `Stop` hooks were installed at 23:31:12Z into a session that began at 23:03Z, and fired
+  17 seconds later. Any argument that rules out an instrument fault by pointing at when a
+  session began (as the previous version of this section did, defensibly) is unsound.
+- **`Stop` fires.** Recorded from a separate live session, carrying `stop_hook_active` and
+  `background_tasks`.
+
+**The limit of this, stated plainly.** All six spawns reported
+`tool_response.status: "async_launched"` — this Claude Code version launches an interactively
+requested subagent in the background. A **foreground** `Agent` spawn from an interactive
+session was not reachable and so is not covered; the foreground case is evidenced only by
+probe 1 (§7), which was headless. Both halves of the surface fired there too.
 
 ## 9. Nested spawns are not refused by Claude Code
 

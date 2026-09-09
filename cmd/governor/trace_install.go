@@ -29,15 +29,27 @@ import (
 // that has grown other hooks since install still comes out correct.
 var traceHookSuffixes = []string{" trace agent", " trace ensure", " trace sample"}
 
-// traceEvents are the three hooks Phase 0 installs, in the order they are reported.
+// traceEvents are the hooks Phase 0 installs, in the order they are reported.
 //
-// SubagentStart and SubagentStop are the observations. SessionStart is not an observation at
-// all — it is what starts the sampler, so that Phase 0 has no launchd job, no systemd unit
-// and nothing that outlives Claude Code.
-var traceEvents = []struct{ event, args string }{
-	{"SubagentStart", "trace agent"},
-	{"SubagentStop", "trace agent"},
-	{"SessionStart", "trace ensure"},
+// SubagentStart, SubagentStop, PostToolUse and Stop are the observations. SessionStart is not
+// an observation at all — it is what starts the sampler, so that Phase 0 has no launchd job,
+// no systemd unit and nothing that outlives Claude Code.
+//
+// PostToolUse and Stop were added by GOV-27 to settle whether either fires in an interactive
+// session, since SubagentStart demonstrably does not (hook-surface.md section 8.1).
+//
+// The matcher on PostToolUse is not optional. PostToolUse fires for EVERY tool call — over
+// fifteen thousand Bash calls appear in the transcripts on this machine alone — so an
+// unmatched registration would bury the trace in records that answer nothing and put this
+// hook on the path of every tool use in every session. "Agent|Task" is the same pair the gate
+// matches, and for the same measured reason: the tool answers to both names within one
+// version (hook-surface.md section 1).
+var traceEvents = []struct{ event, matcher, args string }{
+	{"SubagentStart", "", "trace agent"},
+	{"SubagentStop", "", "trace agent"},
+	{"PostToolUse", "Agent|Task", "trace agent"},
+	{"Stop", "", "trace agent"},
+	{"SessionStart", "", "trace ensure"},
 }
 
 // traceHookTimeout bounds each hook in seconds. It is set explicitly rather than inherited,
@@ -181,13 +193,20 @@ func mergeTraceHooks(settings map[string]any, self string) (int, map[string]any)
 		if hasHookCommand(entries, want) {
 			continue
 		}
-		entries = append(entries, map[string]any{
+		entry := map[string]any{
 			"hooks": []any{map[string]any{
 				"type":    "command",
 				"command": want,
 				"timeout": traceHookTimeout,
 			}},
-		})
+		}
+		// Written only when there is one. An empty matcher key and an absent one are not
+		// reliably the same thing to the harness, and the events that want no matcher have
+		// shipped without the key since GOV-02.
+		if e.matcher != "" {
+			entry["matcher"] = e.matcher
+		}
+		entries = append(entries, entry)
 		hooks[e.event] = entries
 		added++
 	}

@@ -78,11 +78,17 @@ func runTrace(args []string, stdout, stderr io.Writer) int {
 	}
 }
 
-// runTraceAgent is the SubagentStart and SubagentStop hook body.
+// runTraceAgent is the hook body for every lifecycle event Phase 0 observes:
+// SubagentStart, SubagentStop, Stop, and PostToolUse on the Agent tool.
 //
-// One command serves both events because the payload names itself in hook_event_name, and
-// two commands that differ only in a string they could have read is two things to keep in
+// One command serves all of them because the payload names itself in hook_event_name, and
+// commands that differ only in a string they could have read is several things to keep in
 // step.
+//
+// PostToolUse and Stop were added by GOV-27. SubagentStart does not fire in interactive
+// sessions (hook-surface.md section 8.1), so the event the lease lifecycle was built on is
+// absent exactly where it matters; these two are the candidate replacements and this hook is
+// how the claim that they DO fire there gets measured rather than assumed.
 //
 // It returns 0 unconditionally. Every failure — unparseable payload, unwritable log, no
 // home directory — is written to stderr and swallowed. Phase 0 losing a record is a gap in
@@ -112,6 +118,17 @@ func runTraceAgent(stderr io.Writer) int {
 		AgentType     string `json:"agent_type"`
 		PromptID      string `json:"prompt_id"`
 		CWD           string `json:"cwd"`
+		// PostToolUse only. tool_input is deliberately NOT decoded: it carries the agent's
+		// prompt, and this log is not the place for it.
+		ToolName  string `json:"tool_name"`
+		ToolUseID string `json:"tool_use_id"`
+		// Named fields only, for the same reason — tool_response also carries
+		// last_assistant_message.
+		ToolResponse struct {
+			Status        string  `json:"status"`
+			AgentID       string  `json:"agentId"`
+			TotalDuration float64 `json:"totalDurationMs"`
+		} `json:"tool_response"`
 	}
 	if err := json.Unmarshal(payload, &p); err != nil {
 		fmt.Fprintf(stderr, "governor trace agent: parse payload: %v\n", err)
@@ -121,13 +138,18 @@ func runTraceAgent(stderr io.Writer) int {
 	rec := trace.Record{
 		Kind: trace.KindAgent,
 		Agent: &trace.Agent{
-			RawKeys:   payloadKeys(payload),
-			Event:     p.HookEventName,
-			SessionID: p.SessionID,
-			AgentID:   p.AgentID,
-			AgentType: p.AgentType,
-			PromptID:  p.PromptID,
-			CWD:       p.CWD,
+			RawKeys:        payloadKeys(payload),
+			Event:          p.HookEventName,
+			SessionID:      p.SessionID,
+			AgentID:        p.AgentID,
+			AgentType:      p.AgentType,
+			PromptID:       p.PromptID,
+			CWD:            p.CWD,
+			ToolName:       p.ToolName,
+			ToolUseID:      p.ToolUseID,
+			ToolStatus:     p.ToolResponse.Status,
+			ToolAgentID:    p.ToolResponse.AgentID,
+			ToolDurationMS: p.ToolResponse.TotalDuration,
 		},
 	}
 	if err := trace.Append(rec); err != nil {
