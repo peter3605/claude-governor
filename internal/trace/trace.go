@@ -50,14 +50,15 @@ type Record struct {
 	Sample *Sample `json:"sample,omitempty"`
 }
 
-// Agent is a SubagentStart or SubagentStop observation.
+// Agent is a subagent lifecycle observation: SubagentStart, SubagentStop, Stop, or
+// PostToolUse on the Agent tool.
 //
 // The fields are exactly what the hook payload carries (design.md section 10.1, measured in
 // GOV-01), and nothing is synthesised. In particular AgentType may legitimately be empty:
 // tool_input.subagent_type is optional and was absent on a nested spawn, so a record with no
 // type is a real observation rather than a dropped field.
 type Agent struct {
-	// Event is the hook_event_name from the payload: SubagentStart or SubagentStop.
+	// Event is the hook_event_name from the payload.
 	Event string `json:"event"`
 	// SessionID identifies the Claude Code session.
 	SessionID string `json:"session_id"`
@@ -71,6 +72,31 @@ type Agent struct {
 	PromptID string `json:"prompt_id,omitempty"`
 	// CWD is the session's working directory, which is what attributes load to a project.
 	CWD string `json:"cwd,omitempty"`
+	// ToolName, ToolUseID and the two Tool* fields below are the PostToolUse correlation
+	// fields (GOV-27). They are empty on SubagentStart, SubagentStop and Stop, which carry
+	// none of them.
+	//
+	// PostToolUse on the Agent tool is the only event on the surface that carries BOTH the
+	// tool_use_id of the spawn and the agent_id it produced (hook-surface.md section 6), so
+	// it is the one place a lease taken at PreToolUse can be tied to an agent exactly rather
+	// than by per-session FIFO. That matters here because SubagentStart — the event the
+	// design originally used for it — does not fire in interactive sessions at all
+	// (section 8.1).
+	ToolName  string `json:"tool_name,omitempty"`
+	ToolUseID string `json:"tool_use_id,omitempty"`
+	// ToolStatus is tool_response.status: "completed" for a foreground spawn, which has
+	// already finished by the time this arrives, or "async_launched" for a background one,
+	// which has only just begun. The two demand opposite handling and the field is the only
+	// thing that separates them.
+	ToolStatus string `json:"tool_status,omitempty"`
+	// ToolAgentID is tool_response.agentId — the agent this spawn produced.
+	ToolAgentID string `json:"tool_agent_id,omitempty"`
+	// ToolDurationMS is tool_response.totalDurationMs, the agent's own measure of how long
+	// it ran. It is recorded because the lease TTLs are supposed to outlive a real agent
+	// and were previously calibrated against three probe runs; this is the first source of
+	// that number at any scale.
+	ToolDurationMS float64 `json:"tool_duration_ms,omitempty"`
+
 	// RawKeys is the sorted list of top-level keys the payload actually carried.
 	//
 	// It is here because without it an absent AgentType is ambiguous, and the ambiguity is
@@ -127,7 +153,13 @@ type Sample struct {
 }
 
 // RecordV is the current record schema version.
-const RecordV = 1
+//
+// Bumped to 2 by GOV-27, which added the PostToolUse correlation fields to Agent and began
+// recording two further events (PostToolUse and Stop). The addition is backward compatible —
+// every v1 field means what it always did — but the file is read as a whole by Phase 0
+// analysis and "no PostToolUse records before this line" is a fact about the instrument
+// rather than about the machine. That distinction is the entire reason this field exists.
+const RecordV = 2
 
 // StateDir is the directory holding the governor's state, per design.md section 13.3.
 func StateDir() (string, error) {

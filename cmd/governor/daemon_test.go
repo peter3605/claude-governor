@@ -17,6 +17,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/peter3605/claude-governor/internal/lease"
+
 	"github.com/peter3605/claude-governor/internal/signals"
 	"github.com/peter3605/claude-governor/internal/transport"
 )
@@ -58,6 +60,13 @@ const unixPathMax = 100
 // not have tested the thing the gate actually talks to.
 func startTestDaemon(t *testing.T, limit int) (string, *daemon) {
 	t.Helper()
+	return startTestDaemonWithLeases(t, limit, lease.Options{})
+}
+
+// startTestDaemonWithLeases is startTestDaemon over a lease table configured by opt, so a
+// test can drive the clock rather than sleep out a thirty-second TTL.
+func startTestDaemonWithLeases(t *testing.T, limit int, opt lease.Options) (string, *daemon) {
+	t.Helper()
 
 	dir, err := os.MkdirTemp("", "govd")
 	if err != nil {
@@ -72,7 +81,7 @@ func startTestDaemon(t *testing.T, limit int) (string, *daemon) {
 	endpoint := "unix://" + path
 
 	ctx, cancel := context.WithCancel(context.Background())
-	d := newDaemon(limit, io.Discard)
+	d := newDaemonWithLeases(limit, io.Discard, opt)
 	ln, err := transport.Listen{}.Listen(ctx, endpoint)
 	if err != nil {
 		cancel()
@@ -561,4 +570,162 @@ func TestListenRefusesASecondDaemonOnTheSameEndpoint(t *testing.T) {
 	if r := call(t, endpoint, acquireReq("s1")); r.OK == nil || !*r.OK {
 		t.Fatalf("the original daemon stopped serving: %+v", r)
 	}
+}
+
+// An interactive fan-out holds one lease per running agent, and holds it for as long as the
+// agent runs (GOV-27).
+//
+// This test exists because the opposite was believed, recorded in the backlog as a launch
+// blocker, and was wrong. GOV-09 measured 62 SubagentStop records against zero SubagentStart
+// across 25 interactive sessions and concluded that SubagentStart does not fire interactively
+// — from which it followed that confirm never runs, no lease is ever bound, and every lease is
+// reaped at the 30 s tentative TTL while its agent is still running. GOV-27 re-measured and
+// found the correlation confounded: those sessions had made almost no Agent tool calls at all
+// (3 in the whole window), because most subagents on that machine came from a spawn path that
+// never passes this gate. Driven properly — three Agent spawns in an ordinary interactive
+// session — SubagentStart fired for all three, all three confirmed, and the daemon reaped
+// nothing. docs/hook-surface.md section 8.1 records the run.
+//
+// So what is pinned here is the behaviour that actually exists, in the shape the live hooks
+// actually produce it:
+//
+//   - confirm carries NO lease id, because SubagentStart has no tool_use_id to put in one
+//     (hook-surface.md section 3). The pairing is per-session FIFO, and the older lifecycle
+//     test passes an explicit lease id, so that path was covered and this one was not.
+//   - a confirmed lease survives well past the TENTATIVE TTL. That is the assertion the
+//     misdiagnosis would have inverted: the proposed fix was to stop reaping unconfirmed
+//     leases, which would have removed the only thing that reclaims an abandoned spawn.
+//   - the reaper runs throughout, on the real 2 s interval, and takes nothing.
+func TestInteractiveFanOutKeepsALeasePerRunningAgent(t *testing.T) {
+	clock := &testClock{now: time.Now()}
+	endpoint, d := startTestDaemonWithLeases(t, 4, lease.Options{Now: clock.Now})
+
+	if r := call(t, endpoint, map[string]any{
+		"v": protocolVersion, "op": "session", "action": "start",
+		"principal": map[string]any{"user": "tester"},
+		"session":   "s1", "pid": os.Getpid(), "pid_started_at": time.Now().Unix(), "weight": 1,
+	}); r.OK == nil || !*r.OK {
+		t.Fatalf("session start refused: %+v", r)
+	}
+
+	// Three spawns announced, as a fan-out in one assistant message announces them.
+	for i := 1; i <= 3; i++ {
+		if got := call(t, endpoint, acquireReq("s1")); got.OK == nil || !*got.OK {
+			t.Fatalf("acquire %d refused with %d/4 in use: %+v", i, got.InUse, got)
+		}
+	}
+	if st := call(t, endpoint, map[string]any{"v": protocolVersion, "op": "status"}); st.InUse != 3 ||
+		st.Sessions[0].Tentative != 3 {
+		t.Fatalf("after three acquires: in_use %d, tentative %d, want 3 and 3",
+			st.InUse, st.Sessions[0].Tentative)
+	}
+
+	// Three SubagentStart hooks arrive. Each sends an agent_id and the owning session's PID
+	// and no lease id at all, which is exactly what buildConfirm puts on the wire.
+	agents := []string{"ag_1", "ag_2", "ag_3"}
+	for _, ag := range agents {
+		if r := call(t, endpoint, map[string]any{
+			"v": protocolVersion, "op": "confirm", "session": "s1",
+			"agent_id": ag, "pid": os.Getpid(), "pid_started_at": time.Now().Unix(),
+		}); r.OK == nil || !*r.OK {
+			t.Fatalf("confirm for %s refused: %+v", ag, r)
+		}
+	}
+
+	st := call(t, endpoint, map[string]any{"v": protocolVersion, "op": "status"})
+	if st.InUse != 3 || st.Sessions[0].Confirmed != 3 || st.Sessions[0].Tentative != 0 {
+		t.Fatalf("after three confirms: in_use %d, confirmed %d, tentative %d, want 3, 3 and 0",
+			st.InUse, st.Sessions[0].Confirmed, st.Sessions[0].Tentative)
+	}
+	// Every lease names a live owner. A lease with no owner is one the reaper cannot ask
+	// about, which is what made the tentative TTL the only thing collecting it.
+	if pids := ownerPIDs(d); len(pids) != 3 {
+		t.Fatalf("owner pids on held leases: %v, want three non-zero", pids)
+	}
+
+	// The agents keep running. Push well past the tentative TTL — the exact window in which
+	// the budget was believed to over-subscribe — and let the real reaper have several turns.
+	clock.advance(4 * lease.DefaultTentativeTTL)
+	waitForReaps(t, d)
+
+	if n := d.table.InUse(); n != 3 {
+		t.Fatalf("%d leases held %v after the fan-out started, want all 3 still held: a live "+
+			"agent's slot was handed back while it was still running", n, 4*lease.DefaultTentativeTTL)
+	}
+
+	// Each agent stops, and each stop returns exactly its own slot.
+	for i, ag := range agents {
+		r := call(t, endpoint, map[string]any{
+			"v": protocolVersion, "op": "release", "session": "s1", "agent_id": ag,
+		})
+		if r.OK == nil || !*r.OK {
+			t.Fatalf("release of %s refused: %+v", ag, r)
+		}
+		if want := 2 - i; r.InUse != want {
+			t.Fatalf("after releasing %s, in_use %d, want %d", ag, r.InUse, want)
+		}
+	}
+}
+
+// An announced spawn that never happens is still reclaimed at the tentative TTL (GOV-27).
+//
+// This is the other half of the test above and the reason the fix GOV-27 proposed was not
+// applied. The tentative TTL is what collects a spawn the user declined or interrupted, and a
+// lease that no longer expires while unconfirmed is a slot lost until the session ends. Both
+// properties have to hold at once, so both are asserted next to each other.
+func TestAnAnnouncedSpawnThatNeverHappensIsStillReclaimed(t *testing.T) {
+	clock := &testClock{now: time.Now()}
+	endpoint, d := startTestDaemonWithLeases(t, 4, lease.Options{Now: clock.Now})
+
+	if got := call(t, endpoint, acquireReq("s1")); got.OK == nil || !*got.OK {
+		t.Fatalf("acquire refused against an empty table: %+v", got)
+	}
+	if n := d.table.InUse(); n != 1 {
+		t.Fatalf("%d leases held after one acquire, want 1", n)
+	}
+
+	// No confirm ever arrives: the spawn was announced and did not happen.
+	clock.advance(lease.DefaultTentativeTTL + time.Second)
+	waitForReaps(t, d)
+
+	if n := d.table.InUse(); n != 0 {
+		t.Fatalf("%d leases held past the tentative TTL with no confirm, want 0: an abandoned "+
+			"spawn is holding a slot", n)
+	}
+}
+
+// ownerPIDs is the non-zero owning PID of every lease currently held.
+func ownerPIDs(d *daemon) []int {
+	var out []int
+	for _, l := range d.table.Leases() {
+		if l.OwnerPID != 0 {
+			out = append(out, l.OwnerPID)
+		}
+	}
+	return out
+}
+
+// waitForReaps blocks until the daemon's reaper has certainly run at least twice, so that a
+// test asserting what the reaper did or did not take is not racing it.
+func waitForReaps(t *testing.T, d *daemon) {
+	t.Helper()
+	time.Sleep(reapInterval*2 + 250*time.Millisecond)
+}
+
+// testClock is a hand-wound clock, safe for the reaper goroutine to read while a test writes.
+type testClock struct {
+	mu  sync.Mutex
+	now time.Time
+}
+
+func (c *testClock) Now() time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.now
+}
+
+func (c *testClock) advance(d time.Duration) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.now = c.now.Add(d)
 }

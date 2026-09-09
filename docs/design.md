@@ -219,11 +219,19 @@ SessionEnd    → release all for session
 reaper (2s)   → drop leases past ttl, whose SESSION is gone, or whose owning pid is gone
 ```
 
-> **`SubagentStart` does not fire in interactive sessions** on the version measured, so the
-> `confirm` step above does not happen in ordinary use and leases are reclaimed at the
-> tentative TTL while their agents still run. Measured in GOV-09; see `hook-surface.md`
-> §8.1. The lifecycle below is the design and remains correct; what is missing is a confirm
-> trigger that fires.
+> **This lifecycle was briefly believed to be broken in interactive use, and is not.** GOV-09
+> read a trace showing 62 `SubagentStop` records against zero `SubagentStart` across 25
+> interactive sessions and concluded that `confirm` never runs in ordinary use. GOV-27
+> re-measured: those sessions had made three `Agent` tool calls between them, so there was
+> almost nothing to confirm. Driven directly — six `Agent` spawns from an ordinary
+> interactive session — `SubagentStart` fired for all six, and a live three-agent fan-out
+> held exactly three slots with zero reaps. See `hook-surface.md` §8.1, which carries the
+> correction and the run.
+>
+> The gap that measurement *did* find is a different one and is not about leases at all:
+> subagents spawned other than through the `Agent` tool (a `Skill` invocation, chiefly) emit
+> `SubagentStop` but never a `PreToolUse` the gate can see, so they take no lease and are not
+> governed. On the machine measured that was 63 of 70 observed spawns.
 
 **The reaper collects three things, not two.** A lease past its TTL; a lease of any state
 whose *session* is registered with a PID that is gone; and a confirmed lease whose own owner
@@ -873,19 +881,24 @@ Uninstall is only verifiable if this list is exhaustive, so it is normative.
 | `~/.claude/governor/sock` | daemon | uninstall |
 | `${CLAUDE_PLUGIN_DATA}/` (config, leases, samples) | daemon | uninstall `--purge` only |
 
-Phase 0 (GOV-02) adds the rows below. They are listed here rather than in a story note
+Phase 0 (GOV-02, extended by GOV-27) adds the rows below. They are listed here rather than in a story note
 because this table is what makes uninstall verifiable, and a path that is touched but not
 listed is a path uninstall silently stops covering. All of them go when Phase 1 replaces the
 `trace` family.
 
 | Path | Written by | Removed by |
 |---|---|---|
-| `~/.claude/settings.json` (three `trace` hooks) | `trace install`, merged after backup | `trace uninstall`, surgically |
+| `~/.claude/settings.json` (five `trace` hooks) | `trace install`, merged after backup | `trace uninstall`, surgically |
 | `~/.claude/settings.json.governor-trace-backup-<ts>` | `trace install` | `trace uninstall` |
 | `~/.claude/governor/samples.jsonl` | `trace agent`, `trace sample` | by hand — it is the measurement, and deleting it on uninstall would throw away the phase |
 | `~/.claude/governor/sampler.lock` | `trace sample` | by hand |
 | `~/.claude/governor/sampler.log` | `trace sample` | by hand |
 | `~/.local/share/claude-governor/bin/governor` | staged by hand in Phase 0 | by hand, until `install.sh` owns it |
+
+The five hooks are `SubagentStart`, `SubagentStop`, `SessionStart`, and — added by GOV-27 to
+settle whether either fires interactively — `PostToolUse` and `Stop`. `PostToolUse` is
+registered with an `Agent|Task` matcher and that matcher is load-bearing rather than tidy:
+unmatched, it would run this binary on every tool call in every session.
 
 `trace uninstall` removes our hook entries **surgically** rather than restoring the backup
 wholesale, because a wholesale restore would destroy anything the user added to

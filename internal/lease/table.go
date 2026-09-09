@@ -31,14 +31,18 @@ import (
 // an owner that lingers as a zombie, which liveness cannot see through.
 //
 // THE CONFIRMED TTL IS BOUNDED, NOT MEASURED, and the distinction is honest rather than
-// pedantic. GOV-09 set out to calibrate it against the SubagentStart timings GOV-02
-// recorded and found there are almost none to calibrate against: SubagentStart does not fire
-// in ordinary interactive sessions on Claude Code 2.1.263 (hook-surface.md section 8.1), so
-// leases are rarely confirmed and this TTL rarely governs anything. What evidence exists
-// bounds an agent's life well under a minute — 1.7 s to 8.3 s across the probe sessions that
-// did emit both events, and a p99 of 43 s across 26 Agent tool calls timed in the
-// transcripts. Half an hour is ~40x the longest of those. It stays generous on purpose, and
-// it stays a guess about the tail rather than a measurement of it.
+// pedantic. GOV-09 set out to calibrate it against the SubagentStart timings GOV-02 recorded
+// and found few to calibrate against, which it attributed to SubagentStart not firing in
+// interactive sessions. GOV-27 showed that reading was wrong — SubagentStart fires per
+// Agent-tool spawn either way (hook-surface.md section 8.1) — but the shortage of samples was
+// real, for the more mundane reason that the Agent tool is called rarely: 26 times in every
+// transcript on the machine.
+//
+// What evidence exists bounds an agent's life well under a minute — 1.7 s to 8.3 s across the
+// probe sessions, a p95 of 42.7 s and a maximum of 43.2 s across those 26 Agent tool calls,
+// and 22.8-23.1 s across the three deliberately slow agents GOV-27 ran. Half an hour is ~40x
+// the longest of those. It stays generous on purpose, and it stays a guess about the tail
+// rather than a measurement of it.
 const (
 	DefaultTentativeTTL = 30 * time.Second
 	DefaultConfirmedTTL = 30 * time.Minute
@@ -483,4 +487,24 @@ func (t *Table) Snapshot() Snapshot {
 	}
 	sort.Slice(s.Sessions, func(i, j int) bool { return s.Sessions[i].ID < s.Sessions[j].ID })
 	return s
+}
+
+// Leases is a copy of every lease currently held, in no particular order.
+//
+// Snapshot answers "how many, and whose", which is what status needs. This answers "which
+// exactly", which is what a test asserting per-lease detail needs — chiefly that a held lease
+// names a live owner, since a lease with no owner is one the reaper cannot ask Liveness about
+// and can only collect by TTL.
+//
+// It returns copies: a caller holding a *Lease could otherwise mutate the table's own entry
+// with no lock held.
+func (t *Table) Leases() []Lease {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	out := make([]Lease, 0, len(t.byID))
+	for _, l := range t.byID {
+		out = append(out, *l)
+	}
+	return out
 }
