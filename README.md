@@ -19,6 +19,42 @@ load and thermal pressure, and every session asks it before spawning.
 Status: **Phase 0 — measuring.** The control loop is designed but not built; what runs today
 is instrumentation only. See [`docs/design.md`](docs/design.md).
 
+## Install
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/peter3605/claude-governor/main/install.sh | sh
+```
+
+That fetches the binary for this OS and architecture and hands off to `governor install`,
+which writes a plugin to `~/.claude/skills/claude-governor/`, merges a `statusLine` key into
+`~/.claude/settings.json` after backing it up, and starts the daemon. It prints every path it
+touched. Sessions already running pick the hooks up when they next start.
+
+```sh
+governor doctor       # is it working, and if not, what exactly do I type
+governor status       # budget, holders, CPU, thermal
+governor uninstall    # remove all of it
+```
+
+**Removing it leaves nothing.** `governor uninstall` deletes the plugin, restores whatever
+`statusLine` you had before — byte for byte, formatting and key order included — stops the
+daemon and removes its socket. `--purge` also removes the config and the sample log, which are
+otherwise kept. There is a test that installs into a scratch home, uninstalls, and fails on
+any difference in a recursive digest of the whole directory; what is being asked of you is to
+run a hook on every subagent spawn, and being able to prove it comes out clean is most of why
+that should be acceptable.
+
+Installing twice changes nothing the second time. The five hooks live in the plugin's own
+`hooks/hooks.json`, so the only key touched in your `settings.json` is `statusLine`, and hooks
+of your own are left exactly where they are.
+
+To build and install from a clone instead:
+
+```sh
+make build
+./bin/governor install
+```
+
 ## Phase 0
 
 Before anything is governed, the machine is measured, so that the setpoint and the ceiling

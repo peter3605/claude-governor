@@ -338,7 +338,7 @@ func TestIsTraceCommandMatchesOnlyOurs(t *testing.T) {
 	}
 	no := []string{
 		"",
-		"/opt/bin/governor gate",          // GOV-18's hook, not ours
+		"/opt/bin/governor gate",          // GOV-21's hook, not ours
 		"/opt/bin/governor trace install", // not a hook command
 		"/opt/bin/other-tool trace agent", // not our binary
 		"/usr/bin/strace agent",           // substring coincidence

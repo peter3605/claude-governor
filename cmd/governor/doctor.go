@@ -28,7 +28,7 @@ import (
 // with `governor daemon`" is a diagnosis. So every failing check carries a fix, and the fix
 // is a command that can be typed, not a suggestion to investigate.
 //
-// It is built before `governor install` (GOV-18) rather than after, deliberately: this is
+// It is built before `governor install` (GOV-21) rather than after, deliberately: this is
 // what tells you whether the installer worked. On a machine where nothing has been
 // installed, doctor is *supposed* to fail — that is the correct report, not a bug in the
 // tool.
@@ -219,7 +219,7 @@ func (d *diagnosis) checkDaemon() {
 		d.add("daemon", fail,
 			fmt.Sprintf("the socket path is %d bytes, past this platform's limit of %d — nothing can bind or connect there",
 				len(path), transport.MaxSocketPath),
-			fmt.Sprintf("point the state directory somewhere shorter: %s=$HOME/.claude/governor, then: governor daemon",
+			fmt.Sprintf("point the state directory somewhere shorter: %s=$HOME/.claude/governor, then: governor install",
 				transport.StateDirEnv))
 		return
 	}
@@ -239,7 +239,7 @@ func (d *diagnosis) checkDaemon() {
 		d.add("daemon", fail,
 			fmt.Sprintf("nothing answering on %s (%s) — every spawn on this machine is ungoverned",
 				short(endpoint), short(reason)),
-			"governor daemon")
+			"governor install")
 		return
 	}
 	d.up = true
@@ -288,7 +288,7 @@ func (d *diagnosis) checkSocket() {
 		}
 		d.add("socket", fail,
 			fmt.Sprintf("a daemon answered but there is no socket at %s", short(path)),
-			"restart the daemon so the endpoint and the socket agree: governor daemon")
+			"restart the daemon so the endpoint and the socket agree: governor install")
 		return
 	}
 	if err != nil {
@@ -303,7 +303,7 @@ func (d *diagnosis) checkSocket() {
 		d.add("socket", fail,
 			fmt.Sprintf("%s exists and is not a socket (mode %s) — the daemon refuses to replace it",
 				short(path), fi.Mode()),
-			fmt.Sprintf("mv %s %s.bak && governor daemon", path, path))
+			fmt.Sprintf("mv %s %s.bak && governor install", path, path))
 		return
 	}
 
@@ -351,7 +351,7 @@ type socketFacts struct {
 func (f socketFacts) faults() (problems, fixes []string) {
 	if f.ownerKnown && f.owner != f.self {
 		problems = append(problems, fmt.Sprintf("owned by uid %d, not by you (uid %d)", f.owner, f.self))
-		fixes = append(fixes, fmt.Sprintf("stop that user's daemon, then: rm %s && governor daemon", f.path))
+		fixes = append(fixes, fmt.Sprintf("stop that user's daemon, then: rm %s && governor install", f.path))
 	}
 	if f.perm&0o077 != 0 {
 		problems = append(problems, fmt.Sprintf("mode %04o: other users on this machine can take leases from your budget", f.perm))
@@ -442,11 +442,10 @@ type hookSource struct {
 
 // hookSources are the two places a governor hook can be registered.
 //
-// Both are named normatively by design.md section 13.3: install merges hooks into
-// ~/.claude/settings.json, and the plugin directory carries the hooks/hooks.json of section
-// 9. GOV-18 has not yet chosen which of the two it writes, and doctor must not prejudge it —
-// a diagnostic that only knew about the one that lost would report a perfectly good install
-// as broken.
+// All three are named by design.md section 13.3. GOV-21 settled where install writes — the
+// plugin's own hooks/hooks.json under ~/.claude/skills — and the settings file is still read
+// because a user may wire a hook there by hand, which is the supported way to keep one of
+// their own.
 func hookSources() ([]hookSource, error) {
 	settings, err := settingsPath()
 	if err != nil {
@@ -456,10 +455,21 @@ func hookSources() ([]hookSource, error) {
 	if err != nil {
 		return nil, err
 	}
-	pluginRoot := filepath.Join(home, ".claude", "plugins", "claude-governor")
+	// The directory `governor install` actually writes, and the only one of the three a
+	// current Claude Code loads. GOV-21 measured it: ~/.claude/skills/<name>/ auto-loads as
+	// <name>@skills-dir with no settings entry, and its hooks/hooks.json fires
+	// (hook-surface.md section 15).
+	pluginRoot := filepath.Join(home, ".claude", "skills", pluginName)
+	// The directory design.md section 13.3 named before that measurement. It is inert on
+	// 2.1.265 and install no longer writes it, but it is still read here: a machine
+	// installed by an earlier build has hooks sitting in it, and a doctor that could not see
+	// them would report "not registered" for a file it is looking straight at, which is
+	// worse than the original mistake.
+	legacyRoot := filepath.Join(home, ".claude", "plugins", pluginName)
 	return []hookSource{
 		{path: settings},
 		{path: filepath.Join(pluginRoot, "hooks", "hooks.json"), pluginRoot: pluginRoot},
+		{path: filepath.Join(legacyRoot, "hooks", "hooks.json"), pluginRoot: legacyRoot},
 	}, nil
 }
 
@@ -801,7 +811,7 @@ func (d *diagnosis) checkProtocol() {
 	}
 	detail += " — every hook is failing open, so nothing is governed"
 	d.add("protocol", fail, detail,
-		"restart the daemon on the same build as the hooks: governor daemon")
+		"restart the daemon on the same build as the hooks: governor install")
 }
 
 // checkBinary compares the binary the hooks run with the one running this check.
@@ -1028,7 +1038,12 @@ func (d *diagnosis) checkLeases() {
 			fmt.Sprintf("%d held, every one by a live session", held), "")
 		return
 	}
-	fix := "restart the daemon to clear them: governor daemon"
+	// Leases live only in the daemon's memory, so a fresh daemon has none. The fix is
+	// therefore a restart, and it has to be one a person can type: `governor install` starts
+	// a daemon only when none is answering, so telling someone to run it while the stuck one
+	// is still up would name a command that does nothing. The pid file GOV-21 added is what
+	// makes the first half precise.
+	fix := "restart the daemon to clear them: kill $(cat " + short(d.pidPath()) + ") && governor install"
 	if ownerless > 0 {
 		// The cause, not the symptom: an ownerless lease means the session was never
 		// registered, which means the SessionStart hook did not run.
@@ -1038,6 +1053,21 @@ func (d *diagnosis) checkLeases() {
 		fmt.Sprintf("%d of %d leases cannot be reclaimed by their owner: %s",
 			ownerless+dead, held, strings.Join(names, ", ")),
 		fix)
+}
+
+// pidPath is where the daemon serving this diagnosis's endpoint keeps its pid.
+//
+// Derived from the endpoint rather than assumed, so that a report about a daemon on a
+// non-default endpoint names that daemon's pid file and not the default one's — a fix that
+// kills the wrong process is worse than no fix at all.
+func (d *diagnosis) pidPath() string {
+	if path, err := daemonPIDPath(d.endpoint); err == nil {
+		return path
+	}
+	if dir, err := transport.StateDir(); err == nil {
+		return filepath.Join(dir, daemonPIDFile)
+	}
+	return daemonPIDFile
 }
 
 // sessionLabel shortens a session id for a report. Session ids are uuids and the first

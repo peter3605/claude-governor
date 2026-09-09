@@ -11,6 +11,9 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"path/filepath"
+	"strconv"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -258,10 +261,75 @@ func runDaemon(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "governor daemon: %v\n", err)
 		return 1
 	}
+	// Written after the listener is bound and removed on the way out, so its presence means
+	// "this pid held the socket" rather than "this pid intended to". `governor uninstall` is
+	// the only reader: it is the one command that has to stop a process it did not start,
+	// and a daemon still running after uninstall is the single piece of residue a user
+	// cannot see in a directory listing. Failing to write it is NOT fatal — the daemon's job
+	// is to answer gates, and refusing to serve because a convenience file would not write
+	// would take the machine ungoverned to protect a bookkeeping detail.
+	if err := writeDaemonPID(ep, stderr); err == nil {
+		defer removeDaemonPID(ep)
+	}
 	fmt.Fprintf(stdout, "governor daemon listening on %s (budget %d)\n", ep, *limit)
 
 	d.serve(ctx, ln)
 	return 0
+}
+
+// daemonPIDFile and daemonLogFile are the daemon's two files in the state directory
+// (design.md section 13.3). The log is written by `governor install` when it starts the
+// daemon detached; this process only names it.
+const (
+	daemonPIDFile = "daemon.pid"
+	daemonLogFile = "daemon.log"
+)
+
+// daemonPIDPath is the pid file beside the socket the daemon actually bound.
+//
+// Derived from the endpoint rather than from transport.StateDir, so that a daemon started
+// with --endpoint elsewhere writes its pid beside its own socket instead of over the pid of
+// the daemon serving the default one. Two governors on one machine is a supported thing
+// (GOVERNOR_ENDPOINT exists for it) and a shared pid file would have uninstall kill the
+// wrong one.
+func daemonPIDPath(endpoint string) (string, error) {
+	sock := strings.TrimPrefix(endpoint, "unix://")
+	if sock == "" || sock == endpoint {
+		return "", fmt.Errorf("endpoint %q is not a unix socket path", endpoint)
+	}
+	return filepath.Join(filepath.Dir(sock), daemonPIDFile), nil
+}
+
+func writeDaemonPID(endpoint string, stderr io.Writer) error {
+	path, err := daemonPIDPath(endpoint)
+	if err != nil {
+		return err
+	}
+	if err := os.WriteFile(path, []byte(strconv.Itoa(os.Getpid())+"\n"), 0o600); err != nil {
+		fmt.Fprintf(stderr, "governor daemon: write pid file: %v\n", err)
+		return err
+	}
+	return nil
+}
+
+// removeDaemonPID removes the pid file, and only when it still holds this process's pid.
+//
+// The check matters on a restart: if this daemon is exiting because another has taken over,
+// the file already names the new one, and removing it would leave the live daemon
+// unstoppable by uninstall.
+func removeDaemonPID(endpoint string) {
+	path, err := daemonPIDPath(endpoint)
+	if err != nil {
+		return
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return
+	}
+	if strings.TrimSpace(string(raw)) != strconv.Itoa(os.Getpid()) {
+		return
+	}
+	_ = os.Remove(path)
 }
 
 // newDaemon builds a daemon with the v1 budget: a slice of sources with exactly one member,

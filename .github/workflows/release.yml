@@ -1,0 +1,79 @@
+name: release
+
+# Tags only. `install.sh` fetches
+# https://github.com/<repo>/releases/latest/download/governor-<os>-<arch>, so a release with
+# those four asset names attached is what makes the bootstrap real rather than aspirational.
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: build ${{ matrix.goos }}/${{ matrix.goarch }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          # darwin is built ON macOS with cgo ON, and that is not a preference. The thermal
+          # shim (GOV-13) reads ProcessInfo.thermalState through cgo, and a darwin binary
+          # cross-compiled with CGO_ENABLED=0 reports "unknown" on every Mac — which
+          # design.md section 5.3 treats as nominal. It would look exactly like a cool
+          # machine and would never take the budget to the floor. The Makefile's `cross`
+          # target carries the same warning; release artefacts do not come from it.
+          - { runner: macos-latest, goos: darwin, goarch: arm64, cgo: '1' }
+          - { runner: macos-latest, goos: darwin, goarch: amd64, cgo: '1' }
+          # linux has no thermal API and needs no cgo, which keeps the binary static — and a
+          # static binary is what lets one artefact run on any distribution.
+          - { runner: ubuntu-latest, goos: linux, goarch: arm64, cgo: '0' }
+          - { runner: ubuntu-latest, goos: linux, goarch: amd64, cgo: '0' }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26'
+      - name: build
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: ${{ matrix.cgo }}
+        # The version is stamped from the tag rather than left at 0.0.0-dev. `governor
+        # doctor` compares the version the hooks run against the one running the check, and
+        # two builds that both call themselves 0.0.0-dev would compare equal however
+        # different they were.
+        run: |
+          go build -trimpath \
+            -ldflags "-X main.binaryVersion=${GITHUB_REF_NAME#v}" \
+            -o "governor-${GOOS}-${GOARCH}" ./cmd/governor
+      - uses: actions/upload-artifact@v4
+        with:
+          name: governor-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: governor-${{ matrix.goos }}-${{ matrix.goarch }}
+          if-no-files-found: error
+
+  publish:
+    name: publish release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: checksums
+        # One file listing every artefact's digest, so a download can be verified without
+        # trusting the transport twice.
+        run: |
+          cd dist
+          chmod +x governor-*
+          sha256sum governor-* > checksums.txt
+          cat checksums.txt
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true

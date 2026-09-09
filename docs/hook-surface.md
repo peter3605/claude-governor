@@ -725,3 +725,103 @@ and an unaccepted workspace trust prompt.
 **`COLUMNS` was not observed to be set** for the child process. A statusline that treated an
 absent `COLUMNS` as a width of zero would render as the empty string on every such machine,
 so it is read as "unknown, do not truncate" rather than as a width.
+
+---
+
+## 15. Where a plugin has to live for its hooks to fire
+
+**Measured on `claude --version` = `2.1.265 (Claude Code)`, macOS/arm64, 2026-09-09 (GOV-21).**
+
+design.md §9 and §13.3 named `~/.claude/plugins/claude-governor/` as the plugin directory
+`governor install` would write. **That path is inert.** Nothing loads a directory dropped
+there, so a gate registered in it would never fire — the silent failure §10.1 was spent
+measuring the tool name to avoid, arriving by a different door: every file present, the
+install apparently complete, and not one spawn governed.
+
+### 15.1 What `~/.claude/plugins` actually holds
+
+Not plugins. On this machine it holds a marketplace cache and bookkeeping:
+
+```
+~/.claude/plugins/
+├── installed_plugins.json        installPath per plugin, per scope
+├── known_marketplaces.json       marketplace name → source and install location
+├── marketplaces/<marketplace>/   the marketplace repo, cloned
+├── cache/<marketplace>/<plugin>/<version>/    the plugin itself
+└── data/<plugin>-<marketplace>/  ${CLAUDE_PLUGIN_DATA}
+```
+
+A plugin installed this way is also listed in `enabledPlugins` in `settings.json`. So the
+supported route in is a marketplace — which is one command more than "curl this" and requires
+somewhere to publish a marketplace to.
+
+### 15.2 `~/.claude/skills/<name>/` auto-loads, and is the way in
+
+`claude plugin init --help` names it: *"Scaffold a new plugin at `~/.claude/skills/<name>/`
+(auto-loads next session as `<name>@skills-dir`)"*. Verified directly rather than taken from
+the help text.
+
+A directory containing only `.claude-plugin/plugin.json` and `hooks/hooks.json`, with **no**
+`settings.json` entry and **no** `installed_plugins.json` entry, was reported by
+`claude plugin list` as:
+
+```
+❯ gov-probe@skills-dir
+  Version: 0.0.1
+  Scope: user
+  Path: ~/.claude/skills/gov-probe
+  Status: ✔ loaded
+```
+
+Three facts follow, each verified by running `claude -p` against a probe hook that appended
+its arguments and environment to a file:
+
+1. **`SessionStart` from a plugin's `hooks/hooks.json` fires.**
+2. **`PreToolUse` *with a matcher* fires.** The probe registered
+   `{"matcher": "Bash", "hooks": [...]}` and it ran on a `Bash` call — so §4.1's registration
+   shape works from a plugin file, matcher included. This is the one that mattered: the whole
+   gate is a matched `PreToolUse`.
+3. **`${CLAUDE_PLUGIN_ROOT}` and `${CLAUDE_PLUGIN_DATA}` both expand** inside the hook's
+   command string, to `~/.claude/skills/gov-probe` and
+   `~/.claude/plugins/data/gov-probe-skills-dir` respectively. A skills-dir plugin's
+   marketplace component is the literal string `skills-dir`.
+
+Probe hook output, verbatim:
+
+```
+sessionstart root=/Users/peterho/.claude/skills/gov-probe
+data=/Users/peterho/.claude/plugins/data/gov-probe-skills-dir
+pretooluse-bash root=/Users/peterho/.claude/skills/gov-probe
+data=/Users/peterho/.claude/plugins/data/gov-probe-skills-dir
+```
+
+### 15.3 Plugin hooks and `settings.json` hooks coexist
+
+During the probe, `settings.json` carried its own `SessionStart` hook and the plugin carried
+another. **Both ran.** They merge; the plugin's registration does not replace the user's.
+
+This is *not* a general answer to whether plugin hooks merge with project-level ones in every
+configuration — it is one observation on one event with two registrations, and it is recorded
+because it is the reason `governor install` can leave the user's own hooks alone rather than
+having to reason about which file wins.
+
+### 15.4 Consequences folded into design.md
+
+§9's package tree and §13.3's path table now say `~/.claude/skills/claude-governor/`. The five
+hooks live in that plugin's own `hooks/hooks.json`, written entirely by us, so the only thing
+`governor install` merges into the user's `settings.json` is the `statusLine` key — `statusLine`
+is not a plugin component (`claude plugin init --with` offers skills, agents, hooks, mcp, lsp,
+output-style and channel, and no statusline), so it has nowhere else to go.
+
+`governor doctor` reads the old path as well as the new one. A machine installed by an earlier
+build has hooks sitting in the inert directory, and a diagnostic that could not see them would
+report "not registered" for a file it is looking straight at.
+
+### 15.5 Still unmeasured
+
+- Whether `~/.claude/skills/` auto-loading survives a Claude Code upgrade. It is documented in
+  `claude plugin init`'s own help, so it is a supported route rather than an accident, but this
+  is one version.
+- Whether a plugin there is picked up by a session **already running**. `install` tells the user
+  it is not, which is the safe claim; `SessionStart` is where hooks are read.
+- Linux. Every measurement in this section is macOS.
