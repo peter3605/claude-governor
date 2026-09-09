@@ -123,7 +123,7 @@ func resolvePaths() (paths, error) {
 // measurement, and throwing it away on uninstall would throw away the phase. The directory
 // itself is removed only once it is empty, so a machine that still has its samples keeps
 // them and everything else goes.
-var stateFiles = []string{"sock", "statusline.json", daemonPIDFile, daemonLogFile, daemonStartFile}
+var stateFiles = []string{"sock", "statusline.json", daemonPIDFile, daemonLogFile, daemonStartFile, onboardMarker}
 
 // ---------------------------------------------------------------------------
 // the plugin's files
@@ -326,12 +326,42 @@ func runInstall(args []string, stdout, stderr io.Writer) int {
 		startDaemon(p, stdout, stderr)
 	}
 
-	fmt.Fprintln(stdout, "\nCheck it with: governor doctor")
-	fmt.Fprintln(stdout, "Remove it with: governor uninstall")
+	fmt.Fprintln(stdout, "\nRemove it with: governor uninstall")
 	// The hooks are read when a session starts, so a session already running is not
 	// governed yet. Saying so is the difference between "it does not work" and "restart".
 	fmt.Fprintln(stdout, "Sessions already running pick the hooks up when they next start.")
-	return 0
+
+	if *noDaemon {
+		// Not verified, and saying so beats printing a report whose daemon-dependent
+		// checks were always going to fail. --no-daemon asks for half an install on
+		// purpose, and doctor cannot tell that apart from a broken one.
+		fmt.Fprintln(stdout, "\nNot verified, because the daemon was not started. Check it with: governor doctor")
+		return 0
+	}
+	return verifyInstall(stdout, stderr)
+}
+
+// verifyInstall ends the install by running doctor and printing its findings (GOV-22).
+//
+// An install that wrote every file and started a daemon can still be a machine that governs
+// nothing: a stale binary earlier on the PATH, a matcher that does not cover the real tool
+// name, a socket owned by another user. Every one of those is a check doctor already makes,
+// and the cost of not making it here is that the first evidence is an ungoverned fan-out,
+// hours later, in a session where nobody is reading an installer's output.
+//
+// The exit code is doctor's, so install.sh — and anything else scripting this — fails on a
+// bad install instead of reporting success and leaving it to be found later. It is not
+// reached under --no-daemon, which is the one case where a failing daemon check means the
+// user got what they asked for.
+func verifyInstall(stdout, stderr io.Writer) int {
+	fmt.Fprintln(stdout, "\n--- governor doctor ---")
+	code := runDoctor(nil, stdout, stderr)
+	if code == 0 {
+		return 0
+	}
+	fmt.Fprintln(stdout, "\nThe files are installed, but this machine is not governing anything yet.")
+	fmt.Fprintln(stdout, "Fix what is named above, then run: governor doctor")
+	return code
 }
 
 // planFile records what writeFile would do, without doing it.

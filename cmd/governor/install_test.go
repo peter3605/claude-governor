@@ -687,8 +687,10 @@ func TestPurgeRemovesStateAndPlainUninstallDoesNot(t *testing.T) {
 	mkdirAll(t, p.state)
 	writeFileT(t, filepath.Join(p.state, "samples.jsonl"), "{\"sample\":1}\n")
 	writeFileT(t, filepath.Join(p.state, "statusline.json"), "{}\n")
+	writeFileT(t, filepath.Join(p.state, onboardMarker), "2026-09-09T00:00:00Z\n")
 	mkdirAll(t, p.data)
 	writeFileT(t, filepath.Join(p.data, "config.json"), "{\"schema\":1}\n")
+	writeFileT(t, filepath.Join(p.data, onboardMarker), "2026-09-09T00:00:00Z\n")
 
 	uninstallOK(t)
 
@@ -700,6 +702,17 @@ func TestPurgeRemovesStateAndPlainUninstallDoesNot(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(p.data, "config.json")); err != nil {
 		t.Errorf("plain uninstall removed the config, which is --purge's job: %v", err)
+	}
+	// The onboarding marker, in both the homes it can have (GOV-22). In the state directory
+	// it goes with everything else there; in the plugin data directory it survives, because
+	// reinstalling after an ordinary uninstall is the same machine and the same person, and
+	// re-showing a notice they have already read and acted on is nagging.
+	if _, err := os.Stat(filepath.Join(p.state, onboardMarker)); err == nil {
+		t.Error("plain uninstall left the onboarding marker in the state directory")
+	}
+	if _, err := os.Stat(filepath.Join(p.data, onboardMarker)); err != nil {
+		t.Errorf("plain uninstall removed the onboarding marker, so an ordinary reinstall "+
+			"would nag a user who has already read it: %v", err)
 	}
 
 	installOK(t)
@@ -953,6 +966,86 @@ func TestDoctorPassesEveryCheckAfterAnInstall(t *testing.T) {
 	if code, out, _ := runReal(t, p, "doctor"); code == 0 {
 		t.Errorf("governor doctor exited 0 with nothing installed:\n%s", out)
 	}
+}
+
+// install ends by running doctor, and fails when doctor does (GOV-22).
+//
+// The gap this closes: every file can land, the daemon can be started, and the machine can
+// still govern nothing — a socket it cannot bind, a stale binary earlier on the PATH, a
+// matcher that does not cover the real tool name. Without this, the first evidence of that
+// is an ungoverned fan-out hours later, in a session where nobody is reading an installer's
+// output. So the installer runs the check-list itself, on the spot, and its exit code is
+// the check-list's.
+func TestInstallVerifiesItselfWithDoctor(t *testing.T) {
+	t.Run("a clean install prints a passing report", func(t *testing.T) {
+		p := stagedHome(t)
+		code, stdout, stderr := runReal(t, p, "install")
+		t.Cleanup(func() { runReal(t, p, "uninstall", "--purge") })
+		if code != 0 {
+			t.Fatalf("governor install: exit %d\nstdout: %s\nstderr: %s", code, stdout, stderr)
+		}
+		if !strings.Contains(stdout, "governor doctor ---") {
+			t.Errorf("install did not run doctor:\n%s", stdout)
+		}
+		if !strings.Contains(stdout, "all passing") {
+			t.Errorf("install ran doctor but did not print a passing report:\n%s\n%s",
+				stdout, daemonLog(t, p))
+		}
+	})
+
+	// --no-daemon is the one case where a failing daemon check means the user got exactly
+	// what they asked for, so it reports that it did not verify rather than printing a
+	// report of failures it had just guaranteed.
+	t.Run("--no-daemon says it did not verify", func(t *testing.T) {
+		stagedHome(t)
+		out := installOK(t)
+		if strings.Contains(out, "governor doctor ---") {
+			t.Errorf("--no-daemon ran doctor, whose daemon checks it had just made fail:\n%s", out)
+		}
+		if !strings.Contains(out, "Not verified") {
+			t.Errorf("--no-daemon did not say the install was unverified:\n%s", out)
+		}
+	})
+
+	// The one that makes the other two worth having: an install that writes every file and
+	// still leaves nothing governed must exit non-zero. A state directory that cannot be
+	// created gives the daemon nowhere to bind, which is a real failure mode (a $HOME long
+	// enough to overrun sockaddr_un reaches the same place) and is invisible in a directory
+	// listing — every plugin file is present and correct.
+	t.Run("an install the daemon cannot survive exits non-zero", func(t *testing.T) {
+		p := stagedHome(t)
+		blocked := filepath.Join(p.home, "not-a-directory")
+		if err := os.WriteFile(blocked, []byte("x"), 0o600); err != nil {
+			t.Fatalf("stage a blocked state dir: %v", err)
+		}
+		cmd := exec.Command(realGovernor(t), "install")
+		cmd.Env = append(os.Environ(),
+			"HOME="+p.home,
+			stateDirEnvForTest+"="+blocked,
+			endpointEnvForTest+"=unix://"+filepath.Join(blocked, "sock"),
+		)
+		var stdout, stderr bytes.Buffer
+		cmd.Stdout, cmd.Stderr = &stdout, &stderr
+		err := cmd.Run()
+		t.Cleanup(func() { runReal(t, p, "uninstall", "--purge") })
+
+		var exitErr *exec.ExitError
+		if !errors.As(err, &exitErr) {
+			t.Fatalf("governor install exited 0 with a daemon that cannot bind\nstdout: %s\nstderr: %s",
+				stdout.String(), stderr.String())
+		}
+		if got := exitErr.ExitCode(); got != 1 {
+			t.Errorf("exit code = %d, want 1 (2 is a usage error, and this is not one)", got)
+		}
+		if !strings.Contains(stdout.String(), "FAIL") {
+			t.Errorf("install failed without naming a failing check:\n%s", stdout.String())
+		}
+		// The files really did land. Without this the test would pass just as well against
+		// an installer that refused early, which is a different thing entirely.
+		if _, statErr := os.Stat(p.hooks); statErr != nil {
+			t.Errorf("the hooks were not written, so this is not the failure being tested: %v", statErr)
+		}
+	})
 }
 
 // Every command doctor names as a fix is a command this binary actually has.
