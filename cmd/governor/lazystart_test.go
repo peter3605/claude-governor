@@ -219,19 +219,35 @@ func TestGateStartsADaemonOnlyWhenNothingIsListening(t *testing.T) {
 		name     string
 		endpoint func(t *testing.T) string
 		want     int
+		// wantDiag is why, not just how many. A count alone can be produced by the wrong
+		// mechanism — a second case sharing a state directory is rate-limited to zero starts
+		// and looks exactly like a case that correctly declined — so each row also pins the
+		// path the gate actually took.
+		wantDiag string
 	}{
 		{
 			name:     "nothing listening",
 			endpoint: func(t *testing.T) string { return "unix://" + filepath.Join(sockDir(t), "sock") },
 			want:     1,
+			wantDiag: "started a daemon",
 		},
 		{
 			name:     "a daemon that accepts and never answers",
 			endpoint: func(t *testing.T) string { return wedged },
 			want:     0,
+			// It got a connection and died on the read, which is the whole point: this is
+			// not "no daemon", so nothing may be started.
+			wantDiag: "read response",
 		},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
+			// Set inside the subtest, not outside it. Without this the gate resolves the
+			// DEFAULT endpoint and the whole table measures the developer's own
+			// ~/.claude/governor — which is how the first version of this test passed
+			// locally and failed on both CI runners, and how it wrote a cooldown marker
+			// into a real state directory. GOV-10 fixed the same class of accident in
+			// main_test.go for the same reason.
+			t.Setenv(transport.EndpointEnv, tt.endpoint(t))
 			starts := recordStarts(t)
 			var stdout, stderr bytes.Buffer
 			code := gate(strings.NewReader(samplePayload), &stdout, &stderr,
@@ -242,6 +258,10 @@ func TestGateStartsADaemonOnlyWhenNothingIsListening(t *testing.T) {
 			}
 			if len(*starts) != tt.want {
 				t.Errorf("started %d daemons, want %d (stderr: %s)", len(*starts), tt.want, stderr.String())
+			}
+			if !strings.Contains(stderr.String(), tt.wantDiag) {
+				t.Errorf("stderr = %q, want it to show the gate took the %q path",
+					stderr.String(), tt.wantDiag)
 			}
 		})
 	}
