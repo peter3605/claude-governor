@@ -694,9 +694,17 @@ The five `internal/` packages are not architecture astronautics: each is one int
 exactly one implementation in v1, and each is a seam section 12 names. If a package needs a
 second implementation before tier two exists, it was premature.
 
-The statusline earns its place: `◐ 3/5 · cpu 61% · thermal ok` in every session turns an
+The statusline earns its place: `3/5 slots - cpu 61% - thermal ok` in every session turns an
 invisible policy into something watchable, which is most of what makes a governor
 trustworthy. Ship it in Phase 1, not as polish.
+
+GOV-10 shipped it, and the line above is what it actually renders. Two departures from the
+`◐ 3/5 · cpu 61% · thermal ok` this section originally illustrated, both deliberate. There is
+no leading glyph, because an animated one would have to come from somewhere and the statusline
+is stateless. And every clause after the slot count is conditional: `cpu` is absent until
+GOV-12 lands the sampler, and `thermal` is absent on any host reporting `unknown`, which is
+every Linux host by design. A clause naming a fact the daemon did not send would be a
+fabricated reading on the one surface whose value is being trusted at a glance.
 
 ---
 
@@ -916,7 +924,14 @@ Uninstall is only verifiable if this list is exhaustive, so it is normative.
 | `~/.claude/settings.json` (hooks, statusLine keys) | install, merged | uninstall, restored from backup |
 | `~/.claude/settings.json.governor-backup-<ts>` | install | uninstall |
 | `~/.claude/governor/sock` | daemon | uninstall |
+| `~/.claude/governor/statusline.json` | `statusline`, when the directory already exists | uninstall |
 | `${CLAUDE_PLUGIN_DATA}/` (config, leases, samples) | daemon | uninstall `--purge` only |
+
+`statusline.json` is a one-second cache of the last status reply (GOV-10). The statusline is
+run on every assistant message in every session, so without it the busiest thing the governor
+does is answering its own status line. It is written only when the state directory already
+exists — the statusline never creates it — because a command that ran on every message and
+recreated the directory would put a file back moments after uninstall removed it.
 
 Phase 0 (GOV-02, extended by GOV-27) adds the rows below. They are listed here rather than in a story note
 because this table is what makes uninstall verifiable, and a path that is touched but not

@@ -7,8 +7,10 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"time"
 
 	"github.com/peter3605/claude-governor/internal/signals"
+	"github.com/peter3605/claude-governor/internal/transport"
 )
 
 // Version strings reported by `governor version`. The protocol version is the "v" field
@@ -37,7 +39,7 @@ var commands = []command{
 	{"session", "SessionStart/SessionEnd hook: register or drop a session", runSession},
 	{"status", "print the current budget and its holders", runStatus},
 	{"mcp", "serve the advisory MCP tool over stdio", stub("mcp")},
-	{"statusline", "render the one-line status for a session", stub("statusline")},
+	{"statusline", "render the one-line status for a session", runStatusline},
 	{"trace", "Phase 0 instrumentation: record hook events and 1 Hz host samples", runTrace},
 	{"install", "install the plugin, hooks and daemon", stub("install")},
 	{"uninstall", "reverse install and restore the settings backup", stub("uninstall")},
@@ -78,19 +80,45 @@ func stub(name string) func([]string, io.Writer, io.Writer) int {
 
 // runStatus prints what the governor currently knows about this host.
 //
-// Today that is the thermal state and nothing else: the daemon (GOV-06) and its sampler
-// (GOV-12) do not exist yet, so there is no budget, no lease table and no CPU reading to
-// report, and inventing placeholder numbers for them would be worse than omitting them.
-// When the daemon lands this becomes the client half of the status operation in design.md
-// section 7 and the rest of the fields arrive over the wire — the thermal line is the same
-// line either way, which is what makes it safe to read now.
+// This is the client half of the status operation in design.md section 7, which GOV-06
+// deliberately left to GOV-10 along with the statusline. It reads the same reply the
+// statusline does and prints all of it rather than one line's worth: `governor status` is
+// what a person runs when the status line has told them something is wrong, so it is the
+// place to be complete rather than brief.
 //
-// Output is one "key value" line per fact so the statusline (GOV-10) and doctor (GOV-20)
-// can parse it without a JSON dependency on a shape that is still growing.
-func runStatus(_ []string, stdout, _ io.Writer) int {
-	fmt.Fprintf(stdout, "thermal %s\n", signals.ReadThermal())
+// Output is one "key value" line per fact, the format this command has always used, so the
+// doctor (GOV-20) can parse it without taking a dependency on a JSON shape that is still
+// growing. Nothing the daemon did not send is printed: a field it omitted is a field this
+// host has no reading for, and a placeholder would be a claim rather than a measurement.
+//
+// The thermal line is read locally when the daemon is unreachable. It is the same line
+// either way — this process can read ProcessInfo.thermalState as well as the daemon can —
+// so an unreachable daemon costs the budget and the lease table, not every fact.
+func runStatus(_ []string, stdout, stderr io.Writer) int {
+	v := view(query(stderr, transport.Dial{}, time.Now().Add(statusBudget)), "")
+	if !v.OK {
+		fmt.Fprintf(stdout, "daemon not running\n")
+		fmt.Fprintf(stdout, "thermal %s\n", signals.ReadThermal())
+		return 0
+	}
+	fmt.Fprintf(stdout, "budget %d\n", v.Budget)
+	fmt.Fprintf(stdout, "in use %d\n", v.InUse)
+	fmt.Fprintf(stdout, "waiting %d\n", v.Waiting)
+	if v.CPU != nil {
+		fmt.Fprintf(stdout, "cpu %.2f\n", *v.CPU)
+	}
+	fmt.Fprintf(stdout, "thermal %s\n", v.Thermal)
 	return 0
 }
+
+// statusBudget is the allowance for `governor status`.
+//
+// It is larger than the statusline's because the two are run by different things: the
+// statusline is rendered on every assistant message and must not be felt, while this is
+// typed by a person who has already decided to wait for an answer. It is still bounded,
+// because a command that hangs against a wedged daemon is a command that gets reported as
+// a hung terminal.
+const statusBudget = time.Second
 
 func runVersion(_ []string, stdout, _ io.Writer) int {
 	fmt.Fprintf(stdout, "governor %s\n", binaryVersion)

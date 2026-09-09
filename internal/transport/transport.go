@@ -40,6 +40,25 @@ const EndpointEnv = "GOVERNOR_ENDPOINT"
 // when Phase 1 lands (section 9) and this package is not.
 const StateDirEnv = "GOVERNOR_STATE_DIR"
 
+// StateDir is the directory holding the governor's state, per design.md section 13.3:
+// ~/.claude/governor unless StateDirEnv overrides it.
+//
+// It resolves the directory and nothing more — it does not create it. A caller that writes
+// there must tolerate its absence rather than call MkdirAll, because a governor that is not
+// installed has no state directory and a statusline or a doctor run must not conjure one.
+// Uninstall removes this directory, and anything that recreates it afterwards is a path
+// uninstall silently stops covering (section 13.3).
+func StateDir() (string, error) {
+	if d := os.Getenv(StateDirEnv); d != "" {
+		return d, nil
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(home, ".claude", "governor"), nil
+}
+
 // DefaultEndpoint is where the daemon listens: unix:// over a socket in the state
 // directory, ~/.claude/governor/sock unless overridden.
 //
@@ -51,13 +70,9 @@ func DefaultEndpoint() (string, error) {
 	if e := os.Getenv(EndpointEnv); e != "" {
 		return e, nil
 	}
-	dir := os.Getenv(StateDirEnv)
-	if dir == "" {
-		home, err := os.UserHomeDir()
-		if err != nil {
-			return "", err
-		}
-		dir = filepath.Join(home, ".claude", "governor")
+	dir, err := StateDir()
+	if err != nil {
+		return "", err
 	}
 	return "unix://" + filepath.Join(dir, "sock"), nil
 }

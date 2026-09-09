@@ -2,10 +2,12 @@ package main
 
 import (
 	"bytes"
+	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/peter3605/claude-governor/internal/signals"
+	"github.com/peter3605/claude-governor/internal/transport"
 )
 
 // The command surface GOV-04 requires, from design.md section 9. A subcommand that
@@ -26,6 +28,7 @@ var required = []string{
 var servers = map[string]bool{"daemon": true}
 
 func TestEverySubcommandExitsZero(t *testing.T) {
+	isolateRealState(t)
 	for _, name := range required {
 		if !registered(name) {
 			t.Errorf("governor %s: not in the command table", name)
@@ -41,6 +44,21 @@ func TestEverySubcommandExitsZero(t *testing.T) {
 	}
 }
 
+// isolateRealState points the state directory and the endpoint somewhere disposable.
+//
+// This file runs every subcommand in the table, and as of GOV-10 one of them writes a cache
+// file to the state directory and another dials the socket. Without this they do it to the
+// developer's own ~/.claude/governor: the run would then depend on whether a daemon happened
+// to be up, and would leave a file behind in a real install. That is the same class of
+// accident as GOV-06's, where running `governor daemon` from this file left a daemon holding
+// the user's real socket — so the isolation goes at the top of the test rather than being
+// remembered subcommand by subcommand as more of them are implemented.
+func isolateRealState(t *testing.T) {
+	t.Helper()
+	t.Setenv(transport.StateDirEnv, t.TempDir())
+	t.Setenv(transport.EndpointEnv, "unix://"+filepath.Join(sockDir(t), "absent"))
+}
+
 func registered(name string) bool {
 	for _, c := range commands {
 		if c.name == name {
@@ -53,12 +71,18 @@ func registered(name string) bool {
 // A stub must look like a grant, not a refusal: the gate's grant path is exit 0 with an
 // empty stdout, and anything on stdout is read by Claude Code as a hook decision.
 //
-// version and status are exempt because they are implemented and printing is their job,
-// and daemon because it does not return. None of the three is wired to a hook, so none of
-// their stdout is ever read as a decision.
-var implemented = map[string]bool{"version": true, "status": true}
+// version, status and statusline are exempt because they are implemented and printing is
+// their job, and daemon because it does not return. None of the four is wired to a hook, so
+// none of their stdout is ever read as a decision.
+//
+// statusline is the one worth being explicit about: its stdout IS read by Claude Code, but
+// as the text of the status line rather than as a permission decision, and it is required
+// to produce a line even when everything has gone wrong. The rule this test enforces —
+// silence on stdout — is the opposite of that command's contract, not a weaker version of it.
+var implemented = map[string]bool{"version": true, "status": true, "statusline": true}
 
 func TestStubsWriteNothingToStdout(t *testing.T) {
+	isolateRealState(t)
 	for _, name := range required {
 		if implemented[name] || servers[name] {
 			continue
@@ -85,17 +109,33 @@ func TestVersionReportsAllThreeVersions(t *testing.T) {
 }
 
 // The thermal state has to reach a human through the status operation, or the one signal
-// that matters most on a fanless chassis is unobservable until GOV-10 ships a statusline.
+// that matters most on a fanless chassis is unobservable.
+//
+// GOV-10 gave this command the client half of the status operation, so the thermal line is
+// no longer the whole output and no longer the first line. It is still required to be
+// there, and required to be one of the five named states — that is the property, and it
+// holds whether the reading came over the wire or was read locally because no daemon
+// answered. The endpoint is pointed at nothing so the test is about the command rather than
+// about whether the developer happens to have a daemon running.
 func TestStatusReportsThermalState(t *testing.T) {
+	t.Setenv(transport.EndpointEnv, "unix://"+filepath.Join(sockDir(t), "absent"))
+
 	var stdout, stderr bytes.Buffer
 	if code := run([]string{"status"}, &stdout, &stderr); code != 0 {
 		t.Fatalf("governor status: exit %d, want 0 (stderr: %s)", code, stderr.String())
 	}
 	out := stdout.String()
-	if !strings.HasPrefix(out, "thermal ") {
+	line := ""
+	for _, l := range strings.Split(out, "\n") {
+		if strings.HasPrefix(l, "thermal ") {
+			line = l
+			break
+		}
+	}
+	if line == "" {
 		t.Fatalf("governor status: output %q, want a \"thermal <state>\" line", out)
 	}
-	state := signals.Thermal(strings.TrimSpace(strings.TrimPrefix(out, "thermal ")))
+	state := signals.Thermal(strings.TrimSpace(strings.TrimPrefix(line, "thermal ")))
 	switch state {
 	case signals.Nominal, signals.Fair, signals.Serious, signals.Critical, signals.Unknown:
 	default:
