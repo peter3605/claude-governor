@@ -218,7 +218,11 @@ Probe 2 (four background spawns) gave the same result, 4/4.
 Nothing in the surface promises it. The reaper (invariant 2) is what makes a mispairing
 survivable rather than corrupting.
 
-## 8. `SubagentStart` does **not** fire once per spawn
+## 8. `SubagentStart` is a start-*or*-resume signal, so it can fire twice for one spawn
+
+> An earlier version of this section also claimed `SubagentStart` never fires in
+> interactive sessions. That claim was wrong; §8.1 carries the correction and is kept
+> rather than rewritten. Everything below it in this section still holds.
 
 Probe 1 spawned exactly one subagent (`subagent_stats: {"spawned":1,...,"completed":1}`) and
 `SubagentStart` fired **twice** for the same `agent_id`, as did `SubagentStop`:
@@ -428,7 +432,7 @@ independent check on what the hooks saw.
 
 ---
 
-## 9. Not the hook surface, but adjacent: never overwrite the binary in place
+## 13. Not the hook surface, but adjacent: never overwrite the binary in place
 
 Found in GOV-02 while redeploying the Phase 0 binary, and recorded here because it presents as
 a hook failure and would otherwise be debugged as one.
