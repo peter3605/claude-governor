@@ -315,12 +315,17 @@ daemon logged **zero reaps**: every lease was returned by its own `SubagentStop`
 TTL or by liveness. The over-subscription this section used to predict does not occur.
 
 **What the other 63 stops were, and why it matters more than this did.** They came from a
-spawn path that emits `SubagentStop` but no `PreToolUse` on `Agent` — strongly correlated
-with `Skill` invocations, of which there were 48 in the same window. Those subagents never
-pass the gate, so they never take a lease, and the governor does not see them at all. That
-is a real governance gap and a much larger one than the bug this section used to describe:
-on this machine the gated path accounted for 3 of 70 observed subagent stops. It is filed as
-its own story rather than fixed here.
+path that emits `SubagentStop` but no `PreToolUse` on `Agent` — strongly correlated with
+`Skill` invocations, of which there were 48 in the same window. Those never pass the gate,
+so they never take a lease, and the governor does not see them at all. On this machine the
+gated path accounted for 3 of 70 observed subagent stops. It is filed as its own story
+rather than fixed here.
+
+> **The `Skill` half of that paragraph is wrong.** GOV-28 measured it and the correlation
+> does not survive: those stops are not subagents at all. §8.2 carries the correction. The
+> sentence is left standing because a fix was designed against it, which is the second time
+> on this surface that a per-session correlation has been read as a mechanism — see the
+> banner at the head of §8.1.
 
 **Two incidental facts settled by the same run.**
 
@@ -336,6 +341,190 @@ its own story rather than fixed here.
 requested subagent in the background. A **foreground** `Agent` spawn from an interactive
 session was not reachable and so is not covered; the foreground case is evidenced only by
 probe 1 (§7), which was headless. Both halves of the surface fired there too.
+
+### 8.2 `SubagentStop` is not a count of subagents
+
+**GOV-28, 2026-09-09.** §8.1 closed by saying the 63 stops the gate could not see were
+"strongly correlated with `Skill` invocations", and GOV-28 was filed to widen the matcher and
+catch them. Measured, that is wrong twice over: they are not `Skill`, and they are not
+subagents.
+
+**The fresh trace.** `~/.claude/governor/samples.jsonl`, 2026-09-08T17:27:00Z →
+2026-09-09T18:29:10Z (25 h 02 m), `claude 2.1.263`, 31 sessions:
+
+| | count |
+|---|---|
+| `SubagentStop` | 91 |
+| `SubagentStart` | 9 |
+| `PostToolUse` on `Agent` | 6 |
+| per-agent transcripts written under `projects/*/subagents/` | 9 of the 91 |
+
+The 9 `SubagentStart` records, the 9 stops with a transcript, and the 9 agents the gate
+leased are **the same nine agents**. The other 82 stops have no start, no `PreToolUse`, no
+transcript, and — see below — nothing that ever ran.
+
+**Four independent lines of evidence, because a fifth correlation was not going to be enough.**
+
+1. **They are `away_summary`, to the millisecond.** Indexing every transcript entry on the
+   machine by `(session_id, timestamp)`, **57 of the 82** land on a `system` entry of
+   subtype `away_summary` in the same session at the same millisecond. The remaining 21 fire
+   1.5–3 s after a `turn_duration` entry and write nothing to the transcript at all. Fixed
+   offsets, not a distribution: the away-summary cluster sits at **182.6–183.4 s** after the
+   session's `Stop`.
+
+2. **`Skill` is refuted from the same window.** There were 62 `Skill` tool calls in it.
+   Only **3 of the 82** ungated stops had a same-session `Skill` call within the preceding
+   120 s. GOV-27 counted *sessions* that used `Skill` against *sessions* that emitted
+   unexplained stops, and both numbers were large; the per-event join is not.
+
+3. **A `Skill` invocation spawns nothing, measured directly.** A probe registering all seven
+   events, driving a local skill (`--setting-sources project`):
+
+   ```
+   SessionStart
+   PreToolUse    tool_name=Skill          ← the skill IS matchable
+   PostToolUse   tool_name=Skill
+   PreToolUse    tool_name=Bash           ← its work, inline, agent_id absent
+   PostToolUse   tool_name=Bash
+   Stop
+   SessionEnd
+   ```
+
+   `subagent_stats: {"spawned": 0, …}`. No `SubagentStart`, no `SubagentStop`. A skill of
+   this kind runs **in the calling session**, and there is no subagent to govern.
+
+4. **There is no `PreToolUse` for them, under any tool name.** A catch-all `PreToolUse`
+   registration ran for 40 minutes across every live session on the machine and captured 85
+   calls (`Bash` 73, `Write` 4, `Edit` 3, the Notion MCP tools, `ToolSearch`). Exactly one
+   `SubagentStop` occurred in that window — session `24b54357`, `Stop` at 18:48:09.366,
+   `SubagentStop` at 18:51:12.084 (+182.7 s), against `away_summary` at 18:51:12.086 in that
+   session's transcript — and **no `PreToolUse` fired for that session in between**. Not one
+   under an unexpected name; none at all.
+
+**The mechanism.** The 2.1.263 binary carries the string
+
+```
+Converting Stop hook to SubagentStop for … (subagents trigger SubagentStop)
+```
+
+adjacent to `execution_context` and `agent-preload`. So `SubagentStop` is what a **`Stop`**
+event becomes when the execution context that finished is not the main conversation — and
+the harness's own away-summary generation is such a context. A probe registering **only**
+`Stop` received one plain `Stop` and never saw the subagent's completion, which is that
+conversion in the observable direction: converted events go to `SubagentStop` handlers and a
+`Stop` registration does not see them.
+
+**A discriminator that separates the two populations cleanly.** Across every v2 record in the
+trace, with no exceptions:
+
+| `agent_type` on `SubagentStop` | gated | ungated |
+|---|---|---|
+| key present, value **set** | 7 | 0 |
+| key present, value **empty** | 0 | 81 |
+
+This also explains the "third state" §4's GOV-02 addendum recorded and could not account for.
+A `SubagentStop` carrying `agent_type` as an empty string is the signature of a non-agent
+execution context, not of an agent whose type went missing.
+
+**What this costs the budget: nothing.** The count the governor leases against and the count
+of subagents that actually ran are the same number — 9 and 9. The gate was not governing 4%
+of spawns; it was governing all of them, and `SubagentStop` was being read as a spawn counter
+when it is not one.
+
+### 8.3 Every spawn path on 2.1.263
+
+The enumeration GOV-28 was filed to produce. "Gated" means a `PreToolUse` the gate can match
+*and* a lease that is returned, verified end to end against a running daemon in §8.4.
+
+| # | Path | `PreToolUse`? | `tool_name` | Puts a subagent on the CPU | Gated |
+|---|---|---|---|---|---|
+| 1 | `Agent` tool spawn — foreground, background, or nested | yes | `Agent` (a `Task` matcher also fires, §1) | yes | **yes**, since GOV-07 |
+| 2 | Resuming an agent through `SendMessage` | yes | `SendMessage`, with `tool_input.to` = the agent id | yes | **yes**, since GOV-28 |
+| 3 | `Skill` invocation | yes | `Skill` | **no** — runs inline, `spawned: 0` | n/a, nothing to govern |
+| 4 | Away-summary and other non-main execution contexts | **no, none at all** | — | **no** — no start, no tools, no transcript | **cannot be**, see below |
+
+**Path 2 is a real gap and it is closed.** Probe C, all events registered, one spawn then one
+resume:
+
+```
+t= 0.000  PreToolUse     tool=Agent          ← the spawn: gated
+t= 0.045  SubagentStart  agent=ac05ddd6e5bdf6c51
+t= 1.782  PreToolUse     tool=Bash           agent=ac05ddd6e5bdf6c51
+t= 3.050  SubagentStop   agent=ac05ddd6e5bdf6c51
+t= 3.088  PostToolUse    tool=Agent
+t= 6.676  PreToolUse     tool=SendMessage    ← the resume: NO PreToolUse(Agent) anywhere
+t= 6.718  PostToolUse    tool=SendMessage    resumedAgentId=ac05ddd6e5bdf6c51
+t= 6.718  SubagentStart  agent=ac05ddd6e5bdf6c51    ← same agent_id, second start
+t= 8.370  PreToolUse     tool=Bash           agent=ac05ddd6e5bdf6c51
+t= 9.649  SubagentStop   agent=ac05ddd6e5bdf6c51
+```
+
+The agent runs real work after the resume. Before GOV-28 it held no lease while doing it.
+`confirm` and `release` needed no change — `SubagentStart` fires on a resume and
+`SubagentStop` still carries the `agent_id` — so the missing acquire was the whole of it.
+
+The `PreToolUse(SendMessage)` payload carries the recipient:
+
+```json
+{"to":"ac05ddd6e5bdf6c51","summary":"ask for first line of README.md",
+ "message":"Also report the FIRST line of README.md…","recipient":"ac05ddd6e5bdf6c51"}
+```
+
+`to` is the discriminator, and it has to be, because `SendMessage` also addresses teammates,
+other local sessions and cloud sessions **by name**. The gate takes a lease only when `to`
+has the shape of an agent id — seventeen lowercase hex characters, §2. A resume addressed by
+name is therefore still ungoverned; that is a stated limit rather than an oversight, and it
+fails open, which is the side to fail on.
+
+**Path 4 cannot be gated, and this is the honest answer rather than a deferral.** Gating
+requires an event to decide on. There is no `PreToolUse` for these — measured, not assumed,
+with a catch-all matcher watching every tool in every session. The only event they emit is
+the completion. A governor cannot refuse something it first hears about when it is over. It
+also should not want to: nothing was spawned, no tool ran, and the work is the harness's own
+bookkeeping. The correct handling is what the daemon already does — `release` keys off
+`byAgent`, which only `confirm` populates, so one of these arrives as `no_lease` and changes
+nothing (§8.4).
+
+### 8.4 End-to-end, against a running daemon
+
+Real daemon (`--budget 4`), real `gate` / `confirm` / `release` / `session` hooks, `in_use`
+polled over the daemon's own `status` op at 20 Hz.
+
+**Path 1 — three `Agent` spawns in one message.** `subagent_stats.spawned: 3`.
+
+```
+in_use=0                      in_use=3  (0 tentative, 3 confirmed)
+in_use=1  tentative 1         in_use=2
+in_use=1  confirmed  1        in_use=1
+in_use=2  tentative 1         in_use=0
+```
+
+**Path 2 — one spawn, then a `SendMessage` resume.** Two full lease cycles for one agent:
+
+```
+matcher Agent|Task|SendMessage      matcher Agent|Task   (the control, pre-GOV-28)
+  in_use 0 → 1 → 0    the spawn       in_use 0 → 1 → 0     the spawn
+  in_use 0 → 1 → 0    the resume      (nothing)            the resume, ungoverned
+```
+
+Both runs completed both steps — line count and first line — so both did resume; only the
+widened matcher leased for it.
+
+**Path 3 — a `Skill` invocation.** `spawned: 0`, the skill returned its answer, and `in_use`
+never left 0.
+
+**Path 4 — an away-summary `SubagentStop` cannot take a live agent's slot.** Fed the real
+`agent_id` captured at 18:51:12, while a genuine agent held a confirmed lease:
+
+```
+after Agent gate        in_use=1  (tentative 1)
+after confirm           in_use=1  (confirmed 1)
+away_summary stop  →    governor release: ok=false reason="no_lease"  in_use=1
+after the real stop     in_use=0
+```
+
+**The catch-all was removed.** It ran for 40 minutes, and `~/.claude/settings.json` was
+restored byte-identically from its backup afterwards — verified with `cmp`, not asserted.
 
 ## 9. Nested spawns are not refused by Claude Code
 
