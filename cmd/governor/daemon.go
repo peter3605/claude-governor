@@ -232,6 +232,62 @@ type daemon struct {
 	// rubbish is told nothing, because there is nothing useful to tell it and a broker that
 	// echoes attacker-controlled input is a broker that can be used to write to a log.
 	diag io.Writer
+	// peakMu guards peak, the highest in_use this daemon has seen. It is logged when it
+	// rises and never otherwise — see event.
+	peakMu sync.Mutex
+	peak   int
+}
+
+// The budget event log (GOV-11).
+//
+// The daemon otherwise records only its own start-up, which makes the one question GOV-11
+// has to answer — did a fixed budget of four actually help? — unanswerable by anything but
+// memory. These lines are the evidence. They are deliberately few: a machine's subagents
+// were measured at single digits a day (docs/hook-surface.md section 8.3), and an event is
+// written when the budget MOVES or BINDS. A daemon whose log shows a peak that never reached
+// the budget is itself the finding — four was never touched and the semaphore did nothing —
+// and that reading is only available because the peak is recorded on the way up rather than
+// inferred from the absence of denials.
+//
+// The log is the daemon's stderr, which `governor install` and a lazy start both point at
+// ~/.claude/governor/daemon.log. Timestamped because it is append-only across restarts and a
+// week of it is read after the fact, not watched.
+
+// event records one budget event.
+func (d *daemon) event(format string, args ...any) {
+	fmt.Fprintf(d.diag, "%s budget %s\n", time.Now().Format(time.RFC3339), fmt.Sprintf(format, args...))
+}
+
+// notePeak logs a new high-water mark for concurrent leases, and only a new one.
+//
+// The high-water mark is the single most informative number in the log: if it never reaches
+// the budget, the budget never bound, and no amount of reasoning about denials matters.
+func (d *daemon) notePeak(inUse, limit int) {
+	d.peakMu.Lock()
+	if inUse <= d.peak {
+		d.peakMu.Unlock()
+		return
+	}
+	d.peak = inUse
+	d.peakMu.Unlock()
+	d.event("peak in_use=%d/%d", inUse, limit)
+}
+
+// syncWriter serialises writes to the daemon log.
+//
+// The daemon answers every connection in its own goroutine and they all share one log. Two
+// events written at the same instant would interleave, and where the log is a bytes.Buffer —
+// which is how every test in this package builds one — they are a data race that `go test
+// -race` is right to fail.
+type syncWriter struct {
+	mu sync.Mutex
+	w  io.Writer
+}
+
+func (s *syncWriter) Write(p []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.w.Write(p)
 }
 
 func runDaemon(args []string, stdout, stderr io.Writer) int {
@@ -293,11 +349,31 @@ const (
 // (GOVERNOR_ENDPOINT exists for it) and a shared pid file would have uninstall kill the
 // wrong one.
 func daemonPIDPath(endpoint string) (string, error) {
-	sock := strings.TrimPrefix(endpoint, "unix://")
-	if sock == "" || sock == endpoint {
-		return "", fmt.Errorf("endpoint %q is not a unix socket path", endpoint)
+	dir, err := stateDirFor(endpoint)
+	if err != nil {
+		return "", err
 	}
-	return filepath.Join(filepath.Dir(sock), daemonPIDFile), nil
+	return filepath.Join(dir, daemonPIDFile), nil
+}
+
+// socketPath is the filesystem path an endpoint URL names, or an error naming why it has
+// none. v1 speaks unix:// and nothing else, exactly as transport.Dial does.
+//
+// It lives here rather than beside its first caller because three things now depend on
+// agreeing about it: `doctor` checks the socket's permissions, the daemon writes its pid
+// beside it, and a lazy start rate-limits itself in the same directory (GOV-11). Two
+// functions that each strip a scheme prefix will eventually disagree about what counts as
+// an endpoint, and the cost of that disagreement is a path uninstall stops covering.
+func socketPath(endpoint string) (string, error) {
+	const prefix = "unix://"
+	if !strings.HasPrefix(endpoint, prefix) {
+		return "", fmt.Errorf("endpoint %s is not a unix:// URL: v1 speaks unix:// and nothing else", endpoint)
+	}
+	path := strings.TrimPrefix(endpoint, prefix)
+	if path == "" {
+		return "", fmt.Errorf("endpoint %s has no socket path", endpoint)
+	}
+	return path, nil
 }
 
 func writeDaemonPID(endpoint string, stderr io.Writer) error {
@@ -361,7 +437,7 @@ func newDaemonWithLeases(limit int, diag io.Writer, opt lease.Options) *daemon {
 		thermal: signals.ReadThermal,
 		waits:   &waitQueue{},
 		denials: newDenyLog(nil),
-		diag:    diag,
+		diag:    &syncWriter{w: diag},
 	}
 }
 
@@ -543,6 +619,7 @@ func (d *daemon) acquire(req request) any {
 	// short of a slot, it is not allowed one, and parking it for twenty seconds before
 	// saying so would stall a session to reach an answer that was already known.
 	if req.Depth > maxFanOutDepth {
+		d.event("deny session=%s reason=depth", req.Session)
 		return refuseReply{
 			V: protocolVersion, Reason: "depth",
 			Budget: limit, InUse: d.table.InUse(), Source: src,
@@ -566,6 +643,9 @@ func (d *daemon) acquire(req request) any {
 		return d.refuseForCapacity(req.Session, limit, src)
 	}
 
+	d.event("park session=%s in_use=%d/%d wait=%v", req.Session, d.table.InUse(), limit, wait)
+	parked := time.Now()
+
 	w := &waiter{session: req.Session, depth: req.Depth, granted: make(chan lease.Lease, 1)}
 	d.waits.enqueue(w)
 	// A slot may have freed between the failed Acquire above and the enqueue. Pumping here
@@ -575,6 +655,7 @@ func (d *daemon) acquire(req request) any {
 	case l := <-w.granted:
 		// It was never really a wait. Answer as an ordinary grant rather than sending an
 		// interim line the client would have to read for nothing.
+		d.event("park-granted session=%s waited=%v", req.Session, time.Since(parked).Round(time.Millisecond))
 		return d.granted(l, limit, src)
 	default:
 	}
@@ -592,8 +673,10 @@ func (d *daemon) acquire(req request) any {
 			select {
 			case l := <-w.granted:
 				// The pump removed it from the queue before handing over the lease.
+				d.event("park-granted session=%s waited=%v", req.Session, time.Since(parked).Round(time.Millisecond))
 				return d.granted(l, limit, src)
 			case <-timer.C:
+				d.event("park-expired session=%s waited=%v", req.Session, time.Since(parked).Round(time.Millisecond))
 				if l, got := d.waits.drop(w); got {
 					// Granted at the very moment the wait expired. The lease exists and
 					// this caller owns it, so honour it rather than refusing a spawn that
@@ -615,9 +698,11 @@ func (d *daemon) acquire(req request) any {
 
 // granted builds the reply for a lease that has been taken, however it was taken.
 func (d *daemon) granted(l lease.Lease, limit int, src string) grantReply {
+	inUse := d.table.InUse()
+	d.notePeak(inUse, limit)
 	return grantReply{
 		V: protocolVersion, OK: true, Lease: l.ID,
-		Budget: limit, InUse: d.table.InUse(),
+		Budget: limit, InUse: inUse,
 		// v1's allocation policy is "no division": there is no max-min fair share and no
 		// wait queue yet (design.md section 6.1, 6.2), so a session's share is the whole
 		// budget and the first to ask is the first served. This is the accurate description
@@ -635,12 +720,17 @@ func (d *daemon) granted(l lease.Lease, limit int, src string) grantReply {
 // ends in a grant must not count as a denial, or a session that waited patiently would be
 // shouted at on its next refusal.
 func (d *daemon) refuseForCapacity(session string, limit int, src string) refuseReply {
-	return refuseReply{
+	r := refuseReply{
 		V: protocolVersion, Reason: "capacity",
 		Budget: limit, InUse: d.table.InUse(), Source: src,
 		CPU: nil, Thermal: d.thermal(),
 		Denials: d.denials.record(session),
 	}
+	// Logged here rather than at each call site so that a refusal added later cannot be one
+	// the log does not know about. This is the event that costs the model something, and it
+	// is the one a week of dogfooding is read for.
+	d.event("deny session=%s reason=capacity in_use=%d/%d denials=%d", session, r.InUse, r.Budget, r.Denials)
+	return r
 }
 
 // pump hands freed slots to the longest-waiting callers, in order.

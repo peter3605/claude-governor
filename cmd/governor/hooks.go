@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -364,8 +365,9 @@ func decodePayload(stdin io.Reader, diag io.Writer, v any) bool {
 // Every failure means the same thing to every caller — fail open — so they are reported to
 // stderr and reduced to a single false.
 func exchange(diag io.Writer, dialer transport.Dialer, deadline time.Time, req any, out any) bool {
-	conn, r, ok := dialAndSend(diag, dialer, deadline, req)
-	if !ok {
+	conn, r, err := dialAndSend(dialer, deadline, req)
+	if err != nil {
+		fmt.Fprintf(diag, "governor: %v\n", err)
 		return false
 	}
 	defer conn.Close()
@@ -390,11 +392,15 @@ func exchange(diag io.Writer, dialer transport.Dialer, deadline time.Time, req a
 // discarded and block on a socket with nothing left to send, and the gate would sit there
 // until its grace expired and then fail open. The failure is invisible in any test where
 // the daemon is slow enough to send the lines separately, which is most of them.
-func dialAndSend(diag io.Writer, dialer transport.Dialer, deadline time.Time, req any) (net.Conn, *bufio.Reader, bool) {
+//
+// It returns an error rather than a bool because one of its failures is different from the
+// others: errNoDaemon means nothing was listening, which is the only one a lazy start can
+// do anything about (GOV-11). Every caller still treats them all the same way — fail open —
+// and only the gate looks at which one it got.
+func dialAndSend(dialer transport.Dialer, deadline time.Time, req any) (net.Conn, *bufio.Reader, error) {
 	endpoint, err := transport.DefaultEndpoint()
 	if err != nil {
-		fmt.Fprintf(diag, "governor: resolve endpoint: %v\n", err)
-		return nil, nil, false
+		return nil, nil, fmt.Errorf("resolve endpoint: %w", err)
 	}
 
 	ioDeadline := deadline.Add(-ioMargin)
@@ -404,29 +410,35 @@ func dialAndSend(diag io.Writer, dialer transport.Dialer, deadline time.Time, re
 
 	conn, err := dialer.Dial(ctx, endpoint)
 	if err != nil {
-		fmt.Fprintf(diag, "governor: dial %s: %v\n", endpoint, err)
-		return nil, nil, false
+		// Wrapped, not replaced: the underlying error says whether the socket was absent,
+		// refused or timed out, and that is what a person reads in the log.
+		return nil, nil, fmt.Errorf("%w: dial %s: %v", errNoDaemon, endpoint, err)
 	}
 
 	if err := conn.SetDeadline(ioDeadline); err != nil {
-		fmt.Fprintf(diag, "governor: set deadline: %v\n", err)
 		conn.Close()
-		return nil, nil, false
+		return nil, nil, fmt.Errorf("set deadline: %w", err)
 	}
 
 	line, err := json.Marshal(req)
 	if err != nil {
-		fmt.Fprintf(diag, "governor: encode request: %v\n", err)
 		conn.Close()
-		return nil, nil, false
+		return nil, nil, fmt.Errorf("encode request: %w", err)
 	}
 	if _, err := conn.Write(append(line, '\n')); err != nil {
-		fmt.Fprintf(diag, "governor: write request: %v\n", err)
 		conn.Close()
-		return nil, nil, false
+		return nil, nil, fmt.Errorf("write request: %w", err)
 	}
-	return conn, bufio.NewReaderSize(io.LimitReader(conn, maxResponse), 4096), true
+	return conn, bufio.NewReaderSize(io.LimitReader(conn, maxResponse), 4096), nil
 }
+
+// errNoDaemon reports that nothing was listening on the endpoint.
+//
+// It is deliberately narrow. A daemon that accepted the connection and then behaved badly —
+// answered late, answered rubbish, answered in a protocol this binary does not speak — is
+// NOT this error, because there is a daemon and starting a second one would be wrong. Only
+// a failed dial says the socket has nobody behind it.
+var errNoDaemon = errors.New("no daemon on the endpoint")
 
 // readLineInto reads exactly one newline-terminated JSON line, bounded in both time (the
 // connection deadline, set by the caller) and size (the limited reader it was built over).

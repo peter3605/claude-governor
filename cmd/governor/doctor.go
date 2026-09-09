@@ -367,20 +367,6 @@ func (f socketFacts) faults() (problems, fixes []string) {
 	return problems, fixes
 }
 
-// socketPath is the filesystem path an endpoint URL names, or an error naming why it has
-// none. v1 speaks unix:// and nothing else, exactly as transport.Dial does.
-func socketPath(endpoint string) (string, error) {
-	const prefix = "unix://"
-	if !strings.HasPrefix(endpoint, prefix) {
-		return "", fmt.Errorf("endpoint %s is not a unix:// URL: v1 speaks unix:// and nothing else", endpoint)
-	}
-	path := strings.TrimPrefix(endpoint, prefix)
-	if path == "" {
-		return "", fmt.Errorf("endpoint %s has no socket path", endpoint)
-	}
-	return path, nil
-}
-
 // ownerUID reads the owning uid out of a FileInfo, and reports false where the platform
 // does not carry one. Both v1 platforms do (design.md section 13.5).
 func ownerUID(fi os.FileInfo) (int, bool) {
