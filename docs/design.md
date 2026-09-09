@@ -116,7 +116,7 @@ a test.
 // hooks/hooks.json
 {
   "hooks": {
-    "PreToolUse":    [{ "matcher": "Agent|Task",
+    "PreToolUse":    [{ "matcher": "Agent|Task|SendMessage",
                         "hooks": [{ "type": "command",
                                     "command": "${CLAUDE_PLUGIN_ROOT}/bin/governor gate",
                                     "timeout": 30 }] }],
@@ -132,10 +132,19 @@ a test.
 }
 ```
 
-The matcher is a regex covering both `Agent` and `Task` because the subagent-spawning tool
-has been named both across versions. On 2.1.263 the payload's `tool_name` is **`Agent`**, and
-a `Task` matcher fires for it too (§10.1) — keep the regex regardless, it costs nothing and
-survives the next rename, but branch on `Agent` when reading the payload.
+The matcher covers `Agent` and `Task` because the subagent-spawning tool has been named both
+across versions. On 2.1.263 the payload's `tool_name` is **`Agent`**, and a `Task` matcher
+fires for it too (§10.1) — keep the regex regardless, it costs nothing and survives the next
+rename, but branch on the payload when reading it.
+
+`SendMessage` was added by GOV-28 and is a **second spawn path**, not a second spelling.
+Resuming an agent through it puts that subagent back on the CPU with no `PreToolUse(Agent)`
+anywhere, so before this the resumed agent ran holding no lease
+([hook-surface.md](hook-surface.md) §8.3). A matcher is not enough on its own here: the same
+tool addresses teammates and other sessions by name, so the gate leases only when
+`tool_input.to` has the shape of an agent id — seventeen lowercase hex characters — and
+treats every other recipient as an ordinary message. A resume addressed by *name* is
+therefore not governed; that is a stated limit, and it fails open.
 
 `timeout` is set explicitly rather than inherited: the default was measured at over 150 s with
 no established ceiling (§10.1), which is not a number to build a wait window on. 30 s gives the
@@ -228,10 +237,11 @@ reaper (2s)   → drop leases past ttl, whose SESSION is gone, or whose owning p
 > held exactly three slots with zero reaps. See `hook-surface.md` §8.1, which carries the
 > correction and the run.
 >
-> The gap that measurement *did* find is a different one and is not about leases at all:
-> subagents spawned other than through the `Agent` tool (a `Skill` invocation, chiefly) emit
-> `SubagentStop` but never a `PreToolUse` the gate can see, so they take no lease and are not
-> governed. On the machine measured that was 63 of 70 observed spawns.
+> The gap that measurement *appeared* to find — 63 of 70 `SubagentStop` records with no
+> `PreToolUse` the gate could see, blamed on `Skill` — was not a gap. GOV-28 measured it:
+> those stops are not subagents at all, and a `Skill` spawns nothing. See §10.1a and
+> `hook-surface.md` §8.2. The one real omission it turned up, the `SendMessage` resume, is
+> gated as of §4.1.
 
 **The reaper collects three things, not two.** A lease past its TTL; a lease of any state
 whose *session* is registered with a PID that is gone; and a confirmed lease whose own owner
@@ -703,8 +713,35 @@ detail not stated here MUST measure it and extend both files, not guess.
 `tool_name` on the wire is `Agent`. A hook registered with `matcher: "Task"` fired for it
 anyway; `Task` is carried as an alias. Both spellings are live *within this one version* —
 the same run reported the same tool as `Task` in its `permission_denials`. So: keep the
-`Agent|Task` regex in §4.1, and match on the **payload** value `Agent` in code. Registering
-only `Task` would have worked by luck; relying on the payload saying `Task` would not.
+both spellings in §4.1's regex, and match on the **payload** value in code. Registering only
+`Task` would have worked by luck; relying on the payload saying `Task` would not. §4.1's
+matcher also carries `SendMessage`, for the separate reason given in 1a.
+
+**1a. What the gate is gated on — the decision GOV-28 was filed to make.**
+
+The premise GOV-28 carried was that the gate saw about 4% of subagent spawns, because 63 of
+70 `SubagentStop` records had no matching `PreToolUse` and correlated with `Skill`. Measured,
+both halves are wrong ([hook-surface.md](hook-surface.md) §8.2). A `Skill` runs **inline** and
+spawns nothing. The unmatched stops are not subagents: they are `Stop` events that the harness
+relabels `SubagentStop` when the execution context that finished is not the main conversation
+— overwhelmingly its own away-summary generation, which fires ~183 s after a turn ends. They
+have no start, no tools, no transcript, and **no `PreToolUse` under any tool name**, confirmed
+with a catch-all matcher watching every tool in every live session.
+
+**So the budget stays driven by agent count**, and GOV-14 and GOV-15 need no correction: over
+a 25 h window the number of agents the gate leased and the number of subagents that actually
+ran were the same nine. What changed instead is one genuine omission — the `SendMessage`
+resume path of §4.1, now gated.
+
+Two rules follow, and both are load-bearing:
+
+- **`SubagentStop` is not a spawn counter.** Anything deriving a count of agents from it is
+  measuring the harness's bookkeeping as well as its subagents. `release` is safe because it
+  keys off `byAgent`, which only `confirm` populates, so a non-agent stop is a `no_lease`
+  no-op; nothing else may assume more.
+- **`agent_type` present-but-empty on a `SubagentStop` marks a non-agent context**, cleanly
+  separating the two populations across every record in the trace. It is a discriminator, not
+  a missing field — which is what §4's GOV-02 addendum saw and could not explain.
 
 **2. `tool_input` shape — `{description, prompt, subagent_type?, run_in_background}`.**
 `subagent_type` carries the agent type but is **optional** — it was absent on a nested spawn.

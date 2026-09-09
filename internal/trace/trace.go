@@ -79,9 +79,7 @@ type Agent struct {
 	// PostToolUse on the Agent tool is the only event on the surface that carries BOTH the
 	// tool_use_id of the spawn and the agent_id it produced (hook-surface.md section 6), so
 	// it is the one place a lease taken at PreToolUse can be tied to an agent exactly rather
-	// than by per-session FIFO. That matters here because SubagentStart — the event the
-	// design originally used for it — does not fire in interactive sessions at all
-	// (section 8.1).
+	// than by per-session FIFO.
 	ToolName  string `json:"tool_name,omitempty"`
 	ToolUseID string `json:"tool_use_id,omitempty"`
 	// ToolStatus is tool_response.status: "completed" for a foreground spawn, which has

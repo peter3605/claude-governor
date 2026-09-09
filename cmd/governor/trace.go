@@ -85,10 +85,11 @@ func runTrace(args []string, stdout, stderr io.Writer) int {
 // commands that differ only in a string they could have read is several things to keep in
 // step.
 //
-// PostToolUse and Stop were added by GOV-27. SubagentStart does not fire in interactive
-// sessions (hook-surface.md section 8.1), so the event the lease lifecycle was built on is
-// absent exactly where it matters; these two are the candidate replacements and this hook is
-// how the claim that they DO fire there gets measured rather than assumed.
+// PostToolUse and Stop were added by GOV-27 to test the claim that SubagentStart does not
+// fire in interactive sessions. It does (hook-surface.md section 8.1); they are kept because
+// PostToolUse on the Agent tool is the only event carrying both a spawn's tool_use_id and the
+// agent_id it produced, and because Stop is what SubagentStop turns out to be a relabelling
+// of (section 8.2) — the pair is what let GOV-28 tell the two populations apart.
 //
 // It returns 0 unconditionally. Every failure — unparseable payload, unwritable log, no
 // home directory — is written to stderr and swallowed. Phase 0 losing a record is a gap in

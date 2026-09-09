@@ -7,6 +7,7 @@ import (
 	"io"
 	"net"
 	"os"
+	"regexp"
 	"strings"
 	"time"
 
@@ -141,6 +142,49 @@ type hookPayload struct {
 	// It is the only depth signal the surface carries — there is no depth field
 	// (docs/hook-surface.md section 2).
 	AgentID string `json:"agent_id"`
+	// ToolInput is decoded for one field only. `to` is what separates a SendMessage that
+	// resumes a subagent from one that messages a teammate or another session
+	// (docs/hook-surface.md section 8.3). Nothing else here is read: tool_input also
+	// carries the prompt and the message body, and this process has no business with either.
+	ToolInput struct {
+		To string `json:"to"`
+	} `json:"tool_input"`
+}
+
+// agentIDShape is the shape of a subagent id on 2.1.263: seventeen lowercase hex characters,
+// measured in docs/hook-surface.md sections 2 and 8.3.
+//
+// It is used for exactly one decision — whether a SendMessage is resuming a subagent — and
+// it is deliberately the strict form. SendMessage also addresses teammates, other local
+// sessions and cloud sessions by NAME, and taking a lease for one of those would be a slot
+// consumed by something that is not a subagent and never returned, because no SubagentStop
+// follows it. An unrecognised recipient is left ungoverned, which is the status quo and the
+// side to fail on.
+var agentIDShape = regexp.MustCompile(`^[0-9a-f]{17}$`)
+
+// governsSpawn reports whether this payload puts a subagent on the CPU, and if not, why.
+//
+// The set of paths is the one GOV-28 measured rather than the one the tool names suggest
+// (docs/hook-surface.md section 8.3):
+//
+//	Agent, Task    a spawn. The tool answers to both names within one version.
+//	""             a payload shape this binary does not recognise. Governed deliberately:
+//	               guessing "not an agent" after a harness rename stops governing silently.
+//	SendMessage    a resume IF `to` names an agent; otherwise an ordinary message.
+//	anything else  not a spawn. Skill in particular runs INLINE in the calling session and
+//	               spawns nothing at all, which is what GOV-28 established.
+func governsSpawn(p hookPayload) (bool, string) {
+	switch p.ToolName {
+	case "Agent", "Task", "":
+		return true, ""
+	case "SendMessage":
+		if agentIDShape.MatchString(p.ToolInput.To) {
+			return true, ""
+		}
+		return false, fmt.Sprintf("SendMessage to %q is not a subagent resume", p.ToolInput.To)
+	default:
+		return false, fmt.Sprintf("not a subagent spawn (tool_name %q)", p.ToolName)
+	}
 }
 
 // denyOutput is the PreToolUse decision Claude Code reads from stdout, measured verbatim in
@@ -198,14 +242,10 @@ func gateOnce(stdin io.Reader, stdout, diag io.Writer, dialer transport.Dialer, 
 		return
 	}
 
-	// The hook matcher is a regex covering both spellings of the tool, but a matcher is
-	// configuration and configuration drifts. On 2.1.263 the payload's tool_name is Agent
-	// and a Task matcher fires for it too (docs/hook-surface.md section 1), so accept
-	// either and take a lease for nothing else. An empty tool_name is let through: it means
-	// a payload shape this binary does not recognise, and guessing "not an agent" would
-	// silently stop governing.
-	if p.ToolName != "" && p.ToolName != "Agent" && p.ToolName != "Task" {
-		fmt.Fprintf(diag, "governor gate: not a subagent spawn (tool_name %q)\n", p.ToolName)
+	// The hook matcher is configuration and configuration drifts, so the payload is checked
+	// here too and a lease is taken for nothing the binary does not recognise as a spawn.
+	if ok, why := governsSpawn(p); !ok {
+		fmt.Fprintf(diag, "governor gate: %s\n", why)
 		return
 	}
 

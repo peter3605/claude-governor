@@ -619,3 +619,101 @@ func TestDialRejectsOtherSchemes(t *testing.T) {
 		})
 	}
 }
+
+// TestGateTakesALeaseForASendMessageResume covers the second spawn path, measured in GOV-28
+// and recorded in docs/hook-surface.md section 8.3.
+//
+// Resuming an agent through SendMessage puts a subagent back on the CPU with no
+// PreToolUse(Agent) anywhere: the surface emits PreToolUse(SendMessage), then SubagentStart
+// for the agent that was already running, then its work, then SubagentStop. Before this the
+// gate saw none of it, so a resumed agent ran holding no lease at all.
+//
+// The confirm and release halves need no change — SubagentStart fires on a resume and
+// SubagentStop still carries the agent_id — so this acquire is the whole of the fix.
+func TestGateTakesALeaseForASendMessageResume(t *testing.T) {
+	dialed := make(chan struct{}, 1)
+	endpoint := listenerFunc(t, func(c net.Conn, _ []byte) {
+		dialed <- struct{}{}
+		c.Write([]byte(`{"v":1,"ok":true}` + "\n"))
+	})
+	// Verbatim shape from the GOV-28 probe C timeline.
+	payload := `{"session_id":"s","hook_event_name":"PreToolUse","tool_name":"SendMessage",` +
+		`"tool_input":{"to":"ac05ddd6e5bdf6c51","message":"also report the first line"},` +
+		`"tool_use_id":"toolu_resume"}`
+
+	runGateFor(t, endpoint, payload, transport.Dial{})
+	select {
+	case <-dialed:
+	case <-time.After(time.Second):
+		t.Error("the gate took no lease for a SendMessage resume; a resumed agent runs ungoverned")
+	}
+}
+
+// TestGateTakesNoLeaseForAnOrdinarySendMessage is the other half of the pair, and the reason
+// the matcher could not simply be widened to SendMessage and left there.
+//
+// SendMessage addresses teammates, other local sessions and cloud sessions by name. None of
+// those is a subagent and none produces a SubagentStop, so a lease taken for one would be a
+// slot consumed forever — the exact failure TestGateTakesNoLeaseForOtherTools guards for
+// Bash, arriving through a tool the matcher now deliberately admits.
+func TestGateTakesNoLeaseForAnOrdinarySendMessage(t *testing.T) {
+	for _, to := range []string{
+		"claude-code-guide", // a teammate or agent addressed by name
+		"",                  // no recipient at all
+		"AC05DDD6E5BDF6C51", // right shape, wrong case: not an id this version emits
+		"ac05ddd6e5bdf6c5",  // sixteen characters, one short
+	} {
+		t.Run("to="+to, func(t *testing.T) {
+			dialed := make(chan struct{}, 1)
+			endpoint := listenerFunc(t, func(c net.Conn, _ []byte) {
+				dialed <- struct{}{}
+				c.Write([]byte(`{"v":1,"ok":true}` + "\n"))
+			})
+			payload := `{"session_id":"s","hook_event_name":"PreToolUse","tool_name":"SendMessage",` +
+				`"tool_input":{"to":"` + to + `"},"tool_use_id":"toolu_msg"}`
+
+			diag := runGateFor(t, endpoint, payload, transport.Dial{})
+			if !strings.Contains(diag, "is not a subagent resume") {
+				t.Errorf("stderr = %q, want it to say the message was not a resume", diag)
+			}
+			select {
+			case <-dialed:
+				t.Errorf("the gate took a lease for SendMessage to %q, which is not a subagent", to)
+			case <-time.After(50 * time.Millisecond):
+			}
+		})
+	}
+}
+
+// TestGateTakesNoLeaseForASkillInvocation is a regression test for a belief, not for a line
+// of code.
+//
+// GOV-27 recorded that the 63 subagent stops the gate could not see were "strongly
+// correlated with Skill invocations", and GOV-28 was filed to widen the matcher to catch
+// them. Measured directly, a Skill invocation emits PreToolUse(tool_name="Skill"), runs
+// INLINE in the calling session, and spawns nothing: subagent_stats reported
+// {"spawned": 0} and no SubagentStart or SubagentStop followed
+// (docs/hook-surface.md section 8.3).
+//
+// Taking a lease for one would consume a slot that nothing ever returns, because no
+// SubagentStop is coming. The test exists so that the next reader who finds that correlation
+// in the log has to delete an explicit assertion, and read why, before acting on it.
+func TestGateTakesNoLeaseForASkillInvocation(t *testing.T) {
+	dialed := make(chan struct{}, 1)
+	endpoint := listenerFunc(t, func(c net.Conn, _ []byte) {
+		dialed <- struct{}{}
+		c.Write([]byte(`{"v":1,"ok":true}` + "\n"))
+	})
+	payload := `{"session_id":"s","hook_event_name":"PreToolUse","tool_name":"Skill",` +
+		`"tool_input":{"skill":"countlines"},"tool_use_id":"toolu_skill"}`
+
+	diag := runGateFor(t, endpoint, payload, transport.Dial{})
+	if !strings.Contains(diag, "not a subagent spawn") {
+		t.Errorf("stderr = %q, want it to say the payload was not a spawn", diag)
+	}
+	select {
+	case <-dialed:
+		t.Error("the gate took a lease for a Skill invocation, which spawns no subagent")
+	case <-time.After(50 * time.Millisecond):
+	}
+}
