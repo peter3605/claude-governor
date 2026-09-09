@@ -30,6 +30,16 @@ which writes a plugin to `~/.claude/skills/claude-governor/`, merges a `statusLi
 `~/.claude/settings.json` after backing it up, and starts the daemon. It prints every path it
 touched. Sessions already running pick the hooks up when they next start.
 
+**It then checks its own work.** `governor install` finishes by running `governor doctor` and
+printing the report, and exits non-zero if any check fails. An install can write every file
+correctly and still govern nothing — a socket it cannot bind, an older `governor` earlier on
+your `PATH` — and without this the first evidence of that is an ungoverned fan-out hours
+later, in a session where nobody is reading an installer's output.
+
+**Your first session after installing gets one short notice**, saying what is now happening,
+how to read the status line, and how to turn it off. It is shown once and never again, and it
+goes to you rather than into the model's context.
+
 ```sh
 governor doctor       # is it working, and if not, what exactly do I type
 governor status       # budget, holders, CPU, thermal
@@ -38,8 +48,8 @@ governor uninstall    # remove all of it
 
 **Removing it leaves nothing.** `governor uninstall` deletes the plugin, restores whatever
 `statusLine` you had before — byte for byte, formatting and key order included — stops the
-daemon and removes its socket. `--purge` also removes the config and the sample log, which are
-otherwise kept. There is a test that installs into a scratch home, uninstalls, and fails on
+daemon and removes its socket. `--purge` also removes the config, the first-run notice marker and the
+sample log, which are otherwise kept. There is a test that installs into a scratch home, uninstalls, and fails on
 any difference in a recursive digest of the whole directory; what is being asked of you is to
 run a hook on every subagent spawn, and being able to prove it comes out clean is most of why
 that should be acceptable.

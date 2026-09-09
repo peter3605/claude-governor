@@ -825,3 +825,71 @@ report "not registered" for a file it is looking straight at.
 - Whether a plugin there is picked up by a session **already running**. `install` tells the user
   it is not, which is the safe claim; `SessionStart` is where hooks are read.
 - Linux. Every measurement in this section is macOS.
+
+---
+
+## 16. Where a hook's output goes — the user, the model, or nowhere
+
+Measured 2026-09-09 on Claude Code **2.1.265**, macOS arm64, against a throwaway skills-dir
+plugin (`gov22-probe`) registering a single `SessionStart` hook — §15.2's route, no
+`settings.json` entry. GOV-22 needed one fact this document did not have: a first-run notice
+is written for a *person*, and nothing here recorded which channel a person actually reads.
+
+Two drivers, because they answer different halves of it. `claude -p … --output-format
+stream-json` shows what reaches the **model** (the prompt asked it to quote back any marker in
+its own context) and carries a `system`/`hook_response` event per hook with `stdout`, `stderr`,
+`exit_code` and `outcome`. A real TUI under a pty shows what reaches the **person**, which
+`claude -p` cannot: two of the results below are invisible in headless mode entirely.
+
+### 16.1 The three channels
+
+| Hook writes | Reaches the model | Reaches the person |
+|---|---|---|
+| plain text on stdout, exit 0 | yes, as `SessionStart:startup hook success: <text>` | **no** |
+| `{"hookSpecificOutput":{"hookEventName":"SessionStart","additionalContext":"<text>"}}` | yes, wrapped in `<system-reminder>` as `SessionStart hook additional context: <text>` | **no** |
+| `{"systemMessage":"<text>"}` | **no — nothing at all** | yes, as `SessionStart:startup says: <text>` |
+| stderr, exit 0 | no | no (captured, not displayed) |
+| stderr, non-zero exit | no | yes, as `[<command path>]: <stderr>` under a `hook error` line |
+
+The two JSON fields compose: sent in one object, `systemMessage` goes to the person and
+`additionalContext` to the model, each unaware of the other.
+
+**`systemMessage` is therefore the only channel that addresses the user**, and it is the one
+`governor session start` uses for the first-run notice. `additionalContext` is the channel
+§8's advisory instruction (GOV-17) will want, and the two are not interchangeable in either
+direction — a notice sent as `additionalContext` is read by nobody but the model, and a
+standing instruction sent as `systemMessage` is read by nobody but the person.
+
+**It is invisible in headless mode.** `systemMessage` did not appear in `claude -p` output in
+either text or `stream-json` form. A test of it has to drive a pty or read the code, which is
+why GOV-22's tests assert the JSON this binary *emits* rather than what a session displays.
+
+### 16.2 Three traps
+
+1. **A non-zero exit discards plain-text stdout, but not `additionalContext`.** Same rule as
+   the statusline in §14.2 for the plain-text route — it is gated on `outcome == "success"` —
+   and the JSON route is not gated at all: a hook exiting 1 still injected its
+   `additionalContext`, twice out of two.
+
+2. **Printing parseable hook JSON suppresses the user-visible error, even at exit 1.** Three
+   runs: the TUI showed no `hook error` line and no stderr, while the transcript still recorded
+   `"exit_code": 1, "outcome": "error"`. A hook that fails while printing valid JSON fails
+   *silently to the user*. This is the reason `sessionNotice` carries one field and nothing
+   else — the less a hook says on stdout, the less it can hide.
+
+3. **Unknown top-level keys are ignored, not fatal**, with a hint naming
+   `hookSpecificOutput.additionalContext`. A typo'd field is silence, not an error.
+
+### 16.3 Caps, read from the binary rather than probed
+
+`systemMessage` 4000 chars / 20 lines; `additionalContext` 8000 / 200; `reason`,
+`stopReason` and `permissionDecisionReason` 2000 chars / 20 lines. Flagged as a binary read:
+over-length truncation was **not** exercised. The first-run notice is six lines and well
+under 1000 characters, so it is not close to either bound.
+
+### 16.4 Still unmeasured
+
+- Whether `systemMessage` surfaces in any headless mode. It does not in `-p` text or
+  `stream-json`; the SDK path was not tested.
+- Truncation behaviour at the caps above.
+- Linux. Every measurement in this section is macOS.

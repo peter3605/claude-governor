@@ -24,13 +24,19 @@ import (
 // it when that agent stops, and tell the daemon when a whole session comes and goes.
 //
 // They are held to the same contract as the gate, because they run in the same place: a
-// hook Claude Code is blocked on. Every path exits 0 with an empty stdout inside the
-// budget. A confirm that hangs is a session that hangs, and the fact that it would fail
-// "safely" from the budget's point of view — the lease stays tentative and is reaped in
-// 30 s — is no comfort to a user whose session has stopped.
+// hook Claude Code is blocked on. Every path exits 0 inside the budget. A confirm that hangs
+// is a session that hangs, and the fact that it would fail "safely" from the budget's point
+// of view — the lease stays tentative and is reaped in 30 s — is no comfort to a user whose
+// session has stopped.
 //
 // What is deliberately NOT here: any decision. Only the gate speaks to the model, and only
-// to refuse. These three report to stderr and are otherwise silent.
+// to refuse. confirm and release say nothing on stdout at all; the diagnostics of all three
+// go to stderr, which the user sees only when a hook fails (docs/hook-surface.md section 16).
+//
+// `session start` is the one exception, and it is narrow: on the first session after an
+// install it prints a `systemMessage` object, which Claude Code renders to the PERSON and
+// does not put in the model's context (GOV-22, section 16). That is still not a decision, and
+// it happens exactly once per install — every later session start is silent again.
 
 // hookBudget is the wall-clock allowance for one lifecycle hook, matching the gate's
 // (design.md section 4.4).
@@ -99,10 +105,23 @@ func runRelease(_ []string, _ io.Writer, stderr io.Writer) int {
 	return lifecycleHook(os.Stdin, stderr, transport.Dial{}, hookBudget, buildRelease)
 }
 
-func runSession(args []string, _ io.Writer, stderr io.Writer) int {
+func runSession(args []string, stdout io.Writer, stderr io.Writer) int {
 	action := ""
 	if len(args) > 0 {
 		action = args[0]
+	}
+	// The one-time notice (GOV-22) rides the SessionStart registration that already exists
+	// rather than adding a sixth hook, because a second registration on the same event is a
+	// second thing to install, to diagnose and to remove for one paragraph of text.
+	//
+	// It is gated on the explicit argument and not on the payload's hook_event_name, unlike
+	// buildSession's fallback below. The two disagree on purpose: guessing the action wrong
+	// there registers a session at its end and never drops it, which is a stranded lease,
+	// whereas guessing wrong here shows a person a notice at the wrong moment. The stakes
+	// are not the same, and reading stdin here would consume the payload the hook still
+	// needs. install always writes the argument, and doctor checks that it did.
+	if action == "start" {
+		emitFirstRunNotice(stdout, stderr)
 	}
 	return lifecycleHook(os.Stdin, stderr, transport.Dial{}, hookBudget, buildSession(action))
 }

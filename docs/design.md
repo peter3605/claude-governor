@@ -967,7 +967,7 @@ being asked of them is to run a hook on every subagent spawn.
 | Command | Does |
 |---|---|
 | `install.sh` | curl-able bootstrap: detect OS/arch, fetch the matching binary, hand off to `governor install` |
-| `governor install` | write the plugin (manifest, hooks, binary), merge the statusline into settings (after backup), start the daemon, print exactly what it touched |
+| `governor install` | write the plugin (manifest, hooks, binary), merge the statusline into settings (after backup), start the daemon, print exactly what it touched, then run `doctor` and exit non-zero if it fails |
 | `governor uninstall` | reverse all of it, restore the settings backup, stop the daemon, remove state on `--purge` |
 | `governor doctor` | daemon reachable? hooks registered? matcher matches the real tool name? binary and plugin versions agree? config schema current? each failure names its fix |
 | `governor calibrate` | measure cores, performance cores, RAM and a short load probe; write setpoint and B_max for *this* machine |
@@ -1021,8 +1021,9 @@ Uninstall is only verifiable if this list is exhaustive, so it is normative.
 | `~/.claude/governor/daemon.log` | install, when it starts the daemon | uninstall |
 | `~/.claude/governor/statusline.json` | `statusline`, when the directory already exists | uninstall |
 | `~/.claude/governor/daemon.start` | the gate, when it lazily starts a daemon and the directory already exists | uninstall |
+| `~/.claude/governor/onboarded` | `session start`, only in the fallback below, and only when the directory already exists | uninstall |
 | `~/.claude/governor/` | daemon (`transport.Listen`) | uninstall, only once it is empty; `--purge` regardless |
-| `~/.claude/plugins/data/claude-governor-skills-dir/` (`${CLAUDE_PLUGIN_DATA}`: config) | Claude Code creates it; the governor writes config.json | uninstall `--purge` only |
+| `~/.claude/plugins/data/claude-governor-skills-dir/` (`${CLAUDE_PLUGIN_DATA}`: config, onboarding marker) | Claude Code creates it; the governor writes config.json and `onboarded` | uninstall `--purge` only |
 
 Four rows carry a condition, and each condition is the difference between "removes everything
 it added" and "removes things it did not":
@@ -1057,6 +1058,21 @@ by hand, or a `doctor` run outside a plugin context — `config.json` resolves t
 directory above, beside the socket, rather than to a location of its own. One directory holds
 all of the governor's state, and a second home for the config would be a path uninstall
 silently stops covering.
+
+`onboarded` is the record that the first-run notice has been shown (GOV-22), and it lives
+beside `config.json` for `config.json`'s reason: one directory holds the governor's state, and
+a second home for a file is a path uninstall silently stops covering. In a plugin context that
+is `${CLAUDE_PLUGIN_DATA}`, so a plain uninstall **keeps** it and only `--purge` removes it —
+which is the behaviour the notice wants. Reinstalling after an ordinary uninstall is the same
+machine and the same person, and re-showing a notice they have already read and acted on is
+nagging; `--purge` says "forget everything about me", and a genuine fresh start should be
+greeted like one. Outside a plugin context it falls back to the state directory and is removed
+by a plain uninstall along with everything else there.
+
+It follows the same never-create-the-directory rule as the two files below, and one
+consequence is worth stating: where the directory is absent the notice is not shown at all,
+rather than shown and unrecorded. A notice that cannot record itself is a notice that repeats
+every session forever, which is the failure this file exists to prevent.
 
 `daemon.start` is the rate limit on lazy daemon starts (GOV-11), and it follows the same
 rule as `statusline.json` for the same reason: it is written only when the state directory
