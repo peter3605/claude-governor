@@ -27,6 +27,19 @@ var required = []string{
 // killed. That is not hypothetical: it happened once while GOV-06 was being written.
 var servers = map[string]bool{"daemon": true}
 
+// diagnostics are the subcommands whose exit code REPORTS something rather than merely
+// reflecting whether they ran.
+//
+// `governor doctor` is the only one (GOV-20). Its contract is to exit non-zero when a check
+// fails, and this file deliberately runs it on a machine with no daemon and no hooks
+// registered — so a failure here is the correct answer, not a broken command. It is still
+// asserted to be in the command table, which is what this file is actually for.
+//
+// It is exempted rather than isolated into a passing state on purpose: making doctor pass
+// would mean staging a complete working install just to prove a subcommand exists, and the
+// checks themselves are tested in doctor_test.go against exactly that.
+var diagnostics = map[string]bool{"doctor": true}
+
 func TestEverySubcommandExitsZero(t *testing.T) {
 	isolateRealState(t)
 	for _, name := range required {
@@ -34,7 +47,7 @@ func TestEverySubcommandExitsZero(t *testing.T) {
 			t.Errorf("governor %s: not in the command table", name)
 			continue
 		}
-		if servers[name] {
+		if servers[name] || diagnostics[name] {
 			continue
 		}
 		var stdout, stderr bytes.Buffer
@@ -71,15 +84,15 @@ func registered(name string) bool {
 // A stub must look like a grant, not a refusal: the gate's grant path is exit 0 with an
 // empty stdout, and anything on stdout is read by Claude Code as a hook decision.
 //
-// version, status and statusline are exempt because they are implemented and printing is
-// their job, and daemon because it does not return. None of the four is wired to a hook, so
-// none of their stdout is ever read as a decision.
+// version, status, statusline and doctor are exempt because they are implemented and
+// printing is their job, and daemon because it does not return. None of the five is wired to
+// a hook, so none of their stdout is ever read as a decision.
 //
 // statusline is the one worth being explicit about: its stdout IS read by Claude Code, but
 // as the text of the status line rather than as a permission decision, and it is required
 // to produce a line even when everything has gone wrong. The rule this test enforces —
 // silence on stdout — is the opposite of that command's contract, not a weaker version of it.
-var implemented = map[string]bool{"version": true, "status": true, "statusline": true}
+var implemented = map[string]bool{"version": true, "status": true, "statusline": true, "doctor": true}
 
 func TestStubsWriteNothingToStdout(t *testing.T) {
 	isolateRealState(t)

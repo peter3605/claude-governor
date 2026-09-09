@@ -913,6 +913,33 @@ being asked of them is to run a hook on every subagent spawn.
 | `governor calibrate` | measure cores, performance cores, RAM and a short load probe; write setpoint and B_max for *this* machine |
 | `governor version` | binary version, protocol version, config schema version |
 
+GOV-20 shipped `doctor`, and it reports eight findings rather than the six checks this table
+lists — `binary`, `protocol` and `config` are the three halves of "versions agree", split
+because they have three different fixes and a line carrying three fixes is a line nobody acts
+on. Three details are worth stating because they are decisions rather than implementation:
+
+- **A finding can be `skip`.** With the daemon down there is no protocol version to compare
+  and no lease table to read, and reporting those as further *failures* would print four
+  problems and four fixes for one cause. A skip is only ever reachable downstream of a check
+  that already failed and already named its fix, and it does not move the exit code.
+- **It reads both hook files.** `~/.claude/settings.json` and
+  `~/.claude/plugins/claude-governor/hooks/hooks.json` are both named by 13.3 and §9, GOV-18
+  has not yet chosen which it writes, and a diagnostic that only knew about the one that lost
+  would report a good install as broken. It expands `${CLAUDE_PLUGIN_ROOT}` for the same
+  reason — §4.1 registers the hooks through that variable, and stat'ing the command verbatim
+  would report "not an executable file" for every correctly installed plugin there is.
+- **A matcher of exactly `Task` fails.** It fires on 2.1.263 by way of the alias in §10.1,
+  which is precisely why: that section says registering only `Task` "would have worked by
+  luck", and a diagnostic that passes something for working by luck will pass it on the
+  version where the luck runs out. The matcher must cover `Agent`, `Task` and `SendMessage`.
+
+"Stranded" is also a precise thing rather than a feeling. The reaper collects a lease three
+ways — its TTL expires, its session's process is gone, or `Liveness` says its owner is gone —
+and the last two need an owning PID, bound at `session start` and at `confirm`. A lease held
+under a session with **no** PID has neither available to it and holds its slot for a full
+TTL, half an hour for a confirmed one. That is what a full budget on an idle machine actually
+looks like, and the status line reports it as `4/4 slots` either way.
+
 ### 13.3 What touches the user's machine
 
 Uninstall is only verifiable if this list is exhaustive, so it is normative.
@@ -926,6 +953,12 @@ Uninstall is only verifiable if this list is exhaustive, so it is normative.
 | `~/.claude/governor/sock` | daemon | uninstall |
 | `~/.claude/governor/statusline.json` | `statusline`, when the directory already exists | uninstall |
 | `${CLAUDE_PLUGIN_DATA}/` (config, leases, samples) | daemon | uninstall `--purge` only |
+
+`${CLAUDE_PLUGIN_DATA}` is set by Claude Code for a plugin. When it is unset — a binary run
+by hand, or a `doctor` run outside a plugin context — `config.json` resolves to the state
+directory above, beside the socket, rather than to a location of its own. One directory holds
+all of the governor's state, and a second home for the config would be a path uninstall
+silently stops covering.
 
 `statusline.json` is a one-second cache of the last status reply (GOV-10). The statusline is
 run on every assistant message in every session, so without it the busiest thing the governor

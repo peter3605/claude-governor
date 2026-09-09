@@ -7,7 +7,13 @@
 // config is a governor that will not start.
 package config
 
-import "context"
+import (
+	"context"
+	"os"
+	"path/filepath"
+
+	"github.com/peter3605/claude-governor/internal/transport"
+)
 
 // Schema is the config schema version this binary writes.
 const Schema = 1
@@ -37,4 +43,33 @@ type Config struct {
 type Store interface {
 	Load(ctx context.Context) (Config, error)
 	Save(ctx context.Context, c Config) error
+}
+
+// File is the config's filename inside the data directory.
+const File = "config.json"
+
+// DataDirEnv is the environment variable Claude Code sets to the plugin's own data
+// directory (design.md sections 9 and 13.3).
+const DataDirEnv = "CLAUDE_PLUGIN_DATA"
+
+// Path is where config.json lives.
+//
+// ${CLAUDE_PLUGIN_DATA}/config.json when Claude Code has named a data directory for the
+// plugin, and the governor's own state directory otherwise — the same directory as the
+// socket, because design.md section 13.3's promise is that one directory holds all of the
+// governor's state and uninstall removes it. A separate fallback location would be a path
+// uninstall silently stops covering.
+//
+// It resolves a name and does not touch the filesystem. A governor that has never been
+// configured has no config file, and a doctor or a statusline that conjured a directory
+// while merely asking where one would be is exactly what section 13.3 exists to prevent.
+func Path() (string, error) {
+	if d := os.Getenv(DataDirEnv); d != "" {
+		return filepath.Join(d, File), nil
+	}
+	dir, err := transport.StateDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(dir, File), nil
 }
