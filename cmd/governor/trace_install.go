@@ -15,7 +15,7 @@ import (
 
 // Installing and removing the Phase 0 hooks.
 //
-// This is NOT `governor install` (GOV-18). That command installs the plugin, the gate, the
+// This is NOT `governor install` (GOV-21). That command installs the plugin, the gate, the
 // daemon and the statusline, and it is a different story. This one installs three
 // instrumentation hooks and nothing else, and exists mostly so that the thing being asked of
 // a machine — run our binary on every subagent start and stop — is undoable by running one
@@ -389,7 +389,7 @@ func stripOurHooks(entry any) int {
 // from any of those permanently unremovable — which is precisely the residue the reversible
 // install exists to prevent.
 //
-// It stays narrow in the other direction too. GOV-18's `governor gate` hook has no trace
+// It stays narrow in the other direction too. GOV-21's `governor gate` hook has no trace
 // tail and is not ours to remove, and a command from an unrelated tool does not have
 // "governor" in its binary name.
 func isTraceCommand(cmd string) bool {

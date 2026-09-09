@@ -17,10 +17,18 @@ import (
 // every wire message carries (section 7); the config schema version is the "schema" key in
 // config.json (section 13.4). All three move independently.
 const (
-	binaryVersion       = "0.0.0-dev"
 	protocolVersion     = 1
 	configSchemaVersion = 1
 )
+
+// binaryVersion is a var rather than a const so that a release build can stamp the tag into
+// it with `-ldflags -X main.binaryVersion=...`.
+//
+// It is not cosmetic. `governor doctor` compares the version the hooks run against the
+// version running the check, and two different builds that both call themselves 0.0.0-dev
+// compare equal — so an upgrade that left stale hooks behind would pass the one check that
+// exists to catch it. Nothing writes to it after start-up.
+var binaryVersion = "0.0.0-dev"
 
 // command is one subcommand of the binary. run returns the process exit code.
 type command struct {
@@ -41,8 +49,8 @@ var commands = []command{
 	{"mcp", "serve the advisory MCP tool over stdio", stub("mcp")},
 	{"statusline", "render the one-line status for a session", runStatusline},
 	{"trace", "Phase 0 instrumentation: record hook events and 1 Hz host samples", runTrace},
-	{"install", "install the plugin, hooks and daemon", stub("install")},
-	{"uninstall", "reverse install and restore the settings backup", stub("uninstall")},
+	{"install", "install the plugin, hooks and daemon", runInstall},
+	{"uninstall", "reverse install and restore the settings backup", runUninstall},
 	{"doctor", "diagnose a broken install and name each fix", runDoctor},
 	{"calibrate", "measure this host and write its defaults", stub("calibrate")},
 	{"version", "print binary, protocol and config schema versions", runVersion},

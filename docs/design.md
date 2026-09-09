@@ -655,12 +655,9 @@ approach zero without the budget changing.
 ## 9. Package
 
 ```
-claude-governor/
-├── .claude-plugin/plugin.json    name, version, userConfig (setpoint, B_max, wait_max)
-├── hooks/hooks.json              the five hooks in section 4.1
-├── .mcp.json                     stdio server → bin/governor mcp
+claude-governor/                  the repo
 ├── install.sh                    curl-able bootstrap: fetch binary, then `governor install`
-├── bin/governor                  one static binary
+├── cmd/governor/                 one static binary
 │   ├── daemon gate confirm release session status mcp statusline
 │   ├── install uninstall doctor calibrate version
 │   └── trace                     Phase 0 only — removed when the gate ships
@@ -671,12 +668,33 @@ claude-governor/
 │   ├── signals/                  Sampler interface; sampler_darwin.go, sampler_linux.go
 │   └── config/                   versioned schema, migration, atomic write
 ├── skills/fleet-budget/SKILL.md  "ask before you fan out"
-├── commands/governor.md          /governor status | limit N | pause | boost
-└── settings.json                 defaults + statusLine wiring
+└── commands/governor.md          /governor status | limit N | pause | boost
 
-state  → ${CLAUDE_PLUGIN_DATA}/   config.json, leases.db, samples.jsonl
-socket → unix:///~/.claude/governor/sock
+~/.claude/skills/claude-governor/ the installed plugin, written by `governor install`
+├── .claude-plugin/plugin.json    name, version, description
+├── hooks/hooks.json              the five hooks in section 4.1
+└── bin/governor                  the binary those hooks run
+
+state  → ~/.claude/governor/      sock, daemon.pid, daemon.log, statusline.json, samples.jsonl
+config → ${CLAUDE_PLUGIN_DATA}/config.json, falling back to the state directory
 ```
+
+**The installed plugin goes in `~/.claude/skills/`, not `~/.claude/plugins/`.** GOV-21
+measured why ([hook-surface.md](hook-surface.md) §15): `~/.claude/plugins` holds a marketplace
+cache and its bookkeeping, and a directory dropped beside them is loaded by nothing.
+`~/.claude/skills/<name>/` auto-loads as `<name>@skills-dir` with no `settings.json` entry at
+all, its `hooks/hooks.json` fires for a *matched* `PreToolUse`, and `${CLAUDE_PLUGIN_ROOT}`
+and `${CLAUDE_PLUGIN_DATA}` both expand. Registering the gate in the other directory would
+have been the silent never-fires failure §10.1 exists to prevent, arriving by a different
+door.
+
+The binary lives **inside** the plugin. One copy, so there is nothing for an upgrade to leave
+skewed, and `${CLAUDE_PLUGIN_ROOT}/bin/governor` is one string on every platform — the release
+artefacts are `governor-darwin-arm64` and friends and are renamed on the way in.
+
+`.mcp.json` is not written yet: `governor mcp` is still a stub, and a plugin file registering
+an MCP server that does nothing would be a broken server in the user's session rather than an
+absent one. It arrives with the advisory channel (section 8).
 
 `governor trace` is Phase 0 (GOV-02) and is deliberately not part of the surface above it.
 It is `trace agent` (the `SubagentStart`/`SubagentStop` hook body), `trace sample` (the 1 Hz
@@ -687,7 +705,7 @@ to `samples.jsonl`.
 It is a separate command family rather than a temporary meaning for `gate`, `confirm` and
 `release` on purpose: giving those a second definition now would leave the stories that
 implement them properly (GOV-05, GOV-07) guessing which one they are replacing. `internal/trace`
-and the whole `trace` family are deleted when Phase 1 lands, and `governor install` (GOV-18)
+and the whole `trace` family are deleted when Phase 1 lands, and `governor install` (GOV-21)
 supersedes `trace install`.
 
 The five `internal/` packages are not architecture astronautics: each is one interface with
@@ -907,7 +925,7 @@ being asked of them is to run a hook on every subagent spawn.
 | Command | Does |
 |---|---|
 | `install.sh` | curl-able bootstrap: detect OS/arch, fetch the matching binary, hand off to `governor install` |
-| `governor install` | write plugin files, merge hooks and statusline into settings (after backup), start the daemon, print exactly what it touched |
+| `governor install` | write the plugin (manifest, hooks, binary), merge the statusline into settings (after backup), start the daemon, print exactly what it touched |
 | `governor uninstall` | reverse all of it, restore the settings backup, stop the daemon, remove state on `--purge` |
 | `governor doctor` | daemon reachable? hooks registered? matcher matches the real tool name? binary and plugin versions agree? config schema current? each failure names its fix |
 | `governor calibrate` | measure cores, performance cores, RAM and a short load probe; write setpoint and B_max for *this* machine |
@@ -922,12 +940,15 @@ on. Three details are worth stating because they are decisions rather than imple
   and no lease table to read, and reporting those as further *failures* would print four
   problems and four fixes for one cause. A skip is only ever reachable downstream of a check
   that already failed and already named its fix, and it does not move the exit code.
-- **It reads both hook files.** `~/.claude/settings.json` and
-  `~/.claude/plugins/claude-governor/hooks/hooks.json` are both named by 13.3 and §9, GOV-18
-  has not yet chosen which it writes, and a diagnostic that only knew about the one that lost
-  would report a good install as broken. It expands `${CLAUDE_PLUGIN_ROOT}` for the same
-  reason — §4.1 registers the hooks through that variable, and stat'ing the command verbatim
-  would report "not an executable file" for every correctly installed plugin there is.
+- **It reads every file that can hold one.** `~/.claude/settings.json`,
+  `~/.claude/skills/claude-governor/hooks/hooks.json` — where GOV-21's installer actually
+  writes them — and `~/.claude/plugins/claude-governor/hooks/hooks.json`, the directory 13.3
+  named before that story measured it to be inert. The third is still read because a machine
+  installed by an earlier build has hooks sitting in it, and a diagnostic that could not see
+  them would report "not registered" for a file it is looking straight at, which is worse than
+  the original mistake. It expands `${CLAUDE_PLUGIN_ROOT}` for the same reason — §4.1
+  registers the hooks through that variable, and stat'ing the command verbatim would report
+  "not an executable file" for every correctly installed plugin there is.
 - **A matcher of exactly `Task` fails.** It fires on 2.1.263 by way of the alias in §10.1,
   which is precisely why: that section says registering only `Task` "would have worked by
   luck", and a diagnostic that passes something for working by luck will pass it on the
@@ -946,13 +967,47 @@ Uninstall is only verifiable if this list is exhaustive, so it is normative.
 
 | Path | Written by | Removed by |
 |---|---|---|
-| `~/.local/share/claude-governor/bin/governor` | install.sh | uninstall |
-| `~/.claude/plugins/claude-governor/` | install | uninstall |
-| `~/.claude/settings.json` (hooks, statusLine keys) | install, merged | uninstall, restored from backup |
-| `~/.claude/settings.json.governor-backup-<ts>` | install | uninstall |
+| `~/.claude/skills/claude-governor/.claude-plugin/plugin.json` | install | uninstall |
+| `~/.claude/skills/claude-governor/hooks/hooks.json` (the five hooks) | install | uninstall |
+| `~/.claude/skills/claude-governor/bin/governor` | install, copied from the running binary | uninstall |
+| `~/.claude/skills/` | install, only if absent | uninstall, only if it empties |
+| `~/.claude/settings.json` (`statusLine` key only) | install, merged | uninstall, previous value restored from backup |
+| `~/.claude/settings.json.governor-backup-<ts>` | install, only when a settings file existed | uninstall, unless `--keep-backup` |
+| `~/.local/bin/governor` | install, **only if `~/.local/bin` already exists** and nothing else is at that name | uninstall, only if it still links to our binary |
 | `~/.claude/governor/sock` | daemon | uninstall |
+| `~/.claude/governor/daemon.pid` | daemon | uninstall |
+| `~/.claude/governor/daemon.log` | install, when it starts the daemon | uninstall |
 | `~/.claude/governor/statusline.json` | `statusline`, when the directory already exists | uninstall |
-| `${CLAUDE_PLUGIN_DATA}/` (config, leases, samples) | daemon | uninstall `--purge` only |
+| `~/.claude/governor/` | daemon (`transport.Listen`) | uninstall, only once it is empty; `--purge` regardless |
+| `~/.claude/plugins/data/claude-governor-skills-dir/` (`${CLAUDE_PLUGIN_DATA}`: config) | Claude Code creates it; the governor writes config.json | uninstall `--purge` only |
+
+Four rows carry a condition, and each condition is the difference between "removes everything
+it added" and "removes things it did not":
+
+- **`~/.local/bin/governor` is a convenience, never a requirement.** install does not create
+  `~/.local/bin`; conjuring a standard PATH directory into someone's home would leave uninstall
+  deciding whether to remove it. When it is absent, install says so and names the full path,
+  which works. Something else already at that name is left strictly alone in both directions —
+  far more likely another tool than a stale link of ours, and the cost of guessing wrong is
+  deleting a binary somebody depends on.
+- **`~/.claude/skills/` and `~/.claude/governor/` are removed only if empty.** `os.Remove`
+  refuses a non-empty directory, which is exactly the test: a machine with other skills-dir
+  plugins, or with `samples.jsonl` still in it, keeps the directory and loses only our files.
+- **`samples.jsonl` survives a plain uninstall**, per the Phase 0 table below. It is the
+  measurement the setpoint is derived from and it is not reconstructable.
+- **The `statusLine` value is restored, not deleted.** There is only one status line, so
+  install *replaces* whatever was there; uninstall's job is to undo a replacement, and the
+  backup is the only record of the previous value. When install found no settings file at all
+  it writes no backup — and uninstall then removes the file it created rather than leaving an
+  empty `{}` behind.
+
+`governor uninstall` removes our `statusLine` **surgically** rather than restoring the backup
+wholesale, for the same reason `trace uninstall` does: a wholesale restore would destroy
+anything the user added to `settings.json` since install. It then compares the result against
+the backup and, when nothing else changed, writes the backup's original bytes — so the
+ordinary case is byte-identical, formatting and key order included, not merely equivalent.
+There is a test that asserts this over a recursive digest of the whole home directory rather
+than over this table, because this table being exhaustive is the thing under test.
 
 `${CLAUDE_PLUGIN_DATA}` is set by Claude Code for a plugin. When it is unset — a binary run
 by hand, or a `doctor` run outside a plugin context — `config.json` resolves to the state
@@ -978,7 +1033,7 @@ listed is a path uninstall silently stops covering. All of them go when Phase 1 
 | `~/.claude/governor/samples.jsonl` | `trace agent`, `trace sample` | by hand — it is the measurement, and deleting it on uninstall would throw away the phase |
 | `~/.claude/governor/sampler.lock` | `trace sample` | by hand |
 | `~/.claude/governor/sampler.log` | `trace sample` | by hand |
-| `~/.local/share/claude-governor/bin/governor` | staged by hand in Phase 0 | by hand, until `install.sh` owns it |
+| `bin/governor` in the repo, staged by hand in Phase 0 | by hand | by hand — GOV-21's `governor install` supersedes it, and installs into the plugin instead |
 
 The five hooks are `SubagentStart`, `SubagentStop`, `SessionStart`, and — added by GOV-27 to
 settle whether either fires interactively — `PostToolUse` and `Stop`. `PostToolUse` is
@@ -1011,6 +1066,17 @@ this would land on every hook of every live session at once. Upgrade MUST write 
 binary to a temporary name in the same directory and `rename(2)` it over the old one, exactly
 as the config write does — a rename swaps the directory entry and leaves running processes on
 the old inode, so nothing in flight is signed wrong.
+
+GOV-21's `governor install` does exactly that: it writes the binary to a sibling temp name in
+the plugin's `bin/` and renames it over the old one, and it skips the copy entirely when the
+digests already match. That skip is what makes a second install a no-op rather than a
+needless rewrite of a file every live hook may be executing.
+
+**The version is stamped at release, not left at `0.0.0-dev`.** The release workflow builds
+with `-ldflags -X main.binaryVersion=<tag>`, which is why `binaryVersion` is a var. `doctor`
+compares the version the hooks run against the version running the check, and two different
+builds that both call themselves `0.0.0-dev` compare equal — so an upgrade that left stale
+hooks behind would pass the one check that exists to catch it.
 
 Every protocol message carries `"v"`. A daemon that does not support a gate's version replies
 `unsupported_version`, and the gate treats that reply exactly like an unreachable daemon: it

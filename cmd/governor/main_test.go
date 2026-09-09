@@ -40,6 +40,23 @@ var servers = map[string]bool{"daemon": true}
 // checks themselves are tested in doctor_test.go against exactly that.
 var diagnostics = map[string]bool{"doctor": true}
 
+// mutating are the subcommands that change the machine.
+//
+// `install` writes a plugin directory, merges the user's settings.json and starts a detached
+// daemon; `uninstall` removes all of it. Running either from this sweep would do that to the
+// DEVELOPER'S OWN ~/.claude — isolateRealState redirects the state directory and the
+// endpoint, but not HOME, and a test that installed over someone's real settings while
+// merely asserting a subcommand exists would be the same class of accident as GOV-06's
+// daemon holding the real socket, with a blast radius of one settings file rather than one
+// socket.
+//
+// They are exempted here rather than isolated into passing, because HOME is process-wide and
+// this file runs the whole table: pointing it at a temp directory for these two would point
+// it there for every other subcommand too, quietly changing what the rest of the sweep
+// tests. install_test.go runs both for real against an isolated HOME, which is where the
+// behaviour belongs.
+var mutating = map[string]bool{"install": true, "uninstall": true}
+
 func TestEverySubcommandExitsZero(t *testing.T) {
 	isolateRealState(t)
 	for _, name := range required {
@@ -47,7 +64,7 @@ func TestEverySubcommandExitsZero(t *testing.T) {
 			t.Errorf("governor %s: not in the command table", name)
 			continue
 		}
-		if servers[name] || diagnostics[name] {
+		if servers[name] || diagnostics[name] || mutating[name] {
 			continue
 		}
 		var stdout, stderr bytes.Buffer
@@ -97,7 +114,7 @@ var implemented = map[string]bool{"version": true, "status": true, "statusline":
 func TestStubsWriteNothingToStdout(t *testing.T) {
 	isolateRealState(t)
 	for _, name := range required {
-		if implemented[name] || servers[name] {
+		if implemented[name] || servers[name] || mutating[name] {
 			continue
 		}
 		var stdout, stderr bytes.Buffer
