@@ -381,9 +381,11 @@ const clauseSep = " - "
 // than bytes. That cut is not reachable from render() today — every first clause it builds
 // is ASCII, so a multi-byte thermal value is dropped whole long before anything is cut, and
 // mutating the cut to bytes leaves the suite green. It is written rune-safe anyway because
-// design.md section 9's own illustration of this line is "◐ 3/5 · cpu 61% · thermal ok":
-// the moment a leading glyph is added, a byte cut splits a character on the one part of the
-// screen reserved for the governor's own report. TestFit covers the branch directly.
+// the multi-byte case is one edit away rather than hypothetical: design.md section 9
+// illustrated this line with a leading spinner glyph and middle-dot separators until GOV-B09
+// deleted that illustration, and the moment a glyph returns — or a thermal word arrives that
+// is not ASCII — a byte cut splits a character on the one part of the screen reserved for the
+// governor's own report. TestFit covers the branch directly.
 //
 // width <= 0 means "unknown", and is not a constraint. COLUMNS is frequently unset for a
 // child process, and treating an absent width as a width of zero would render every status
