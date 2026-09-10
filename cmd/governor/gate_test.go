@@ -41,11 +41,22 @@ const samplePayload = `{"session_id":"2ed4bf1c-470b-4e08-9b48-4f310663cb6e",` +
 // It returns the stderr diagnostics so a test can check the gate reported the right reason.
 func runGateFor(t *testing.T, endpoint, payload string, dialer transport.Dialer) string {
 	t.Helper()
+	return runGateSpeaking(t, endpoint, payload, dialer, protocolVersion)
+}
+
+// runGateSpeaking is runGateFor for a gate that talks a given protocol version.
+//
+// The version is a parameter so that the cross-version tests in version_test.go get the
+// same three assertions as every other fail-open case rather than a weaker set of their
+// own. A gate meeting a daemon of another version is a fail-open path like any other, and
+// the bound is what says it degraded instead of stalling.
+func runGateSpeaking(t *testing.T, endpoint, payload string, dialer transport.Dialer, speaks int) string {
+	t.Helper()
 	t.Setenv(transport.EndpointEnv, endpoint)
 
 	var stdout, stderr bytes.Buffer
 	start := time.Now()
-	code := gate(strings.NewReader(payload), &stdout, &stderr, dialer, gateBudget)
+	code := gate(strings.NewReader(payload), &stdout, &stderr, dialer, gateBudget, speaks)
 	elapsed := time.Since(start)
 
 	if code != 0 {
@@ -264,7 +275,7 @@ func TestGateFailsOpenWhenStdinNeverCloses(t *testing.T) {
 
 	var stdout, stderr bytes.Buffer
 	start := time.Now()
-	code := gate(blockingReader{}, &stdout, &stderr, transport.Dial{}, gateBudget)
+	code := gate(blockingReader{}, &stdout, &stderr, transport.Dial{}, gateBudget, protocolVersion)
 	elapsed := time.Since(start)
 
 	if code != 0 {
@@ -378,7 +389,7 @@ func runGateDeny(t *testing.T, endpoint, payload string) denyOutput {
 
 	var stdout, stderr bytes.Buffer
 	start := time.Now()
-	code := gate(strings.NewReader(payload), &stdout, &stderr, transport.Dial{}, gateBudget)
+	code := gate(strings.NewReader(payload), &stdout, &stderr, transport.Dial{}, gateBudget, protocolVersion)
 	elapsed := time.Since(start)
 
 	// A deny is still exit 0. The decision travels on stdout; a non-zero exit would be a

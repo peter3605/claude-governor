@@ -251,7 +251,7 @@ func TestGateStartsADaemonOnlyWhenNothingIsListening(t *testing.T) {
 			starts := recordStarts(t)
 			var stdout, stderr bytes.Buffer
 			code := gate(strings.NewReader(samplePayload), &stdout, &stderr,
-				transport.Dial{}, gateBudget)
+				transport.Dial{}, gateBudget, protocolVersion)
 
 			if code != 0 || stdout.Len() != 0 {
 				t.Fatalf("code %d stdout %q, want 0 and empty", code, stdout.String())
