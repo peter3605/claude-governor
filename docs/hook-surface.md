@@ -700,7 +700,7 @@ GOV-10 relies on are `session_id` and nothing else.
 }
 ```
 
-### 14.2 Four facts about the invocation
+### 14.2 Five facts about the invocation
 
 1. **There is no `hook_event_name`.** Every hook payload in §1–§5 carries one; this does not.
    A binary that dispatches on that field cannot dispatch a statusline, which is why
@@ -717,6 +717,38 @@ GOV-10 relies on are `session_id` and nothing else.
 
 4. **stderr is captured to the debug log and never displayed.** Diagnostics are safe to write
    there, on the same bargain the hooks make.
+
+5. **It is invoked on events only, unless `statusLine.refreshInterval` is set.** Measured for
+   GOV-B07 against `2.1.267` by the same read-the-binary method as the rest of §14. The
+   settings schema is
+
+   ```jsonc
+   statusLine: {
+     type: "command",
+     command: string,
+     padding?: number,
+     refreshInterval?: number,      // .min(1), "Re-run the status line command every N
+                                    // seconds in addition to event-driven updates"
+     hideVimModeIndicator?: boolean
+   }
+   ```
+
+   and it resolves to milliseconds as `refreshInterval === undefined ? null : Math.max(1, n) * 1000`.
+   Four consequences, all load-bearing for GOV-B07:
+
+   - **Absent means no timer at all**, and the events are: a new assistant message, a compact,
+     a permission-mode change, a settings change. A session waiting on a fan-out produces
+     none of them, so the line freezes at its pre-fan-out value for the whole fan-out. That
+     is the defect GOV-B07 fixes and it is a property of the harness, not of our command.
+   - **The unit is seconds and the floor is 1.** A sub-second interval is not an error, it is
+     silently clamped. The zod field also carries `.catch(undefined)`, so a malformed value
+     drops the key rather than rejecting the whole settings file — which is also why writing
+     this key is safe against an older Claude Code that does not know it.
+   - **The timer is a plain repeating `setTimeout`, not reset by event-driven renders.** An
+     active session pays both, and an idle session pays the timer forever. The cost of the
+     interval therefore scales with sessions open, not with sessions working.
+   - **Each fire goes through the same 300 ms debounce as an event refresh**, which coalesces
+     a timer fire with a concurrent event rather than running the command twice.
 
 Two settings suppress the statusline entirely and are worth knowing when one appears not to
 run: `disableAllHooks` (which covers statusLine execution as well as hooks, despite the name)

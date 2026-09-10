@@ -177,9 +177,65 @@ func pluginHooks() ([]byte, error) {
 // 100 ms connect deadline in section 4.4 is what protects a session from a wedged daemon.
 const gateHookTimeout = 30
 
+// statuslineRefreshInterval re-runs the status line on a timer, in seconds (GOV-B07).
+//
+// WHY THERE HAS TO BE ONE. Without this key Claude Code invokes the status line on events
+// only — a new assistant message, a compact, a permission-mode change, a settings change.
+// A session that has spawned a fan-out and is waiting for it produces no assistant message
+// for as long as the fan-out lasts, so the command never runs and the line keeps showing
+// what it captured BEFORE the spawns. On 2026-09-09 that rendered `0/4 slots` beside two
+// subagents visibly running for the better part of a minute. The leases were correct and
+// the daemon had counted them; the line simply had not been asked. A counter that goes
+// blank during precisely the parallel stretches worth watching does not deliver what
+// design.md section 9 claims for it.
+//
+// MEASURED, on this host (Claude Code 2.1.267, macOS/arm64, 8 logical cores, 2026-09-09,
+// against a live daemon):
+//
+//	one invocation      4.32 ms CPU (2.53 user + 1.79 sys), 5.3 ms wall, 10.9 MB peak RSS
+//	cache hit           p50 5.1 ms, p99 6.4 ms
+//	cache miss          p50 5.7 ms, p99 6.7 ms  (full socket round trip to the daemon)
+//
+// WHAT THAT MEASUREMENT CHANGES. The socket round trip is ~0.6 ms of a ~5.7 ms call: nine
+// tenths of the cost is starting a process at all. So statusline.json is not, as its own
+// comment supposed, what makes a high call rate affordable — it barely dents the per-call
+// cost. What it does is bound DAEMON round trips at one per second machine-wide however
+// many sessions are open. Process spawns it cannot bound, and spawns are the cost, so the
+// interval is what has to bound them, and it is chosen against spawns rather than against
+// the round trip.
+//
+// WHY 2 SECONDS. Cost does not decide it. At N seconds and S sessions the machine pays
+// S/N × 4.32 ms of CPU per second, forever, because the timer is a plain repeating
+// setTimeout that idle sessions run too: at N=2 that is 2.2 ms/s per session, so twenty
+// open sessions cost 4% of one core, 0.5% of this machine. Every interval from 1 s upward
+// is affordable, which means the number has to be argued from what the line is for.
+//
+// Two things decide it. First, the cache TTL: at N=1 a lone session's timer fires exactly
+// at the one-second expiry, so the cache alternates between hit and miss on a race and its
+// behaviour is not stateable. The smallest interval strictly greater than the TTL makes it
+// definite — a single session always reads through to the daemon, and concurrent sessions
+// coalesce onto at most one round trip per second. Second, staleness as a person
+// experiences it: worst case from a lease changing to the line showing it is the interval,
+// plus Claude Code's 300 ms debounce, plus up to a second of cache, so 3.3 s at N=2. A
+// fan-out worth watching lasts tens of seconds; being right within about three of them is
+// watchable, and the next step up buys nothing for a second more of lag.
+//
+// WHY THIS IS A CONSTANT AND NOT CALIBRATED. GOV-25 has defaults come from the machine,
+// and the measurement above is how that principle was applied here: it says the cost term
+// does not bind. What binds is the one-second cache and human perception, and neither is a
+// property of the host. A host where this stopped being true is a specific and checkable
+// one — a spawn costing tens of milliseconds of CPU rather than four — so if `calibrate`
+// ever measures the statusline, that is the threshold at which it should lengthen this
+// rather than a reason to make every host carry a tuned number today.
+const statuslineRefreshInterval = 2
+
 // statusLineSetting is the settings.json value that wires up the status line.
 func statusLineSetting(binary string) map[string]any {
-	return map[string]any{"type": "command", "command": binary + " statusline"}
+	return map[string]any{
+		"type":            "command",
+		"command":         binary + " statusline",
+		"refreshInterval": statuslineRefreshInterval,
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -945,12 +1001,33 @@ func loadSettings(path string) ([]byte, map[string]any, error) {
 func mergeStatusLine(settings map[string]any, binary string) bool {
 	want := statusLineSetting(binary)
 	if existing, ok := settings["statusLine"].(map[string]any); ok {
-		if fmt.Sprint(existing["command"]) == fmt.Sprint(want["command"]) &&
-			fmt.Sprint(existing["type"]) == fmt.Sprint(want["type"]) {
+		if sameStatusLine(existing, want) {
 			return false
 		}
 	}
 	settings["statusLine"] = want
+	return true
+}
+
+// sameStatusLine reports whether a statusLine already in settings.json is the one install
+// would write.
+//
+// EVERY key we write is compared, and that is what makes an upgrade work. A governor from
+// before GOV-B07 wrote type and command and no refreshInterval; comparing only the two keys
+// it happened to write would find that entry equal to this one, report "unchanged", and
+// leave every machine that already had the plugin installed on the event-only status line
+// this story exists to fix — with install printing a line saying it had checked.
+//
+// Compared through fmt.Sprint because the two sides come from different worlds: `want` holds
+// Go's own types, `existing` was decoded from JSON, where every number is a float64. The
+// literal 2 and the decoded 2.0 are the same setting and must not read as a difference, or
+// install rewrites the key on every run and idempotency is gone.
+func sameStatusLine(existing, want map[string]any) bool {
+	for key, value := range want {
+		if fmt.Sprint(existing[key]) != fmt.Sprint(value) {
+			return false
+		}
+	}
 	return true
 }
 

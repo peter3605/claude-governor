@@ -766,6 +766,26 @@ concluded the governor was working. The count was the thing being misread, so th
 what goes; and this is the one state where what a reader needs is not a number but an
 instruction.
 
+GOV-B07 added the other half of that. Claude Code runs a status line on events — an assistant
+message, a compact, a permission-mode change, a settings change — and on nothing else unless
+`statusLine.refreshInterval` is set (hook-surface.md §14.2). A session that has spawned a
+fan-out and is waiting for it produces no assistant message until the fan-out ends, so the
+line displayed whatever it captured before the spawns, for the entire duration of the one
+thing it exists to make watchable. Install now writes `refreshInterval: 2`, in seconds.
+
+Two seconds is argued rather than picked, and the measurement that decides it is not the one
+expected. One invocation costs 4.32 ms of CPU on this host, of which the socket round trip to
+the daemon is 0.6 ms: nine tenths of the cost is starting a process. So the interval cannot be
+justified by what it saves the daemon, and `statusline.json` does not do what §13.3 below
+originally claimed for it. What is left is affordable at any interval — S sessions at N
+seconds cost S/N × 4.32 ms of CPU per second, so twenty sessions at two seconds is 0.5% of
+this eight-core machine — which means the number has to come from what the line is for. Two
+things fix it: it must be strictly longer than the one-second cache, or a lone session's timer
+fires exactly at expiry and whether it reads the daemon or a stale entry is a race; and the
+worst case from a lease changing to the line showing it is the interval plus a 300 ms debounce
+plus up to a second of cache, which at two seconds is 3.3 s — inside the tens of seconds a
+fan-out worth watching lasts.
+
 GOV-10 shipped it, and the line above is what it actually renders. Two departures from the
 `◐ 3/5 · cpu 61% · thermal ok` this section originally illustrated, both deliberate. There is
 no leading glyph, because an animated one would have to come from somewhere and the statusline
@@ -1128,10 +1148,19 @@ directory, so a second governor on `GOVERNOR_ENDPOINT` rate-limits beside its ow
 instead of over the first one's.
 
 `statusline.json` is a one-second cache of the last status reply (GOV-10). The statusline is
-run on every assistant message in every session, so without it the busiest thing the governor
-does is answering its own status line. It is written only when the state directory already
-exists — the statusline never creates it — because a command that ran on every message and
-recreated the directory would put a file back moments after uninstall removed it.
+run on every assistant message in every session, and since GOV-B07 on a two-second timer as
+well, so without it the busiest thing the governor does is answering its own status line. It
+is written only when the state directory already exists — the statusline never creates it —
+because a command that ran on every message and recreated the directory would put a file back
+moments after uninstall removed it.
+
+What the cache actually buys was measured for GOV-B07 and is narrower than the paragraph above
+assumed. A cache hit costs 5.1 ms at p50 and a miss 5.7 ms, so it saves 0.6 ms of a 5.7 ms
+call — the daemon round trip is a tenth of the cost and process startup is the rest. It is
+still worth keeping, but for a different reason than per-call cost: it bounds *daemon* round
+trips at one per second machine-wide however many sessions are open, which is what stops the
+daemon from being the thing that scales with session count. Process spawns it cannot bound,
+and those are what §9's refresh interval is chosen against.
 
 Phase 0 (GOV-02, extended by GOV-27) adds the rows below. They are listed here rather than in a story note
 because this table is what makes uninstall verifiable, and a path that is touched but not
