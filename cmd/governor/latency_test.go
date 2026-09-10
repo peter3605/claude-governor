@@ -38,7 +38,10 @@ import (
 // This is a discount for scheduling, not for slowness. A stall in the code — the 200 ms one
 // this story's acceptance criterion inserts — does not make a sleeping goroutine late, is
 // not measured as noise, is not subtracted, and still turns the assertion red. Measured:
-// with the stall in place the failures read "203ms (0s of it scheduler lateness)".
+// with the stall in place the failures read "203ms (0s of it scheduler lateness)", and
+// re-measured after GOV-B10 changed what the pacer counts, "206ms (1ms of it scheduler
+// lateness)" — the millisecond being what it now costs to get the pacer onto a processor
+// under -race, and nowhere near enough to discount a stall into passing.
 //
 // WHAT THE DISCOUNT COSTS. The noise figure is the worst lateness of the whole window, and
 // the operation only ever suffered one late wakeup, so on a badly starved machine it
@@ -53,6 +56,20 @@ import (
 // THE NEXT PERSON: if one of these ceilings starts flaking again, the number is not the
 // thing to change. Either the noise floor is not being measured over the whole operation, or
 // something really did get slower.
+//
+// WHAT GOV-B10 FOUND, because the first version of the pacer measured only its ticks. A
+// goroutine that is never scheduled cannot report how late it is. Under GOMAXPROCS=1 with
+// four spinners — the loaded runner in miniature, below — the pacer was starved out of the
+// window entirely on 40 of 100 measured runs: zero ticks, the first select finding stop
+// already closed, and a discount of exactly nothing handed back for the most starved
+// machines of the set. The discount went quiet on precisely the runners it exists for, and
+// the guard beneath went red one run in ten saying so.
+//
+// The answer is that a wakeup is late from the moment it was owed, whether or not the
+// goroutine is around to see it. The pacer is owed its first instruction when it is created
+// and every later one a tick after the last, so it now opens its account at creation and
+// settles it on whichever channel wins the final race. Being starved for the whole window
+// is no longer indistinguishable from a machine with nothing to report.
 
 // noiseTick is how often the pacer wakes.
 //
@@ -81,26 +98,42 @@ func (l latency) String() string {
 		l.elapsed.Round(time.Millisecond), l.noise.Round(time.Millisecond))
 }
 
+// pace reports, until stop closes, the worst lateness of a goroutine that has nothing to do.
+//
+// launched is when the caller created the goroutine this runs on, and the delay before the
+// first line here is the first thing charged: a goroutine is owed its first instruction
+// immediately, and on a machine starved enough to withhold that for the whole window it is
+// the only lateness there will be to report (GOV-B10).
+//
+// Both ways out of the select settle through the same statement, deliberately. The wakeup was
+// owed at at+noiseTick regardless of which channel won the race, so arriving after that is
+// lateness whether the pacer got a tick or found the operation already over, and arriving
+// before it leaves the figure negative and changes nothing. One statement rather than one per
+// branch means no exit can be reached without being accounted for.
+func pace(launched time.Time, stop <-chan struct{}) time.Duration {
+	late := time.Since(launched)
+	for {
+		at := time.Now()
+		var over bool
+		select {
+		case <-stop:
+			over = true
+		case <-time.After(noiseTick):
+		}
+		late = max(late, time.Since(at)-noiseTick)
+		if over {
+			return late
+		}
+	}
+}
+
 // timed runs op and reports how long it took alongside how late this machine was running a
 // goroutine that had nothing to do while it ran.
 func timed(op func()) latency {
 	stop := make(chan struct{})
 	worst := make(chan time.Duration, 1)
-	go func() {
-		var late time.Duration
-		for {
-			at := time.Now()
-			select {
-			case <-stop:
-				worst <- late
-				return
-			case <-time.After(noiseTick):
-				if over := time.Since(at) - noiseTick; over > late {
-					late = over
-				}
-			}
-		}
-	}()
+	launched := time.Now()
+	go func() { worst <- pace(launched, stop) }()
 
 	start := time.Now()
 	op()
@@ -131,9 +164,36 @@ func TestTimedChargesTheRunnerForItsOwnLateness(t *testing.T) {
 		}
 	})
 
+	// The starved case above cannot be staged on demand — whether the runtime withholds
+	// the pacer for a whole window is the scheduler's to decide, and on 40 runs in 100 it
+	// did (GOV-B10). This stages the consequence instead, with no scheduler in it: a pacer
+	// handed a creation instant already in the past and an operation already over is a
+	// pacer that was never scheduled inside the window, and it must still say how long it
+	// was held. Reporting nothing here is the discount going quiet, which is how the
+	// ceilings above turn back into raw wall clock without a single test saying so.
+	t.Run("a pacer that never ran inside the window is charged for the wait", func(t *testing.T) {
+		const held = 50 * time.Millisecond
+
+		over := make(chan struct{})
+		close(over)
+
+		late := pace(time.Now().Add(-held), over)
+
+		if late < held {
+			t.Errorf("late = %v after being held %v before its first instruction, want at least %v: "+
+				"a goroutine that never ran is not a goroutine that was on time", late, held, held)
+		}
+	})
+
 	// A runtime with one processor and more spinning goroutines than it can run is the
 	// loaded CI runner in miniature, and the pacer must notice. If this ever reports zero
 	// the discount has become a no-op and every ceiling above is back to raw wall clock.
+	//
+	// This is the subtest GOV-B10 fixed, and the fix was not here: the assertion is the
+	// same one, still on the direction and still never on a figure. What changed is that
+	// the pacer now charges for a window it was starved out of, so both ways the scheduler
+	// can take this — pacing the operation, or never running until it is over — arrive at
+	// some lateness rather than one of them arriving at none.
 	t.Run("a starved runtime is charged for the delay it causes", func(t *testing.T) {
 		defer runtime.GOMAXPROCS(runtime.GOMAXPROCS(1))
 
