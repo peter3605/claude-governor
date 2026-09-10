@@ -1198,6 +1198,28 @@ Config is `${CLAUDE_PLUGIN_DATA}/config.json` carrying `"schema": 1`. Unknown ke
 are preserved, never crash — a config written by a newer version must not brick an older
 binary. Migration happens on read; the write is atomic (temp file, rename).
 
+Unknown keys are preserved **byte for byte**. Decoding them through a generic value would
+round every number through `float64`, so a newer version's large integer would come back
+mangled — preserved in name and corrupted in value, which is worse than dropping it because
+nothing reports it. `config.Config.Unknown` therefore holds raw JSON.
+
+Three states are refused rather than guessed at, and `doctor` reports each the same way the
+store treats it. **A missing file is not one of them**: a machine that has never run
+`calibrate` has no config and runs on built-in defaults, which is a state and not a fault, so
+`Load` returns the zero config and writes nothing.
+
+- **A schema from the future.** This binary does not know what changed, so it can neither
+  read the file nor safely rewrite it. Refusing beats saving a truncated version of someone
+  else's settings over the original.
+- **No `"schema"` key at all.** Assuming schema 1 would mean migrating a document of unknown
+  provenance and writing the result back over it.
+- **A gap in the migration chain.** Migrating 1 to 3 by way of nothing would hand schema-1
+  keys to schema-3 code, which is the corruption the version number exists to prevent.
+
+Every config key ships with a default that leaves its feature **inert**. An upgraded binary
+reading an old config must behave exactly as it did before until the user opts in, which is
+what makes an upgrade a non-event rather than a change of behaviour nobody asked for.
+
 **Never overwrite the binary in place.** Measured in GOV-02, on macOS: `cp` onto the existing
 `bin/governor` invalidates its code signature, and the kernel then **SIGKILLs** every
 subsequent execution — `exit=137`, no output, no error message anywhere. That defeats the one
