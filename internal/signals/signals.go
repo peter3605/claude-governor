@@ -25,13 +25,28 @@ const (
 type Sample struct {
 	// CPU is host utilisation in [0,1].
 	CPU float64
-	// RunQueue is loadavg1 divided by the core count: contention that CPU% misses.
+	// RunQueue is loadavg1 divided by the usable core count: contention that CPU% misses.
+	//
+	// The divisor is CPUCapacity, not the physical core count, so that a cgroup-limited host
+	// divides by the cores it may actually use. On an unconstrained machine the two are the
+	// same number and this reads exactly as it always did.
 	RunQueue float64
 	// Thermal is the thermal pressure state, or Unknown where the platform has none.
 	Thermal Thermal
 	// MemoryPressure is a secondary cut trigger in [0,1]. It is derived: the fraction of
 	// physical memory that is not available to a new allocation.
 	MemoryPressure float64
+	// SwapInBytesPerSec is how fast the machine is faulting pages back in from swap.
+	//
+	// It is the other half of the memory signal in design.md section 5.1 ("free pages +
+	// swap-in rate") and it is the half that carries the urgency. Free memory falling is
+	// ordinary — a machine with cold free memory is a machine wasting it. Pages coming BACK
+	// from swap means something resident is being fought over right now, which is the
+	// condition worth cutting the budget for.
+	//
+	// A rate, so it is a difference between ticks like the CPU readings, and zero on the
+	// priming sample for the same reason they are.
+	SwapInBytesPerSec float64
 
 	// The fields below are the raw readings the derived ones above are computed from.
 	// They are recorded rather than discarded because Phase 0's whole purpose is to tune
@@ -46,8 +61,27 @@ type Sample struct {
 	MemTotalBytes uint64
 	// Tree is the cost of the claude process tree.
 	Tree Tree
-	// Cores is the core count the RunQueue divisor came from.
+	// TreeFresh reports whether Tree was walked on this tick or carried over from an earlier
+	// one. See NewSamplerEvery: the daemon refreshes the tree more slowly than the host
+	// signals, because the walk is the expensive term.
+	//
+	// It is recorded rather than left implicit because a consumer that averages Tree across
+	// samples must not treat five carried-over copies as five independent readings. A trace
+	// that cannot tell repetition from measurement will confidently report a variance of
+	// zero.
+	TreeFresh bool
+	// Cores is the physical core count of the machine.
 	Cores int
+	// CPUCapacity is how many cores this process may actually use: the cgroup quota where
+	// one is set, otherwise Cores. It is the RunQueue divisor.
+	//
+	// Fractional on purpose. A cgroup quota is bandwidth, not a whole number of processors,
+	// and half a core is a perfectly ordinary limit.
+	CPUCapacity float64
+	// CPUCapacitySource names where CPUCapacity came from — "host" or "cgroup" — so a trace
+	// or a doctor run can tell a two-core machine from a sixty-four-core machine throttled
+	// to two. The numbers are identical and the right budget is not.
+	CPUCapacitySource string
 	// CostMS is how long this sample itself took to collect, in milliseconds.
 	//
 	// It is in the record because GOV-02 requires the sampler be invisible, and the only

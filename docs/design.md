@@ -464,6 +464,54 @@ finding about the system. Real traces produced both-looking records within an ho
 installation. The key list settles it per record, offline, without re-running anything. Names
 only, never values: the payload carries the agent's prompt.
 
+**The daemon samples the cheap signals every second and the process tree every fifth.**
+GOV-12. The walk is essentially the entire cost of a tick, so paying it at 1 Hz put the
+daemon over the 1%-of-a-core bar that story sets. Nothing the v1 loop reads is affected:
+per-agent tree cost is the "Phase 2 refinement" row of the table above, and CPU, run queue,
+thermal and memory — the signals §5.2 acts on — still tick every second. Samples carry
+`TreeFresh` so a consumer cannot mistake five carried-over copies for five readings. Phase 0's
+own sampler is unchanged and still walks every tick, because GOV-15 tunes the setpoint against
+traces collected at that cadence.
+
+**Measured sampler cost.** `GOVERNOR_MEASURE=1 go test ./internal/signals/ -run TestMeasureSamplerCost -v`,
+which reports CPU time from `getrusage` rather than wall clock — a percentage of a core is a
+claim about CPU consumed, and a sampler blocked on a syscall consumes none.
+
+| Host | Every tick | Tree every 5th tick |
+|---|---|---|
+| darwin/arm64, 8 cores, ~700 processes | 8.4–17.7 ms/tick — 0.84–1.77% | 1.5–3.4 ms/tick — **0.15–0.34%** |
+| linux/arm64 container, `--cpus=2`, ~5 processes | 1.6–1.8 ms/tick — 0.16–0.18% | 0.8–1.1 ms/tick — **0.08–0.11%** |
+
+Ranges, not points, because two runs minutes apart on the same laptop differed by a factor of
+two — the walk's cost tracks how many processes are on the machine and how contended it is.
+A single figure here would be a snapshot presented as a property.
+
+The two rows are not comparable to each other and should not be read as "Linux is ten times
+cheaper": the walk scales with the size of the process table, and a container running one test
+binary has almost nothing in it. The darwin row is the load-bearing one, and even its upper
+end understates a working machine — the Phase 0 sampler, measured over 46 hours of ordinary
+use at full rate, cost **2.30% of one core** (23.0 ms of CPU per tick). Scaling that by the
+same ratio puts the daemon's split cadence near 0.5%, still inside the bar.
+
+Note what the full-rate column says: at 1 Hz the walk is at or over the 1% bar on a real
+machine. The split cadence is not an optimisation, it is the reason the bar is met.
+
+This is checked by an opt-in measurement and not by a CI assertion, and the variance above is
+exactly why: GOV-B04, GOV-B08 and GOV-B10 were each filed to repair a timing guard that
+measured the runner instead of the code.
+
+**On Linux the cgroup quota is preferred to the host's core count.** Inside a container, raw
+host CPU is not merely imprecise but misleading in the direction that breaks the loop: a quota
+of two cores on a 64-core host reads as 97% idle, so the loop would keep increasing the budget
+against a container already throttled flat. The run-queue divisor has the same problem —
+loadavg is the host's, and the cores to divide it by are the cgroup's. `Sample.CPUCapacity`
+carries the effective figure and `CPUCapacitySource` says where it came from, so a two-core
+machine and a 64-core machine throttled to two are distinguishable in a trace. Verified
+against a real cgroup rather than a fixture: in a `--cpus=2` container the sampler reports
+2 cores from `cgroup` while `runtime.NumCPU()` still reports 8. A quota larger than the
+machine is clamped to the host, and an unrecognised cgroup layout falls back to the host
+figure — the same answer a non-cgroup machine gives.
+
 ### 5.2 AIMD
 
 Borrowed from TCP congestion control, and the right shape for the same reason: reclaim

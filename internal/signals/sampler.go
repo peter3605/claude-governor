@@ -29,10 +29,14 @@ import (
 const ClaudeProcessName = "claude"
 
 // hostSampler is the one implementation of Sampler (design.md section 12.1: one interface,
-// one implementation, and a second one is premature until tier two exists). It is not
-// per-platform: gopsutil covers CPU, load, memory and process introspection identically on
-// darwin and linux, and the single genuinely platform-specific reading — thermal state —
-// already has its _darwin/_other pair behind ReadThermal.
+// one implementation, and a second one is premature until tier two exists).
+//
+// Most of it is platform-neutral: gopsutil covers CPU, load, memory and process
+// introspection identically on darwin and linux. Two readings are not, and each has its own
+// build-tagged pair rather than a runtime branch — thermal state behind ReadThermal, and CPU
+// capacity behind cpuCapacity, where Linux prefers the cgroup quota to the host's core count
+// (GOV-12). This is the darwin/linux split section 12.1's Signals row calls for; it is one
+// implementation selected at compile time, not two implementations of the seam.
 //
 // It is stateful because the readings that matter are rates, not levels. CPU utilisation
 // and per-process CPU are both deltas between consecutive ticks, so a sampler is a thing
@@ -62,6 +66,21 @@ type hostSampler struct {
 	// that cannot spawn its own children can only assert against whatever happens to be
 	// running.
 	rootName string
+
+	// treeEvery is how often the process-tree walk is actually performed. Zero means every
+	// tick, which is what Phase 0 uses. See NewSamplerEvery for why the daemon does not.
+	treeEvery time.Duration
+	// lastTree is the most recent walk, returned unchanged on ticks that skip one.
+	lastTree Tree
+	// lastTreeAt is when lastTree was walked.
+	lastTreeAt time.Time
+
+	// swapIn caches the cumulative bytes-swapped-in counter as of the previous tick, and
+	// swapAt is when it was read. Like CPU, the useful signal is the rate, and the counter
+	// is monotonic since boot.
+	swapIn   uint64
+	swapAt   time.Time
+	swapSeen bool
 }
 
 // NewSampler returns a Sampler for this host.
@@ -72,6 +91,30 @@ type hostSampler struct {
 // false zeroes into the trace.
 func NewSampler() Sampler {
 	return newSamplerNamed(ClaudeProcessName)
+}
+
+// NewSamplerEvery returns a Sampler that refreshes the process-tree walk no more often than
+// treeEvery, carrying the previous walk forward on the ticks in between.
+//
+// This exists because the tree walk is the whole cost of sampling and the daemon cannot
+// afford it every second. MEASURED, not estimated: the Phase 0 sampler has run for 46 hours
+// at 1 Hz and cost 2.30% of one core — 23.0 ms of CPU per tick, nearly all of it the
+// per-process syscalls the walk makes across ~700 processes. The host signals either side of
+// it cost 1-2 ms together. Refreshing the tree every 5 s brings the average to roughly 0.6%
+// of a core, which is the bar GOV-12 sets.
+//
+// Nothing is lost from the v1 control loop by doing this. design.md section 5.1 lists the
+// per-agent tree cost as a "Phase 2 refinement"; the signals the loop actually acts on —
+// CPU utilisation, run queue, thermal, memory — are the cheap ones and still tick at 1 Hz.
+//
+// Phase 0 keeps the full-rate walk. NewSampler is unchanged and still walks every tick, so
+// the trace the setpoint will be tuned against is collected exactly as it has been since
+// GOV-02. Samples carry TreeFresh so a slower-tree consumer can tell a fresh walk from a
+// carried-over one.
+func NewSamplerEvery(treeEvery time.Duration) Sampler {
+	s := newSamplerNamed(ClaudeProcessName)
+	s.treeEvery = treeEvery
+	return s
 }
 
 func newSamplerNamed(rootName string) *hostSampler {
@@ -175,6 +218,7 @@ func (s *hostSampler) Host(ctx context.Context) (Host, error) {
 func (s *hostSampler) Sample(ctx context.Context) (Sample, error) {
 	start := time.Now()
 	out := Sample{Thermal: ReadThermal(), Cores: runtime.NumCPU()}
+	out.CPUCapacity, out.CPUCapacitySource = cpuCapacity()
 
 	// cpu.Percent with a zero interval differences against gopsutil's own last call, which
 	// is why the first tick must be discarded rather than trusted.
@@ -183,8 +227,8 @@ func (s *hostSampler) Sample(ctx context.Context) (Sample, error) {
 	}
 	if avg, err := load.AvgWithContext(ctx); err == nil {
 		out.LoadAvg1 = avg.Load1
-		if out.Cores > 0 {
-			out.RunQueue = avg.Load1 / float64(out.Cores)
+		if out.CPUCapacity > 0 {
+			out.RunQueue = avg.Load1 / out.CPUCapacity
 		}
 	}
 	if v, err := mem.VirtualMemoryWithContext(ctx); err == nil {
@@ -194,10 +238,59 @@ func (s *hostSampler) Sample(ctx context.Context) (Sample, error) {
 			out.MemoryPressure = 1 - float64(v.Available)/float64(v.Total)
 		}
 	}
-	out.Tree = s.tree(ctx)
+	out.SwapInBytesPerSec = s.swapRate(ctx, start)
+	out.Tree, out.TreeFresh = s.treeCached(ctx, start)
 
 	out.CostMS = float64(time.Since(start).Microseconds()) / 1000
 	return out, nil
+}
+
+// swapRate returns bytes per second faulted back in from swap since the previous tick.
+//
+// Zero on the priming tick, and zero again if the counter goes backwards — which it does on
+// a machine that has swapoff'd, and would otherwise present as a large negative rate or, once
+// stored in a uint64 difference, an enormous positive one.
+func (s *hostSampler) swapRate(ctx context.Context, now time.Time) float64 {
+	sw, err := mem.SwapMemoryWithContext(ctx)
+	if err != nil {
+		return 0
+	}
+	prev, at, seen := s.swapIn, s.swapAt, s.swapSeen
+	s.swapIn, s.swapAt, s.swapSeen = sw.Sin, now, true
+	if !seen {
+		return 0
+	}
+	elapsed := now.Sub(at).Seconds()
+	if elapsed <= 0 || sw.Sin < prev {
+		return 0
+	}
+	return float64(sw.Sin-prev) / elapsed
+}
+
+// treeCached walks the process tree, or returns the previous walk when one is recent enough.
+//
+// The freshness test is against the time of the last walk rather than a tick count, for the
+// same reason the EWMA is time-aware: ticks are not evenly spaced on a loaded machine, and
+// "every fifth tick" on a machine that skipped four of them is not every five seconds.
+func (s *hostSampler) treeCached(ctx context.Context, now time.Time) (Tree, bool) {
+	if s.treeEvery > 0 && !s.lastTreeAt.IsZero() && now.Sub(s.lastTreeAt) < s.treeEvery {
+		return s.lastTree, false
+	}
+	// Whether the walk about to happen can produce CPU figures at all. The first walk of a
+	// sampler's life has nothing to difference against, so every rate in it is zero by
+	// construction — and caching THAT would republish a manufactured zero on every tick until
+	// the interval elapsed. On a 5 s interval that is five consecutive samples claiming the
+	// claude tree is using no CPU, which is the "reports an idle machine" failure this file
+	// and statusReply's null both exist to prevent, arriving from inside the cache.
+	//
+	// So an unprimed walk is returned but not retained, and the next tick walks again — one
+	// extra walk, once, at startup.
+	wasPrimed := s.primed
+	t := s.tree(ctx)
+	if wasPrimed {
+		s.lastTree, s.lastTreeAt = t, now
+	}
+	return t, true
 }
 
 // tree walks the process table and sums the cost of the claude process tree.

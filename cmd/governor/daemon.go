@@ -116,9 +116,14 @@ type request struct {
 // replies that the protocol never specified. The statusline (GOV-10) and doctor (GOV-20)
 // read these, so each message says exactly what section 7 says it says.
 //
-// cpu is a pointer in both places it appears. The daemon has no sampler until GOV-12, and
-// reporting 0.0 would tell a statusline the machine is idle — a claim. Null says "not
-// measured", which is the truth.
+// cpu is a pointer in both places it appears, because 0.0 would tell a statusline the
+// machine is idle — a claim — where null says "not measured", which is the truth.
+//
+// GOV-12 gave the daemon a sampler, so the STATUS reply now carries real numbers whenever a
+// tick has landed. The REFUSE reply's cpu is still null, and deliberately so: this story is
+// observation only, and a refusal that quoted a live CPU figure would be the first place the
+// governor used a measurement to explain a decision it did not make from one. GOV-14 is where
+// the budget starts moving with the signal, and that is where refuse should start quoting it.
 
 // grantReply answers a granted acquire.
 type grantReply struct {
@@ -197,13 +202,53 @@ type ackReply struct {
 // the machine fail open the moment the daemon restarted — trading a display defect for an
 // ungoverned machine, which is the wrong way round.
 type statusReply struct {
-	V       int             `json:"v"`
-	Budget  int             `json:"budget"`
-	InUse   int             `json:"in_use"`
-	Waiting int             `json:"waiting"`
+	V       int `json:"v"`
+	Budget  int `json:"budget"`
+	InUse   int `json:"in_use"`
+	Waiting int `json:"waiting"`
+	// CPU is the 5 s EWMA of host utilisation in [0,1] (design.md section 5.1), or null when
+	// nothing has sampled yet. It is the smoothed figure rather than the instantaneous one
+	// because a raw read swings hard enough to make anything reading it oscillate — the
+	// statusline included.
 	CPU     *float64        `json:"cpu"`
 	Thermal signals.Thermal `json:"thermal"`
-	Sources []sourceStat    `json:"sources"`
+	// The four signals below were added by GOV-12 and are additive, like GOV-29's before
+	// them: the protocol version is NOT bumped. An older statusline or doctor ignores what it
+	// does not know, where a bump would make every un-upgraded hook on the machine fail open
+	// the moment the daemon restarted.
+	//
+	// Every one is a pointer for the reason the CPU field already was: null means "not
+	// measured" and 0.0 means "measured as zero", and a status line that cannot tell them
+	// apart reports an idle machine when what it has is no reading at all.
+	//
+	// Nothing acts on any of them. GOV-12 is observation only.
+
+	// CPUInstant is the latest unsmoothed utilisation, kept alongside the average so a reader
+	// tuning the window later can see what the smoothing did. Section 5.1's principle: store
+	// the raw reading, because a trace holding only the derived value cannot be re-derived
+	// against a different formula.
+	CPUInstant *float64 `json:"cpu_instant,omitempty"`
+	// RunQueue is loadavg1 over usable cores — contention that CPU% misses.
+	RunQueue *float64 `json:"run_queue,omitempty"`
+	// CPUCapacity is the cores the governor may actually use, and CPUCapacitySource says
+	// whether that came from the host or from a cgroup quota. A 64-core host throttled to two
+	// and a two-core machine report the same capacity and want different budgets.
+	CPUCapacity       *float64 `json:"cpu_capacity,omitempty"`
+	CPUCapacitySource string   `json:"cpu_capacity_source,omitempty"`
+	// MemAvailableBytes is memory available without swapping, and SwapInBytesPerSec is how
+	// fast pages are being faulted back in. Section 5.1 pairs them deliberately: free memory
+	// falling is ordinary, pages coming back from swap is contention happening now.
+	MemAvailableBytes *uint64  `json:"mem_available_bytes,omitempty"`
+	SwapInBytesPerSec *float64 `json:"swap_in_bytes_per_sec,omitempty"`
+	// TreeCPU is cores busy across the whole claude process tree, descendants included, and
+	// TreeCPURoots is the session processes alone. The gap between them is the Phase 0
+	// question — whether the load is the agents or the builds they launch — so they are
+	// reported as two numbers rather than collapsed into one.
+	//
+	// These refresh every treeInterval rather than every tick; see sampleInterval.
+	TreeCPU      *float64     `json:"tree_cpu,omitempty"`
+	TreeCPURoots *float64     `json:"tree_cpu_roots,omitempty"`
+	Sources      []sourceStat `json:"sources"`
 	// BinaryVersion is the version of the binary running this daemon, as `governor version`
 	// reports it. Additive like the governance fields below, and for the same reason: an
 	// older reader ignores what it does not know.
@@ -311,6 +356,25 @@ type daemon struct {
 	machineSeen []signals.LiveSession
 	machineErr  error
 	machineHook time.Time
+
+	// sampler reads this host's load. It is nil unless something wired one in, and a nil
+	// sampler means the daemon reports every signal as null rather than as zero.
+	//
+	// Nil by default for the same reason liveSessions defaults to noLiveSessions, and the
+	// reason is recorded there in full: a default that reaches for the real machine does not
+	// fail in a test, it quietly measures the runner. A sampler is worse than the session
+	// registry in that respect — it walks the entire process table — so runDaemon wires it
+	// and nothing else does.
+	sampler signals.Sampler
+	// signalsMu guards the latest reading and the average below. The sampling goroutine is
+	// the only writer; every status call is a reader.
+	signalsMu sync.Mutex
+	latest    signals.Sample
+	latestOK  bool
+	// cpuAvg is the 5 s EWMA of CPU utilisation from design.md section 5.1. It is kept here
+	// rather than in the Sample because an average is a property of the series, not of any
+	// one reading in it.
+	cpuAvg *signals.EWMA
 }
 
 // machineTTL is how long the daemon reuses its reading of this host's live sessions.
@@ -564,6 +628,7 @@ func noLiveSessions() ([]signals.LiveSession, error) { return nil, signals.ErrNo
 func (d *daemon) observeThisMachine() {
 	d.liveSessions = func() ([]signals.LiveSession, error) { return signals.LiveSessions("") }
 	d.hooksInstalledAt = gateHooksInstalledAt
+	d.sampler = signals.NewSamplerEvery(treeInterval)
 }
 
 // serve accepts connections until ctx is cancelled, reaping leases on a ticker throughout.
@@ -582,6 +647,12 @@ func (d *daemon) serve(ctx context.Context, ln net.Listener) {
 	go func() {
 		defer wg.Done()
 		d.reap(ctx)
+	}()
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		d.sample(ctx)
 	}()
 
 	for {
@@ -606,6 +677,66 @@ func (d *daemon) serve(ctx context.Context, ln net.Listener) {
 		}()
 	}
 	wg.Wait()
+}
+
+// sampleInterval is the daemon's tick, and treeInterval is how often the tick includes the
+// process-tree walk.
+//
+// One second is design.md section 5.1's rate and the rate the control loop will read. Five
+// seconds for the tree is what keeps the whole thing affordable: the walk is 23.0 ms of CPU
+// against 1-2 ms for everything else, measured over 46 hours of the Phase 0 sampler at 2.30%
+// of one core. Refreshing it every fifth tick averages ~0.6% of a core, under GOV-12's bar,
+// and costs the v1 loop nothing because section 5.1 lists per-agent tree cost as a Phase 2
+// refinement — the signals the loop acts on are the cheap ones and still tick every second.
+const (
+	sampleInterval = time.Second
+	treeInterval   = 5 * time.Second
+)
+
+// sample reads the host until ctx is cancelled, and does nothing else with what it reads.
+//
+// Nothing acts on these numbers. That is GOV-12's first trap and it is load-bearing: the
+// budget is a fixed semaphore for as long as the dogfooding week is measuring it, and a
+// sampler that quietly fed the allocator would change the artefact under observation. This
+// goroutine writes to d.latest and d.cpuAvg and touches nothing else — no lease, no source,
+// no budget. GOV-14 is where that changes, and GOV-14 is blocked until the week closes.
+func (d *daemon) sample(ctx context.Context) {
+	if d.sampler == nil {
+		return
+	}
+	t := time.NewTicker(sampleInterval)
+	defer t.Stop()
+
+	// The first reading is a priming read — NewSampler's contract says CPU and every
+	// process-tree rate come back zero because they are differences against a tick that does
+	// not exist yet. Taking it here and discarding it means the first sample a status call
+	// can see is a real one, rather than a row of false zeroes that reads as an idle machine.
+	if _, err := d.sampler.Sample(ctx); err != nil {
+		fmt.Fprintf(d.diag, "governor daemon: priming sample: %v\n", err)
+	}
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			s, err := d.sampler.Sample(ctx)
+			if err != nil {
+				// A failed reading is not a reason to stop sampling, and not a reason to
+				// overwrite a good reading with a blank one. The previous sample stands and
+				// the next tick tries again.
+				fmt.Fprintf(d.diag, "governor daemon: sample: %v\n", err)
+				continue
+			}
+			d.signalsMu.Lock()
+			d.latest, d.latestOK = s, true
+			if d.cpuAvg == nil {
+				d.cpuAvg = signals.NewEWMA(signals.DefaultCPUWindow)
+			}
+			d.cpuAvg.Update(s.CPU, time.Now())
+			d.signalsMu.Unlock()
+		}
+	}
 }
 
 // reap collects expired and orphaned leases until ctx is cancelled.
@@ -1011,12 +1142,10 @@ func (d *daemon) status() statusReply {
 	if !hookAt.IsZero() {
 		hooks = hookAt.UTC().Format(time.RFC3339)
 	}
-	return statusReply{
+	out := statusReply{
 		V: d.speaks, Budget: limit, InUse: snap.InUse,
 		// Parked acquires, from the FIFO of design.md section 6.2.
-		Waiting: d.waits.len(),
-		// Null until the daemon has a sampler (GOV-12). Zero would read as an idle machine.
-		CPU:            nil,
+		Waiting:        d.waits.len(),
 		BinaryVersion:  binaryVersion,
 		Thermal:        d.thermal(),
 		Sources:        sources,
@@ -1025,6 +1154,45 @@ func (d *daemon) status() statusReply {
 		SessionsKnown:  known,
 		Sessions:       sessions,
 	}
+	d.fillSignals(&out)
+	return out
+}
+
+// fillSignals copies the latest reading into a status reply, or leaves every signal null.
+//
+// Null is the whole point of the separation. A daemon with no sampler wired, or one whose
+// first tick has not landed, has measured nothing — and every field here stays absent rather
+// than defaulting to a zero that reads as a quiet, idle machine. That distinction is why
+// these are pointers and why this is a method rather than four lines inline.
+func (d *daemon) fillSignals(out *statusReply) {
+	d.signalsMu.Lock()
+	defer d.signalsMu.Unlock()
+	if !d.latestOK {
+		return
+	}
+	s := d.latest
+
+	if d.cpuAvg != nil {
+		if avg, primed := d.cpuAvg.Value(); primed {
+			out.CPU = &avg
+		}
+	}
+	instant := s.CPU
+	runQueue := s.RunQueue
+	capacity := s.CPUCapacity
+	memAvail := s.MemAvailableBytes
+	swapIn := s.SwapInBytesPerSec
+	treeCPU := s.Tree.CPU
+	treeRoots := s.Tree.CPURoots
+
+	out.CPUInstant = &instant
+	out.RunQueue = &runQueue
+	out.CPUCapacity = &capacity
+	out.CPUCapacitySource = s.CPUCapacitySource
+	out.MemAvailableBytes = &memAvail
+	out.SwapInBytesPerSec = &swapIn
+	out.TreeCPU = &treeCPU
+	out.TreeCPURoots = &treeRoots
 }
 
 // sourceName names the binding source for the "source" wire field. With one source it is

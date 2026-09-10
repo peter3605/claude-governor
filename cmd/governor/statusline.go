@@ -92,9 +92,13 @@ type statusResponse struct {
 	Budget  int `json:"budget"`
 	InUse   int `json:"in_use"`
 	Waiting int `json:"waiting"`
-	// CPU is a pointer because the daemon has no sampler until GOV-12 and sends null
-	// rather than a fabricated 0.0. Null means "not measured"; rendering it as "cpu 0%"
-	// would tell the reader the machine is idle, which is a claim and not a reading.
+	// CPU is a pointer because the daemon sends null when it has not measured, rather than
+	// a fabricated 0.0. Null means "not measured"; rendering it as "cpu 0%" would tell the
+	// reader the machine is idle, which is a claim and not a reading.
+	//
+	// GOV-12 gave the daemon a sampler, so this is now populated on any daemon that has run
+	// a tick — but null is still the honest answer before the first one lands, and on a
+	// daemon started without one.
 	CPU     *float64        `json:"cpu"`
 	Thermal signals.Thermal `json:"thermal"`
 	Sources []sourceStat    `json:"sources"`
@@ -275,8 +279,8 @@ func view(c cachedStatus, session string) statusView {
 // slot count. Every clause after the first is conditional, for the same reason the gate's
 // deny text is — a clause that states a fact the daemon did not send is a fabrication, and
 // on a surface a person reads continuously a fabricated number is worse than a missing one.
-// CPU is null until GOV-12 lands the sampler and thermal is "unknown" on every Linux host
-// by design, so both of those omissions are the normal case rather than the error case.
+// CPU is null until the daemon's first sample lands, and thermal is "unknown" on every Linux
+// host by design, so both of those omissions are ordinary rather than errors.
 func render(v statusView, width int) string {
 	if !v.OK {
 		// Says so rather than erroring. The line is the only channel this command has, so
