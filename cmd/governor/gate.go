@@ -252,22 +252,25 @@ var refusalsThisVersionHonours = map[string]bool{"capacity": true, "depth": true
 const waitingReason = "waiting"
 
 func runGate(_ []string, stdout, stderr io.Writer) int {
-	return gate(os.Stdin, stdout, stderr, transport.Dial{}, gateBudget)
+	return gate(os.Stdin, stdout, stderr, transport.Dial{}, gateBudget, protocolVersion)
 }
 
 // gate is the whole hook body. It returns the process exit code, which is always 0 — even
 // for a refusal, which is carried on stdout rather than in the exit status
 // (docs/hook-surface.md section 10.2).
-func gate(stdin io.Reader, stdout, stderr io.Writer, dialer transport.Dialer, budget time.Duration) int {
+// speaks is the protocol version this gate talks, threaded rather than read from the
+// constant so a test can run a gate of one version against a daemon of another — which is
+// what every upgrade is, and the one path that must fail open rather than stall.
+func gate(stdin io.Reader, stdout, stderr io.Writer, dialer transport.Dialer, budget time.Duration, speaks int) int {
 	return withBudget(stderr, budget, func(diag io.Writer, clock *budgetClock) {
-		gateOnce(stdin, stdout, diag, dialer, clock)
+		gateOnce(stdin, stdout, diag, dialer, clock, speaks)
 	})
 }
 
 // gateOnce asks the daemon for a lease and acts on the answer. Every error it can produce
 // means the same thing to the caller — fail open — so they are reported to stderr and
 // otherwise swallowed.
-func gateOnce(stdin io.Reader, stdout, diag io.Writer, dialer transport.Dialer, clock *budgetClock) {
+func gateOnce(stdin io.Reader, stdout, diag io.Writer, dialer transport.Dialer, clock *budgetClock, speaks int) {
 	var p hookPayload
 	if !decodePayload(stdin, diag, &p) {
 		return
@@ -280,7 +283,7 @@ func gateOnce(stdin io.Reader, stdout, diag io.Writer, dialer transport.Dialer, 
 		return
 	}
 
-	conn, replies, err := dialAndSend(dialer, clock.Deadline(), acquireRequestFor(p))
+	conn, replies, err := dialAndSend(dialer, clock.Deadline(), acquireRequestFor(p, speaks))
 	if err != nil {
 		fmt.Fprintf(diag, "governor gate: %v\n", err)
 		if errors.Is(err, errNoDaemon) {
@@ -299,18 +302,18 @@ func gateOnce(stdin io.Reader, stdout, diag io.Writer, dialer transport.Dialer, 
 		return
 	}
 
-	if resp.V != protocolVersion {
+	if resp.V != speaks {
 		// A version mismatch is answered, not ignored — but the gate treats the answer
 		// exactly as it treats an unreachable daemon. During an upgrade there will be a
 		// daemon of one version and gates of another, and ungoverned spawns are acceptable
 		// where a stalled session is not.
 		fmt.Fprintf(diag, "governor gate: daemon speaks protocol v%d, this binary speaks v%d: failing open\n",
-			resp.V, protocolVersion)
+			resp.V, speaks)
 		return
 	}
 
 	if !resp.OK && resp.Reason == waitingReason {
-		if !awaitParked(diag, conn, replies, clock, &resp) {
+		if !awaitParked(diag, conn, replies, clock, &resp, speaks) {
 			return
 		}
 	}
@@ -359,7 +362,7 @@ func gateOnce(stdin io.Reader, stdout, diag io.Writer, dialer transport.Dialer, 
 //
 // The wait is bounded by what the gate is willing to give, not by what the daemon asks for:
 // a daemon that answers "waiting, 10 minutes" gets gateWaitMax and no more.
-func awaitParked(diag io.Writer, conn net.Conn, replies *bufio.Reader, clock *budgetClock, resp *acquireResponse) bool {
+func awaitParked(diag io.Writer, conn net.Conn, replies *bufio.Reader, clock *budgetClock, resp *acquireResponse, speaks int) bool {
 	wait := gateWaitMax
 	if promised := time.Duration(resp.WaitMS) * time.Millisecond; promised > 0 && promised < wait {
 		wait = promised
@@ -382,9 +385,9 @@ func awaitParked(diag io.Writer, conn net.Conn, replies *bufio.Reader, clock *bu
 		fmt.Fprintf(diag, "governor gate: read parked response: %v: failing open\n", err)
 		return false
 	}
-	if resp.V != protocolVersion {
+	if resp.V != speaks {
 		fmt.Fprintf(diag, "governor gate: parked reply speaks protocol v%d, this binary speaks v%d: failing open\n",
-			resp.V, protocolVersion)
+			resp.V, speaks)
 		return false
 	}
 	if !resp.OK && resp.Reason == waitingReason {
@@ -454,13 +457,13 @@ func escalation(denials int) string {
 }
 
 // acquireRequestFor builds the wire request from the hook payload.
-func acquireRequestFor(p hookPayload) acquireRequest {
+func acquireRequestFor(p hookPayload, speaks int) acquireRequest {
 	depth := 0
 	if p.AgentID != "" {
 		depth = 1
 	}
 	return acquireRequest{
-		V:         protocolVersion,
+		V:         speaks,
 		Op:        "acquire",
 		Principal: localPrincipal(),
 		Session:   p.SessionID,

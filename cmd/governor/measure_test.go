@@ -57,7 +57,7 @@ func TestMeasureGrantRoundTrip(t *testing.T) {
 
 		var stdout, stderr bytes.Buffer
 		start := time.Now()
-		code := gate(strings.NewReader(payload), &stdout, &stderr, transport.Dial{}, gateBudget)
+		code := gate(strings.NewReader(payload), &stdout, &stderr, transport.Dial{}, gateBudget, protocolVersion)
 		elapsed := time.Since(start)
 
 		if code != 0 || stdout.Len() != 0 {

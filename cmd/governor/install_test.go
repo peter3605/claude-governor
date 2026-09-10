@@ -886,6 +886,15 @@ func TestUninstallLeavesTheTraceBackupsAlone(t *testing.T) {
 // Driving the real binary is also the stronger evidence, and it is what GOV-10 and GOV-20
 // did for the same reason: an installer is a claim about what happens on a machine, and an
 // in-process call proves it about a function.
+// stagedEnv is the environment that points a governor process at a staged home.
+func stagedEnv(p paths) []string {
+	return append(os.Environ(),
+		"HOME="+p.home,
+		stateDirEnvForTest+"="+p.state,
+		endpointEnvForTest+"=unix://"+filepath.Join(p.state, "sock"),
+	)
+}
+
 // originalHome is the real home directory, captured before any test can stage another one.
 var originalHome = os.Getenv("HOME")
 
@@ -904,15 +913,7 @@ func realGovernor(t *testing.T) string {
 			return
 		}
 		realGovernorPath = filepath.Join(dir, "governor")
-		cmd := exec.Command("go", "build", "-o", realGovernorPath, ".")
-		// HOME explicitly, because stagedHome has already pointed the process's HOME at a
-		// temp directory by the time the first test asks for a binary. Left inherited, the
-		// Go toolchain would put its module cache under that directory, write it read-only,
-		// and the test's own cleanup would then fail to remove it.
-		cmd.Env = append(os.Environ(), "HOME="+originalHome)
-		if out, err := cmd.CombinedOutput(); err != nil {
-			realGovernorErr = fmt.Errorf("go build: %v\n%s", err, out)
-		}
+		realGovernorErr = goBuildGovernor(realGovernorPath)
 	})
 	if realGovernorErr != nil {
 		t.Fatalf("build governor: %v", realGovernorErr)
@@ -920,15 +921,42 @@ func realGovernor(t *testing.T) string {
 	return realGovernorPath
 }
 
+// buildGovernorTo builds the binary to out with extra `go build` flags, for a test that needs
+// one built differently — a release-style version stamp, say.
+func buildGovernorTo(t *testing.T, out string, extra ...string) {
+	t.Helper()
+	if err := goBuildGovernor(out, extra...); err != nil {
+		t.Fatalf("build governor: %v", err)
+	}
+}
+
+func goBuildGovernor(out string, extra ...string) error {
+	args := append([]string{"build"}, extra...)
+	args = append(args, "-o", out, ".")
+	cmd := exec.Command("go", args...)
+	// HOME explicitly, because stagedHome has already pointed the process's HOME at a
+	// temp directory by the time the first test asks for a binary. Left inherited, the
+	// Go toolchain would put its module cache under that directory, write it read-only,
+	// and the test's own cleanup would then fail to remove it.
+	cmd.Env = append(os.Environ(), "HOME="+originalHome)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("go build: %v\n%s", err, out)
+	}
+	return nil
+}
+
 // runReal runs the shipped binary against a staged home, as a real subprocess.
 func runReal(t *testing.T, p paths, args ...string) (int, string, string) {
 	t.Helper()
-	cmd := exec.Command(realGovernor(t), args...)
-	cmd.Env = append(os.Environ(),
-		"HOME="+p.home,
-		stateDirEnvForTest+"="+p.state,
-		endpointEnvForTest+"=unix://"+filepath.Join(p.state, "sock"),
-	)
+	return runRealBinary(t, realGovernor(t), p, args...)
+}
+
+// runRealBinary is runReal for a nominated binary, so an upgrade can be staged by running a
+// differently built governor against a home the current one installed into.
+func runRealBinary(t *testing.T, binary string, p paths, args ...string) (int, string, string) {
+	t.Helper()
+	cmd := exec.Command(binary, args...)
+	cmd.Env = stagedEnv(p)
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr

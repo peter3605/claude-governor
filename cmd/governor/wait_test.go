@@ -86,7 +86,7 @@ func TestAnUnkeptPromiseToAnswerFailsOpen(t *testing.T) {
 
 	var stdout, stderr strings.Builder
 	start := time.Now()
-	code := gate(strings.NewReader(samplePayload), &stdout, &stderr, transport.Dial{}, gateBudget)
+	code := gate(strings.NewReader(samplePayload), &stdout, &stderr, transport.Dial{}, gateBudget, protocolVersion)
 	elapsed := time.Since(start)
 
 	if code != 0 {
@@ -117,7 +117,7 @@ func TestTheGateWillNotBeParkedTwice(t *testing.T) {
 
 	var stdout, stderr strings.Builder
 	start := time.Now()
-	gate(strings.NewReader(samplePayload), &stdout, &stderr, transport.Dial{}, gateBudget)
+	gate(strings.NewReader(samplePayload), &stdout, &stderr, transport.Dial{}, gateBudget, protocolVersion)
 	elapsed := time.Since(start)
 
 	if stdout.Len() != 0 {
@@ -418,7 +418,7 @@ func TestNestedFanOutIsRefusedOutright(t *testing.T) {
 	t.Setenv(transport.EndpointEnv, endpoint)
 	var stdout, stderr strings.Builder
 	start := time.Now()
-	code := gate(strings.NewReader(nested), &stdout, &stderr, transport.Dial{}, gateBudget)
+	code := gate(strings.NewReader(nested), &stdout, &stderr, transport.Dial{}, gateBudget, protocolVersion)
 	elapsed := time.Since(start)
 
 	if code != 0 {

@@ -74,7 +74,7 @@ func askGate(t *testing.T, endpoint, session, toolUseID string) bool {
 
 	var stdout, stderr bytes.Buffer
 	code := gate(strings.NewReader(preToolUsePayload(session, toolUseID)),
-		&stdout, &stderr, transport.Dial{}, gateBudget)
+		&stdout, &stderr, transport.Dial{}, gateBudget, protocolVersion)
 	if code != 0 {
 		t.Fatalf("gate exit code = %d, want 0 (stderr: %s)", code, stderr.String())
 	}

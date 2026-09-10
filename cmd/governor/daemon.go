@@ -204,6 +204,16 @@ type statusReply struct {
 	CPU     *float64        `json:"cpu"`
 	Thermal signals.Thermal `json:"thermal"`
 	Sources []sourceStat    `json:"sources"`
+	// BinaryVersion is the version of the binary running this daemon, as `governor version`
+	// reports it. Additive like the governance fields below, and for the same reason: an
+	// older reader ignores what it does not know.
+	//
+	// It exists because until GOV-24 nothing could tell WHICH governor was holding the
+	// socket. The protocol "v" answers a narrower question — two builds can speak v1 and
+	// still be different binaries — so an upgrade that changed behaviour without changing the
+	// wire format left `install` no way to see that the daemon was stale. `install` reads
+	// this to decide whether the running daemon is the one it just wrote.
+	BinaryVersion string `json:"binary_version,omitempty"`
 	// DaemonStarted is when this daemon came up, RFC3339. See daemon.started.
 	DaemonStarted string `json:"daemon_started,omitempty"`
 	// HooksInstalled is the mtime of the gate's hooks file, RFC3339, empty when there is no
@@ -256,6 +266,19 @@ const maxRequest = 64 << 10
 // daemon is the broker. Everything it owns is either immutable or internally synchronised,
 // so a handler needs no lock of its own.
 type daemon struct {
+	// speaks is the protocol version this daemon serves: the "v" it stamps on every reply
+	// and the only "v" it accepts on a request (design.md section 7).
+	//
+	// It is a field rather than a read of the protocolVersion constant so that a test can
+	// stand up a daemon of ANOTHER version beside a gate of this one and drive the mismatch
+	// for real. That matters more than it looks: an upgrade is precisely a live daemon of one
+	// version meeting gates of another, and the only way to know that path fails open rather
+	// than stalling is to run both halves at once. A canned reply line proves the gate can
+	// parse a rejection; it cannot prove the daemon produces one.
+	//
+	// Nothing outside a test ever sets it — newDaemonWithLeases defaults it to
+	// protocolVersion and no command-line flag reaches it.
+	speaks  int
 	table   *lease.Table
 	sources []budget.Source
 	thermal func() signals.Thermal
@@ -511,6 +534,7 @@ func newDaemonWithLeases(limit int, diag io.Writer, opt lease.Options) *daemon {
 	}
 	table := lease.NewTable(opt)
 	return &daemon{
+		speaks:           protocolVersion,
 		table:            table,
 		sources:          []budget.Source{budget.LocalSource{N: limit, InUse: table.InUse}},
 		thermal:          signals.ReadThermal,
@@ -681,8 +705,8 @@ func (d *daemon) dispatch(req request) any {
 	// an upgrade there will be a daemon of one version and gates of another; the gate treats
 	// this reply exactly as it treats an unreachable daemon and fails open, so an upgrade
 	// costs ungoverned spawns rather than a stalled session.
-	if req.V != protocolVersion {
-		return versionReply{V: protocolVersion, Reason: "unsupported_version", Supported: []int{protocolVersion}}
+	if req.V != d.speaks {
+		return versionReply{V: d.speaks, Reason: "unsupported_version", Supported: []int{d.speaks}}
 	}
 	switch req.Op {
 	case "acquire":
@@ -696,7 +720,7 @@ func (d *daemon) dispatch(req request) any {
 	case "status":
 		return d.status()
 	default:
-		return ackReply{V: protocolVersion, Reason: "unknown_op", InUse: d.table.InUse()}
+		return ackReply{V: d.speaks, Reason: "unknown_op", InUse: d.table.InUse()}
 	}
 }
 
@@ -722,7 +746,7 @@ func (d *daemon) acquire(req request) any {
 	if req.Depth > maxFanOutDepth {
 		d.event("deny session=%s reason=depth", req.Session)
 		return refuseReply{
-			V: protocolVersion, Reason: "depth",
+			V: d.speaks, Reason: "depth",
 			Budget: limit, InUse: d.table.InUse(), Source: src,
 			CPU: nil, Thermal: d.thermal(),
 		}
@@ -763,7 +787,7 @@ func (d *daemon) acquire(req request) any {
 
 	return &parkedAcquire{
 		interim: waitingReply{
-			V: protocolVersion, Reason: "waiting",
+			V: d.speaks, Reason: "waiting",
 			WaitMS: int(wait / time.Millisecond),
 			Budget: limit, InUse: d.table.InUse(),
 		},
@@ -802,7 +826,7 @@ func (d *daemon) granted(l lease.Lease, limit int, src string) grantReply {
 	inUse := d.table.InUse()
 	d.notePeak(inUse, limit)
 	return grantReply{
-		V: protocolVersion, OK: true, Lease: l.ID,
+		V: d.speaks, OK: true, Lease: l.ID,
 		Budget: limit, InUse: inUse,
 		// v1's allocation policy is "no division": there is no max-min fair share and no
 		// wait queue yet (design.md section 6.1, 6.2), so a session's share is the whole
@@ -822,7 +846,7 @@ func (d *daemon) granted(l lease.Lease, limit int, src string) grantReply {
 // shouted at on its next refusal.
 func (d *daemon) refuseForCapacity(session string, limit int, src string) refuseReply {
 	r := refuseReply{
-		V: protocolVersion, Reason: "capacity",
+		V: d.speaks, Reason: "capacity",
 		Budget: limit, InUse: d.table.InUse(), Source: src,
 		CPU: nil, Thermal: d.thermal(),
 		Denials: d.denials.record(session),
@@ -871,9 +895,9 @@ func (d *daemon) confirm(req request) any {
 	if !ok {
 		// Not an error. A resumed subagent reaches the CPU with no PreToolUse at all
 		// (design.md section 4.3), so there is nothing to bind and v1 does not govern it.
-		return ackReply{V: protocolVersion, Reason: "no_pending_lease", InUse: d.table.InUse()}
+		return ackReply{V: d.speaks, Reason: "no_pending_lease", InUse: d.table.InUse()}
 	}
-	return ackReply{V: protocolVersion, OK: true, Lease: l.ID, InUse: d.table.InUse()}
+	return ackReply{V: d.speaks, OK: true, Lease: l.ID, InUse: d.table.InUse()}
 }
 
 // release returns a lease to the pool.
@@ -885,7 +909,7 @@ func (d *daemon) release(req request) any {
 		// The slot that just came free belongs to whoever has waited longest for it.
 		d.pump()
 	}
-	r := ackReply{V: protocolVersion, OK: ok, InUse: d.table.InUse()}
+	r := ackReply{V: d.speaks, OK: ok, InUse: d.table.InUse()}
 	if !ok {
 		r.Reason = "no_lease"
 	}
@@ -903,7 +927,7 @@ func (d *daemon) session(req request) any {
 		d.table.StartSession(lease.Session{
 			ID: req.Session, PID: req.PID, PIDStarted: started, Weight: req.Weight,
 		})
-		return ackReply{V: protocolVersion, OK: true, InUse: d.table.InUse()}
+		return ackReply{V: d.speaks, OK: true, InUse: d.table.InUse()}
 	case "end":
 		// SessionEnd is what stops a dead session's leases from waiting out their TTL.
 		n := d.table.ReleaseSession(req.Session)
@@ -911,9 +935,9 @@ func (d *daemon) session(req request) any {
 		if n > 0 {
 			d.pump()
 		}
-		return ackReply{V: protocolVersion, OK: true, InUse: d.table.InUse()}
+		return ackReply{V: d.speaks, OK: true, InUse: d.table.InUse()}
 	default:
-		return ackReply{V: protocolVersion, Reason: "unknown_action", InUse: d.table.InUse()}
+		return ackReply{V: d.speaks, Reason: "unknown_action", InUse: d.table.InUse()}
 	}
 }
 
@@ -988,11 +1012,12 @@ func (d *daemon) status() statusReply {
 		hooks = hookAt.UTC().Format(time.RFC3339)
 	}
 	return statusReply{
-		V: protocolVersion, Budget: limit, InUse: snap.InUse,
+		V: d.speaks, Budget: limit, InUse: snap.InUse,
 		// Parked acquires, from the FIFO of design.md section 6.2.
 		Waiting: d.waits.len(),
 		// Null until the daemon has a sampler (GOV-12). Zero would read as an idle machine.
 		CPU:            nil,
+		BinaryVersion:  binaryVersion,
 		Thermal:        d.thermal(),
 		Sources:        sources,
 		DaemonStarted:  d.started.UTC().Format(time.RFC3339),

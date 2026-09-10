@@ -1,7 +1,9 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/json"
 	"errors"
@@ -260,6 +262,13 @@ type installer struct {
 	// a backup written on a no-op run is a file the second run left behind, which is
 	// exactly the idempotency failure this command is tested against.
 	changed bool
+	// binaryReplaced is whether this run renamed a NEW binary over the installed one.
+	//
+	// It is what tells an upgrade from a re-install, and it is taken from the digest rather
+	// than from a version string on purpose: two development builds both call themselves
+	// 0.0.0-dev and compare equal, so a version check alone would leave the old daemon
+	// running for exactly the audience most likely to be upgrading — the person building it.
+	binaryReplaced bool
 }
 
 func (in *installer) record(path, action, comment string) {
@@ -380,7 +389,7 @@ func runInstall(args []string, stdout, stderr io.Writer) int {
 	if *noDaemon {
 		fmt.Fprintln(stdout, "\ndaemon not started (--no-daemon)")
 	} else {
-		startDaemon(p, stdout, stderr)
+		startDaemon(p, in.binaryReplaced, stdout, stderr)
 	}
 
 	fmt.Fprintln(stdout, "\nRemove it with: governor uninstall")
@@ -557,6 +566,10 @@ func (in *installer) installBinary(self string) error {
 	if err := os.Rename(name, in.p.binary); err != nil {
 		return fmt.Errorf("install binary: %w", err)
 	}
+	// A new binary is on disk, so any daemon still running is the OLD one. The rename left
+	// it on the old inode by design (section 13.4) — it keeps running, correctly signed, and
+	// keeps the socket. Replacing it is startDaemon's job and this is how it is told.
+	in.binaryReplaced = true
 	in.record(in.p.binary, "created", "copy of "+self)
 	return nil
 }
@@ -624,21 +637,62 @@ func (in *installer) report(w io.Writer, verb string) {
 	}
 }
 
-// startDaemon starts the daemon unless one is already answering.
+// startDaemon brings up a daemon of THIS binary, replacing a stale one if it has to.
 //
 // A failure to start is reported and is NOT fatal to the install. Every hook fails open
 // against an unreachable daemon (invariant 8), so the machine is ungoverned rather than
 // broken, and telling someone their install failed when the files are correctly in place
 // would send them to undo the wrong thing. doctor is what reports it afterwards.
-func startDaemon(p paths, stdout, stderr io.Writer) {
+//
+// THE REPLACE PATH IS THE UPGRADE PATH, and leaving it out is how an upgrade half-lands.
+// section 13.4 requires the new binary to arrive by rename(2), which deliberately leaves the
+// running daemon on the old inode — so after an upgrade the process holding the socket is
+// still the old one, and it stays that way until something stops it. If that daemon speaks a
+// different protocol version, every gate on the machine then fails open for as long as it
+// lives: ungoverned, silently, with a correct-looking install behind it.
+//
+// So "a daemon is answering" is not the question. The question is whether the daemon
+// answering is THIS one, and there are two independent ways to be sure it is not: install
+// just wrote a new binary (replaced), or the daemon says it is something else (inspect).
+// Neither subsumes the other — the digest catches an upgrade between two builds that call
+// themselves the same version, and the interrogation catches a stale daemon left behind by
+// an EARLIER install, where the binary on disk is already correct and unchanged.
+//
+// Idempotency survives this. A second install of the same binary finds a daemon that matches
+// on both counts and leaves it alone, which is what TestInstallTwiceChangesNothingTheSecondTime
+// requires: replacing a healthy daemon would drop every live lease for no reason.
+func startDaemon(p paths, replaced bool, stdout, stderr io.Writer) {
 	endpoint, err := transport.DefaultEndpoint()
 	if err != nil {
 		fmt.Fprintf(stderr, "governor install: resolve endpoint: %v\n", err)
 		return
 	}
 	if daemonAnswers(endpoint) {
-		fmt.Fprintf(stdout, "\ndaemon already running on %s\n", endpoint)
-		return
+		state := inspectDaemon(endpoint)
+		if !replaced && state.current {
+			fmt.Fprintf(stdout, "\ndaemon already running on %s\n", endpoint)
+			return
+		}
+		why := state.why
+		if replaced {
+			// The digest is the stronger evidence and it is worth saying so: it is true even
+			// when the daemon reports the very same version this binary does.
+			why = "a new binary was installed"
+		}
+		fmt.Fprintf(stdout, "\nreplacing the running daemon on %s (%s)\n", endpoint, why)
+		// In-flight leases are lost, and that is correct rather than merely tolerable: a
+		// lease is a reservation, not a resource the agent holds, so no running agent is
+		// harmed by losing one. The reaper collects what the restart orphans, and every gate
+		// that meets the gap fails open.
+		stopDaemon(p, "install", stdout, stderr)
+		if daemonAnswers(endpoint) {
+			// It would not let go. Starting a second daemon now would either fail to bind or,
+			// worse, race the old one for the socket — so this stops and says so, leaving a
+			// working older daemon in place rather than two half-bound ones.
+			fmt.Fprintf(stderr, "governor install: the daemon on %s did not stop; "+
+				"the old version is still running. Stop it by hand and re-run: governor install\n", endpoint)
+			return
+		}
 	}
 	if err := os.MkdirAll(p.state, 0o700); err != nil {
 		fmt.Fprintf(stderr, "governor install: create %s: %v\n", p.state, err)
@@ -680,6 +734,76 @@ func startDaemon(p paths, stdout, stderr io.Writer) {
 		endpoint, daemonStartTimeout, logPath)
 }
 
+// daemonState is what install could learn about the daemon holding the socket.
+type daemonState struct {
+	// current is true only on positive proof that the daemon is this binary at this
+	// protocol version. Every uncertainty resolves to false.
+	current bool
+	// why states what it is instead, in the words the install report prints. Empty when
+	// current.
+	why string
+}
+
+// inspectDaemon asks the daemon on the endpoint what it is.
+//
+// It fails toward "not current" in every ambiguous case, which is the opposite of the
+// direction the gate fails and is right for the same underlying reason. The gate's mistake
+// costs an ungoverned spawn; this one costs a daemon restart, and a restart is cheap — it
+// drops reservations, not work. Guessing the other way leaves a stale daemon on the socket
+// for the rest of its life, which is the defect this whole path exists to close.
+func inspectDaemon(endpoint string) daemonState {
+	ctx, cancel := context.WithTimeout(context.Background(), daemonInspectTimeout)
+	defer cancel()
+
+	conn, err := transport.Dial{}.Dial(ctx, endpoint)
+	if err != nil {
+		return daemonState{why: "it is not answering"}
+	}
+	defer conn.Close()
+	_ = conn.SetDeadline(time.Now().Add(daemonInspectTimeout))
+
+	req, err := json.Marshal(statusRequest{V: protocolVersion, Op: "status", Principal: localPrincipal()})
+	if err != nil {
+		return daemonState{why: "its version could not be read"}
+	}
+	if _, err := conn.Write(append(req, '\n')); err != nil {
+		return daemonState{why: "its version could not be read"}
+	}
+
+	line, err := bufio.NewReader(conn).ReadString('\n')
+	if err != nil {
+		return daemonState{why: "it did not answer a status request"}
+	}
+	var reply struct {
+		V             int    `json:"v"`
+		Reason        string `json:"reason"`
+		BinaryVersion string `json:"binary_version"`
+	}
+	if err := json.Unmarshal([]byte(line), &reply); err != nil {
+		return daemonState{why: "its answer could not be parsed"}
+	}
+	if reply.V != protocolVersion || reply.Reason == "unsupported_version" {
+		// Either half of this is the upgrade case: a daemon of another version answers in
+		// its own "v", and one that recognises the mismatch says so outright.
+		return daemonState{why: fmt.Sprintf("it speaks protocol v%d, this binary speaks v%d", reply.V, protocolVersion)}
+	}
+	if reply.BinaryVersion == "" {
+		// No binary_version at all: a daemon older than the field itself, so certainly not
+		// this binary however its protocol compares.
+		return daemonState{why: "it predates this binary"}
+	}
+	if reply.BinaryVersion != binaryVersion {
+		return daemonState{why: fmt.Sprintf("it is version %s, this binary is %s", reply.BinaryVersion, binaryVersion)}
+	}
+	return daemonState{current: true}
+}
+
+// daemonInspectTimeout bounds the whole status exchange above.
+//
+// Short, because a daemon too busy to answer within it is one an install should replace
+// anyway, and because install must not hang on a wedged daemon any more than a gate must.
+const daemonInspectTimeout = 2 * time.Second
+
 // daemonAnswers reports whether something is listening on the endpoint.
 //
 // A connect and an immediate close. It does not ask for status: this is called in a poll
@@ -718,7 +842,7 @@ func runUninstall(args []string, stdout, stderr io.Writer) int {
 	// The daemon first. It holds the socket and would rewrite the pid file underneath the
 	// removal that follows, and a daemon left running after uninstall is the one piece of
 	// residue a user cannot see in a directory listing.
-	stopDaemon(p, stdout, stderr)
+	stopDaemon(p, "uninstall", stdout, stderr)
 
 	if err := un.restoreSettings(*keepBackup); err != nil {
 		fmt.Fprintf(stderr, "governor uninstall: %v\n", err)
@@ -923,7 +1047,7 @@ func (un *installer) removeStateFiles() {
 // SIGTERM rather than SIGKILL: the daemon installs a signal handler that closes the
 // listener and drains, and killing it outright would leave the socket file behind for the
 // next Listen to have to decide about.
-func stopDaemon(p paths, stdout, stderr io.Writer) {
+func stopDaemon(p paths, cmdName string, stdout, stderr io.Writer) {
 	endpoint, err := transport.DefaultEndpoint()
 	if err != nil {
 		return
@@ -933,7 +1057,7 @@ func stopDaemon(p paths, stdout, stderr io.Writer) {
 		if daemonAnswers(endpoint) {
 			// Something is on the socket and nothing says what it is. Reporting it is the
 			// honest answer; killing whatever holds a path is not.
-			fmt.Fprintf(stderr, "governor uninstall: a daemon is answering on %s but there is no pid file; stop it by hand\n", endpoint)
+			fmt.Fprintf(stderr, "governor %s: a daemon is answering on %s but there is no pid file; stop it by hand\n", cmdName, endpoint)
 		}
 		return
 	}
@@ -942,7 +1066,7 @@ func stopDaemon(p paths, stdout, stderr io.Writer) {
 			// Already gone; the pid file is stale and removeStateFiles collects it.
 			return
 		}
-		fmt.Fprintf(stderr, "governor uninstall: signal daemon %d: %v\n", pid, err)
+		fmt.Fprintf(stderr, "governor %s: signal daemon %d: %v\n", cmdName, pid, err)
 		return
 	}
 	deadline := time.Now().Add(daemonStopTimeout)
@@ -953,8 +1077,8 @@ func stopDaemon(p paths, stdout, stderr io.Writer) {
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
-	fmt.Fprintf(stderr, "governor uninstall: daemon %d did not exit within %s; stop it by hand\n",
-		pid, daemonStopTimeout)
+	fmt.Fprintf(stderr, "governor %s: daemon %d did not exit within %s; stop it by hand\n",
+		cmdName, pid, daemonStopTimeout)
 }
 
 // ---------------------------------------------------------------------------

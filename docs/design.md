@@ -642,7 +642,7 @@ per connection. Deliberately boring — this is a hot path.
 // -> status (statusline, doctor, /governor)
 {"v":1,"op":"status"}
 {"v":1,"budget":6,"in_use":4,"waiting":1,"cpu":0.61,"thermal":"nominal",
- "sources":[{"name":"local","budget":6}],"sessions":[...]}
+ "binary_version":"1.2.0","sources":[{"name":"local","budget":6}],"sessions":[...]}
 // -> advise (MCP request_agents)
 {"v":1,"op":"advise","session":"abc123","wanted":5}
 {"v":1,"granted":3,"wait_hint_ms":0,"reason":"..."}
@@ -651,6 +651,12 @@ per connection. Deliberately boring — this is a hot path.
 `source` and `sources` are plural because the budget is modelled as a *set* of sources
 reduced by `min()`, with exactly one entry in v1. That plural is the entire cost of the
 seam in section 12.
+
+`binary_version` is the build running the daemon, and it answers a question `v` cannot: two
+builds can both speak protocol v1 and still be different binaries. `governor install` reads
+it to tell a current daemon from a stale one (section 13.4). It is additive — an older
+reader ignores it — and it is absent from a daemon that predates it, which install reads as
+"not this binary" rather than as "unknown".
 
 The `waiting` line is the one message that is not the end of an exchange, and it is
 **compatible in both directions** — which is what let it be added without a version bump. A
@@ -1243,9 +1249,42 @@ hooks behind would pass the one check that exists to catch it.
 
 Every protocol message carries `"v"`. A daemon that does not support a gate's version replies
 `unsupported_version`, and the gate treats that reply exactly like an unreachable daemon: it
-fails open. This is what makes upgrade safe — during an upgrade there will be a live daemon
-of one version and gates of another, and the only acceptable outcome is ungoverned spawns,
-never a stalled session.
+fails open. A gate that cannot parse a reply at all does the same. The rejection is answered
+rather than ignored because silence costs every spawn its full budget before failing open,
+and it is never retried, because a version mismatch is permanent for the life of the daemon
+and a retry only moves the stall. This is what makes upgrade safe — during an upgrade there
+will be a live daemon of one version and gates of another, and the only acceptable outcome is
+ungoverned spawns, never a stalled session.
+
+**`install` replaces a daemon that is not this binary.** The rename above deliberately leaves
+the running daemon on the old inode, so immediately after an upgrade the process holding the
+socket is still the old one. If it were left there, a protocol change would make every gate on
+the machine fail open for as long as that process lived — silently, behind an install that
+looked complete. So install brings up a daemon of the binary it just wrote.
+
+It decides on two independent signals, and needs both:
+
+- **The digest.** Install already knows whether it renamed new bytes in, because it skips the
+  copy when the digests match. This is the only signal that catches an upgrade between two
+  builds that call themselves the same version — which is every development build, since they
+  all report `0.0.0-dev`.
+- **What the daemon says it is.** Install asks the running daemon for `status` and compares
+  `binary_version` and `v`. This is the only signal that catches a daemon left stale by an
+  *earlier* install, where the binary on disk is already correct and unchanged, so no number
+  of re-installs would ever copy anything again.
+
+A daemon matching on both is left alone: restarting a healthy one drops every live lease for
+nothing, and a second install of the same binary must remain a no-op. Every ambiguous answer
+— unparseable, silent, or from a daemon too old to carry `binary_version` — counts as *not*
+current, because a needless restart costs reservations while a missed one costs governance for
+the life of the process.
+
+In-flight leases are lost across the replacement, and that is correct rather than merely
+tolerated: a lease is a reservation, not something a running agent holds, so no agent is
+harmed. The reaper collects what the restart orphans. Gates firing in the window between the
+old daemon releasing the socket and the new one binding it find nothing listening and fail
+open on their own 100 ms budget — a spawn loses its governance, never a session its
+responsiveness.
 
 ### 13.5 Platforms
 
