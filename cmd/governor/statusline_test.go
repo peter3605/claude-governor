@@ -33,6 +33,9 @@ import (
 // failOpenCeiling. It is asserted over the failure modes and not only the happy path,
 // because a status line that is fast against a live daemon and slow against a dead one is
 // slow exactly when a person is most likely to be looking at it.
+//
+// It is asserted through timed, which discounts what a loaded runner cost rather than what
+// this command did. latency_test.go says why, and why the 70 is not the thing to raise.
 const statuslineCeiling = 70 * time.Millisecond
 
 // sampleStatusLinePayload is a real statusLine payload, from docs/hook-surface.md section
@@ -101,12 +104,13 @@ func runStatuslineFor(t *testing.T, endpoint, payload string, width int) string 
 	t.Setenv(transport.EndpointEnv, endpoint)
 
 	var stderr bytes.Buffer
-	start := time.Now()
-	line := statusline(strings.NewReader(payload), &stderr, transport.Dial{}, statuslineBudget, width)
-	elapsed := time.Since(start)
+	var line string
+	took := timed(func() {
+		line = statusline(strings.NewReader(payload), &stderr, transport.Dial{}, statuslineBudget, width)
+	})
 
-	if elapsed > statuslineCeiling {
-		t.Errorf("took %v, want under %v (stderr: %s)", elapsed.Round(time.Millisecond), statuslineCeiling, stderr.String())
+	if took.exceeds(statuslineCeiling) {
+		t.Errorf("took %v, want under %v (stderr: %s)", took, statuslineCeiling, stderr.String())
 	}
 	if line == "" {
 		t.Errorf("rendered an empty line; every failure must still say something")
@@ -455,12 +459,13 @@ func TestStatuslineSurvivesAStdinThatNeverCloses(t *testing.T) {
 	t.Setenv(transport.EndpointEnv, endpoint)
 
 	var stderr bytes.Buffer
-	start := time.Now()
-	line := statusline(blockingReader{}, &stderr, transport.Dial{}, statuslineBudget, 0)
-	elapsed := time.Since(start)
+	var line string
+	took := timed(func() {
+		line = statusline(blockingReader{}, &stderr, transport.Dial{}, statuslineBudget, 0)
+	})
 
-	if elapsed > statuslineCeiling {
-		t.Errorf("took %v, want under %v", elapsed.Round(time.Millisecond), statuslineCeiling)
+	if took.exceeds(statuslineCeiling) {
+		t.Errorf("took %v, want under %v", took, statuslineCeiling)
 	}
 	if line == "" {
 		t.Errorf("rendered nothing; the budget expiring must still produce a line")

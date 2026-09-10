@@ -8,7 +8,6 @@ import (
 	"strings"
 	"sync"
 	"testing"
-	"time"
 
 	"github.com/peter3605/claude-governor/internal/config"
 	"github.com/peter3605/claude-governor/internal/signals"
@@ -267,6 +266,9 @@ func boolKeys(m map[string]any) map[string]bool {
 // case, and a doubling nothing asserts is a doubling that keeps going. The lifecycle tests
 // drive lifecycleHook directly and so cannot see it — this is the only place the whole
 // subcommand is timed.
+//
+// It is asserted through timed, which discounts what a loaded runner cost rather than what
+// the subcommand did. latency_test.go says why, and why neither half is the thing to raise.
 const sessionStartCeiling = failOpenCeiling + firstRunNoticeBudget
 
 // `governor session start` exits 0 inside its ceiling with nothing listening.
@@ -294,15 +296,16 @@ func TestSessionStartFailsOpenInsideItsCeiling(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			tc.data(t)
 			var stdout, stderr bytes.Buffer
-			start := time.Now()
-			code := run([]string{"session", "start"}, &stdout, &stderr)
-			elapsed := time.Since(start)
+			var code int
+			took := timed(func() {
+				code = run([]string{"session", "start"}, &stdout, &stderr)
+			})
 
 			if code != 0 {
 				t.Errorf("exit code = %d, want 0 (stderr: %s)", code, stderr.String())
 			}
-			if elapsed > sessionStartCeiling {
-				t.Errorf("took %v, want under %v", elapsed.Round(time.Millisecond), sessionStartCeiling)
+			if took.exceeds(sessionStartCeiling) {
+				t.Errorf("took %v, want under %v", took, sessionStartCeiling)
 			}
 		})
 	}

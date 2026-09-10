@@ -85,9 +85,10 @@ func TestAnUnkeptPromiseToAnswerFailsOpen(t *testing.T) {
 	t.Setenv(transport.EndpointEnv, endpoint)
 
 	var stdout, stderr strings.Builder
-	start := time.Now()
-	code := gate(strings.NewReader(samplePayload), &stdout, &stderr, transport.Dial{}, gateBudget, protocolVersion)
-	elapsed := time.Since(start)
+	var code int
+	took := timed(func() {
+		code = gate(strings.NewReader(samplePayload), &stdout, &stderr, transport.Dial{}, gateBudget, protocolVersion)
+	})
 
 	if code != 0 {
 		t.Errorf("exit code = %d, want 0", code)
@@ -95,12 +96,14 @@ func TestAnUnkeptPromiseToAnswerFailsOpen(t *testing.T) {
 	if stdout.Len() != 0 {
 		t.Errorf("stdout = %q, want empty: an unanswered promise is a failure, and failures fail open", stdout.String())
 	}
-	if elapsed < 100*time.Millisecond {
-		t.Errorf("gave up after %v, before the wait it was promised", elapsed)
+	// The floor is asserted on the raw elapsed time and not on took.own(): a busy runner
+	// cannot make the gate give up sooner than it promised, so there is nothing to discount.
+	if took.elapsed < 100*time.Millisecond {
+		t.Errorf("gave up after %v, before the wait it was promised", took.elapsed)
 	}
-	if ceiling := 100*time.Millisecond + waitGrace + failOpenCeiling; elapsed > ceiling {
+	if ceiling := 100*time.Millisecond + waitGrace + failOpenCeiling; took.exceeds(ceiling) {
 		t.Errorf("took %v, want under %v: the wait is bounded by what the gate offered, not by the daemon",
-			elapsed.Round(time.Millisecond), ceiling)
+			took, ceiling)
 	}
 }
 
@@ -116,9 +119,9 @@ func TestTheGateWillNotBeParkedTwice(t *testing.T) {
 	t.Setenv(transport.EndpointEnv, endpoint)
 
 	var stdout, stderr strings.Builder
-	start := time.Now()
-	gate(strings.NewReader(samplePayload), &stdout, &stderr, transport.Dial{}, gateBudget, protocolVersion)
-	elapsed := time.Since(start)
+	took := timed(func() {
+		gate(strings.NewReader(samplePayload), &stdout, &stderr, transport.Dial{}, gateBudget, protocolVersion)
+	})
 
 	if stdout.Len() != 0 {
 		t.Errorf("stdout = %q, want empty", stdout.String())
@@ -126,8 +129,8 @@ func TestTheGateWillNotBeParkedTwice(t *testing.T) {
 	if !strings.Contains(stderr.String(), "parked the request twice") {
 		t.Errorf("stderr = %q, want it to name the second parking", stderr.String())
 	}
-	if elapsed > failOpenCeiling+100*time.Millisecond {
-		t.Errorf("took %v; a second parking must be rejected at once, not waited out", elapsed.Round(time.Millisecond))
+	if took.exceeds(failOpenCeiling + 100*time.Millisecond) {
+		t.Errorf("took %v; a second parking must be rejected at once, not waited out", took)
 	}
 }
 
@@ -417,9 +420,10 @@ func TestNestedFanOutIsRefusedOutright(t *testing.T) {
 
 	t.Setenv(transport.EndpointEnv, endpoint)
 	var stdout, stderr strings.Builder
-	start := time.Now()
-	code := gate(strings.NewReader(nested), &stdout, &stderr, transport.Dial{}, gateBudget, protocolVersion)
-	elapsed := time.Since(start)
+	var code int
+	took := timed(func() {
+		code = gate(strings.NewReader(nested), &stdout, &stderr, transport.Dial{}, gateBudget, protocolVersion)
+	})
 
 	if code != 0 {
 		t.Fatalf("exit code = %d, want 0", code)
@@ -442,8 +446,8 @@ func TestNestedFanOutIsRefusedOutright(t *testing.T) {
 
 	// The budget had three free slots. A depth refusal is not a capacity problem and must
 	// not be parked in the hope of one appearing.
-	if elapsed > failOpenCeiling {
-		t.Errorf("took %v; a nested spawn must be refused at once, not waited out", elapsed.Round(time.Millisecond))
+	if took.exceeds(failOpenCeiling) {
+		t.Errorf("took %v; a nested spawn must be refused at once, not waited out", took)
 	}
 	if got := d.table.InUse(); got != 0 {
 		t.Errorf("in use = %d, want 0: a refused nested spawn must not consume a lease", got)
@@ -464,15 +468,14 @@ func TestASessionRefusedInsideTheCooloffIsNotParkedAgain(t *testing.T) {
 		t.Fatal("the second spawn was allowed against a budget of 1")
 	}
 
-	start := time.Now()
-	if askGate(t, endpoint, "s1", "toolu_03") {
+	var allowed bool
+	took := timed(func() { allowed = askGate(t, endpoint, "s1", "toolu_03") })
+	if allowed {
 		t.Fatal("the third spawn was allowed against a budget of 1")
 	}
-	elapsed := time.Since(start)
 
-	if elapsed > failOpenCeiling {
-		t.Errorf("the retry waited %v; inside the cooloff it must be refused at once",
-			elapsed.Round(time.Millisecond))
+	if took.exceeds(failOpenCeiling) {
+		t.Errorf("the retry waited %v; inside the cooloff it must be refused at once", took)
 	}
 }
 

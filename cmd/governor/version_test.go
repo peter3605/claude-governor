@@ -552,23 +552,24 @@ func TestNoSpawnStallsWhileTheDaemonIsBeingReplaced(t *testing.T) {
 		sessionOp(endpoint, "start")
 
 		var stdout, stderr bytes.Buffer
-		start := time.Now()
-		code := gate(strings.NewReader(samplePayload), &stdout, &stderr, transport.Dial{}, gateBudget, protocolVersion)
-		elapsed := time.Since(start)
+		var code int
+		took := timed(func() {
+			code = gate(strings.NewReader(samplePayload), &stdout, &stderr, transport.Dial{}, gateBudget, protocolVersion)
+		})
 		spawns++
-		if int64(elapsed) > worst {
-			worst = int64(elapsed)
+		if int64(took.own()) > worst {
+			worst = int64(took.own())
 		}
 
 		if code != 0 {
 			t.Fatalf("gate exit %d during the swap, want 0: a spawn must never fail because "+
 				"the daemon is being replaced (stderr: %s)", code, stderr.String())
 		}
-		if elapsed > failOpenCeiling {
+		if took.exceeds(failOpenCeiling) {
 			t.Fatalf("a spawn took %v during the daemon swap, want under %v. The window between "+
 				"the old daemon releasing the socket and the new one binding it must cost a "+
 				"spawn its governance, never a session its responsiveness (stderr: %s)",
-				elapsed.Round(time.Millisecond), failOpenCeiling, stderr.String())
+				took, failOpenCeiling, stderr.String())
 		}
 
 		// Return whatever this spawn took, so the budget cannot fill and turn a correct
