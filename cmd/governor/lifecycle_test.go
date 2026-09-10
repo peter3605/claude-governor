@@ -372,16 +372,17 @@ func TestLifecycleHooksFailOpenWithNoDaemon(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Setenv(transport.EndpointEnv, endpoint)
 			var stderr bytes.Buffer
-			start := time.Now()
-			code := lifecycleHook(strings.NewReader(tc.payload), &stderr,
-				transport.Dial{}, hookBudget, tc.build)
-			elapsed := time.Since(start)
+			var code int
+			took := timed(func() {
+				code = lifecycleHook(strings.NewReader(tc.payload), &stderr,
+					transport.Dial{}, hookBudget, tc.build)
+			})
 
 			if code != 0 {
 				t.Errorf("exit code = %d, want 0", code)
 			}
-			if elapsed > failOpenCeiling {
-				t.Errorf("took %v, want under %v", elapsed.Round(time.Millisecond), failOpenCeiling)
+			if took.exceeds(failOpenCeiling) {
+				t.Errorf("took %v, want under %v", took, failOpenCeiling)
 			}
 		})
 	}

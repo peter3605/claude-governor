@@ -27,6 +27,9 @@ import (
 // These tests must keep passing unchanged when GOV-07 wires the gate to a real daemon. The
 // most likely regression there is a path that starts waiting on the daemon in a case that
 // used to short-circuit, and that regression is invisible except here.
+//
+// It is asserted through timed, which discounts what a loaded runner cost rather than what
+// the gate did. latency_test.go says why, and why the 120 is not the thing to raise.
 const failOpenCeiling = 120 * time.Millisecond
 
 // samplePayload is a real PreToolUse payload for a depth-0 spawn, from
@@ -55,9 +58,10 @@ func runGateSpeaking(t *testing.T, endpoint, payload string, dialer transport.Di
 	t.Setenv(transport.EndpointEnv, endpoint)
 
 	var stdout, stderr bytes.Buffer
-	start := time.Now()
-	code := gate(strings.NewReader(payload), &stdout, &stderr, dialer, gateBudget, speaks)
-	elapsed := time.Since(start)
+	var code int
+	took := timed(func() {
+		code = gate(strings.NewReader(payload), &stdout, &stderr, dialer, gateBudget, speaks)
+	})
 
 	if code != 0 {
 		t.Errorf("exit code = %d, want 0: the gate must never fail a spawn", code)
@@ -65,8 +69,8 @@ func runGateSpeaking(t *testing.T, endpoint, payload string, dialer transport.Di
 	if stdout.Len() != 0 {
 		t.Errorf("stdout = %q, want empty: the grant path is exit 0 and silence, never a decision", stdout.String())
 	}
-	if elapsed > failOpenCeiling {
-		t.Errorf("took %v, want under %v", elapsed.Round(time.Millisecond), failOpenCeiling)
+	if took.exceeds(failOpenCeiling) {
+		t.Errorf("took %v, want under %v", took, failOpenCeiling)
 	}
 	return stderr.String()
 }
@@ -274,9 +278,10 @@ func TestGateFailsOpenWhenStdinNeverCloses(t *testing.T) {
 	t.Setenv(transport.EndpointEnv, "unix://"+filepath.Join(sockDir(t), "absent"))
 
 	var stdout, stderr bytes.Buffer
-	start := time.Now()
-	code := gate(blockingReader{}, &stdout, &stderr, transport.Dial{}, gateBudget, protocolVersion)
-	elapsed := time.Since(start)
+	var code int
+	took := timed(func() {
+		code = gate(blockingReader{}, &stdout, &stderr, transport.Dial{}, gateBudget, protocolVersion)
+	})
 
 	if code != 0 {
 		t.Errorf("exit code = %d, want 0", code)
@@ -284,8 +289,8 @@ func TestGateFailsOpenWhenStdinNeverCloses(t *testing.T) {
 	if stdout.Len() != 0 {
 		t.Errorf("stdout = %q, want empty", stdout.String())
 	}
-	if elapsed > failOpenCeiling {
-		t.Errorf("took %v, want under %v", elapsed.Round(time.Millisecond), failOpenCeiling)
+	if took.exceeds(failOpenCeiling) {
+		t.Errorf("took %v, want under %v", took, failOpenCeiling)
 	}
 	if !strings.Contains(stderr.String(), "budget") {
 		t.Errorf("stderr = %q, want it to report the expired budget", stderr.String())
@@ -388,17 +393,18 @@ func runGateDeny(t *testing.T, endpoint, payload string) denyOutput {
 	t.Setenv(transport.EndpointEnv, endpoint)
 
 	var stdout, stderr bytes.Buffer
-	start := time.Now()
-	code := gate(strings.NewReader(payload), &stdout, &stderr, transport.Dial{}, gateBudget, protocolVersion)
-	elapsed := time.Since(start)
+	var code int
+	took := timed(func() {
+		code = gate(strings.NewReader(payload), &stdout, &stderr, transport.Dial{}, gateBudget, protocolVersion)
+	})
 
 	// A deny is still exit 0. The decision travels on stdout; a non-zero exit would be a
 	// hook error, which is a different thing entirely and is not what a refusal means.
 	if code != 0 {
 		t.Errorf("exit code = %d, want 0 even for a deny (stderr: %s)", code, stderr.String())
 	}
-	if elapsed > failOpenCeiling {
-		t.Errorf("took %v, want under %v", elapsed.Round(time.Millisecond), failOpenCeiling)
+	if took.exceeds(failOpenCeiling) {
+		t.Errorf("took %v, want under %v", took, failOpenCeiling)
 	}
 
 	var out denyOutput
@@ -556,9 +562,10 @@ func TestGateWritesNothingToStdoutViaTheCommandSurface(t *testing.T) {
 	t.Cleanup(func() { os.Stdin = saved; r.Close() })
 
 	var stdout, stderr bytes.Buffer
-	start := time.Now()
-	code := run([]string{"gate"}, &stdout, &stderr)
-	elapsed := time.Since(start)
+	var code int
+	took := timed(func() {
+		code = run([]string{"gate"}, &stdout, &stderr)
+	})
 
 	if code != 0 {
 		t.Errorf("exit code = %d, want 0", code)
@@ -566,8 +573,8 @@ func TestGateWritesNothingToStdoutViaTheCommandSurface(t *testing.T) {
 	if stdout.Len() != 0 {
 		t.Errorf("stdout = %q, want empty", stdout.String())
 	}
-	if elapsed > failOpenCeiling {
-		t.Errorf("took %v, want under %v", elapsed.Round(time.Millisecond), failOpenCeiling)
+	if took.exceeds(failOpenCeiling) {
+		t.Errorf("took %v, want under %v", took, failOpenCeiling)
 	}
 }
 
