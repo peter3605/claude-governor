@@ -18,6 +18,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/peter3605/claude-governor/internal/signals"
 	"github.com/peter3605/claude-governor/internal/transport"
 )
 
@@ -329,7 +330,7 @@ func runInstall(args []string, stdout, stderr io.Writer) int {
 	fmt.Fprintln(stdout, "\nRemove it with: governor uninstall")
 	// The hooks are read when a session starts, so a session already running is not
 	// governed yet. Saying so is the difference between "it does not work" and "restart".
-	fmt.Fprintln(stdout, "Sessions already running pick the hooks up when they next start.")
+	fmt.Fprintln(stdout, openSessionsNotice(gateHooksInstalledAt(), signals.LiveSessions))
 
 	if *noDaemon {
 		// Not verified, and saying so beats printing a report whose daemon-dependent
@@ -1069,4 +1070,55 @@ func readDaemonPID(state string) (int, error) {
 		return 0, fmt.Errorf("pid file does not hold a pid")
 	}
 	return pid, nil
+}
+
+// openSessionsNotice is the line install ends on about sessions that are already running.
+//
+// GOV-29. The line this replaced said "Sessions already running pick the hooks up when they
+// next start", which is true and reads as reassurance — as though it will happen by itself.
+// It will not: hooks are bound at session start, so every session open right now stays
+// ungoverned until a person restarts it, and on a machine running five or six of them that
+// is most of the fleet. The install that produced the story printed that sentence and left
+// four sessions ungoverned for twenty-nine hours with every instrument reporting healthy.
+//
+// It counts only sessions that predate the hook file, so a reinstall that changed nothing
+// does not tell someone to restart sessions that are already governed — installer.writeFile
+// leaves a file whose content already matches alone, so its mtime survives a no-op install.
+func openSessionsNotice(hooksAt time.Time, enumerate func(string) ([]signals.LiveSession, error)) string {
+	live, err := enumerate("")
+	if err != nil {
+		// No registry to read: say the thing that is true on every machine rather than a
+		// count that would be a guess.
+		return "Sessions already running are NOT governed until you restart them."
+	}
+	var stale []string
+	for _, s := range live {
+		// Interactive only, for the reason doctor filters the same way: restarting is the
+		// only fix, and it is not one a headless run can be given.
+		if s.Kind != "" && s.Kind != "interactive" {
+			continue
+		}
+		if hooksAt.IsZero() || s.Started.IsZero() || s.Started.Before(hooksAt) {
+			stale = append(stale, liveSessionLabel(s))
+		}
+	}
+	if len(stale) == 0 {
+		return "Every Claude Code session now running started after these hooks, so all of them are governed."
+	}
+	sort.Strings(stale)
+	return fmt.Sprintf("%d Claude Code session(s) are running now and will stay UNGOVERNED until restarted: %s",
+		len(stale), strings.Join(stale, ", "))
+}
+
+// liveSessionLabel names a session the way a person would find it: by its directory. It is
+// distinct from doctor's sessionLabel, which shortens a bare uuid for a lease report and has
+// no directory to work with.
+func liveSessionLabel(s signals.LiveSession) string {
+	if s.CWD != "" {
+		return filepath.Base(s.CWD)
+	}
+	if len(s.ID) > 8 {
+		return s.ID[:8]
+	}
+	return s.ID
 }

@@ -175,6 +175,24 @@ var agentIDShape = regexp.MustCompile(`^[0-9a-f]{17}$`)
 // a matcher that silently stops covering a spawn path.
 var spawnToolNames = []string{"Agent", "Task", "SendMessage"}
 
+// spawnToolNamesConfirmedAgainst is the Claude Code version the list above was last MEASURED
+// against, not merely believed correct for.
+//
+// It exists because `governor doctor`'s matcher check cannot, on its own, catch the failure
+// it was written for. That check reads the matcher off disk and tests it against the list
+// above, which catches a hand-edited or stale matcher — but install writes the matcher FROM
+// that same list, so on a stock install the two agree by construction. If Claude Code renamed
+// the spawn tool tomorrow, both sides would still agree, doctor would print ok, and not one
+// spawn would be governed: exactly the silent failure design.md section 10.1 was spent
+// measuring the tool name to avoid.
+//
+// A version stamp cannot detect a rename either. What it can do is stop the claim from being
+// unfalsifiable: it turns "the matcher is correct" into "the matcher was correct as of
+// 2.1.267", which is a statement that expires and can be re-earned by re-running the probe in
+// docs/hook-surface.md section 12. GOV-28 and GOV-29 between them changed the answer twice in
+// four patch versions, so it does expire.
+const spawnToolNamesConfirmedAgainst = "2.1.267"
+
 // governsSpawn reports whether this payload puts a subagent on the CPU, and if not, why.
 //
 // The set of paths is the one GOV-28 measured rather than the one the tool names suggest

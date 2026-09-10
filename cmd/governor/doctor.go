@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -149,10 +150,222 @@ func (d *diagnosis) run() {
 	d.checkSocket()
 	d.checkHooks()
 	d.checkMatcher()
+	d.checkSpawnTools()
 	d.checkProtocol()
 	d.checkBinary()
 	d.checkConfig()
+	d.checkSessions()
 	d.checkLeases()
+}
+
+// ---------------------------------------------------------------------------
+// spawn tools
+// ---------------------------------------------------------------------------
+
+// checkSpawnTools reports which Claude Code versions are running here against the version the
+// spawn tool names were last measured on.
+//
+// WHY THIS IS SEPARATE FROM checkMatcher. That check reads the matcher off disk and tests it
+// against spawnToolNames, and it earns its keep: a hand-edited or stale matcher fails it. What
+// it cannot do is notice that spawnToolNames itself has gone out of date, because install
+// writes the matcher from that same list — the two agree by construction on every stock
+// install. A tool rename in Claude Code would leave both agreeing, doctor printing ok, and
+// nothing governed.
+//
+// This check cannot detect a rename either, and does not pretend to. It reports a fact from
+// outside this binary — the version actually running, read from the harness's own session
+// registry — so that the matcher's correctness stops being a claim with no expiry date.
+//
+// IT IS DELIBERATELY NOT A FAILURE. A newer Claude Code is a routine event and, for anyone
+// who is not maintaining this program, not a fixable one; failing on it would put a red line
+// in front of every user after every upgrade and teach them that a red line means nothing.
+// The whole report is worth less than that costs.
+func (d *diagnosis) checkSpawnTools() {
+	names := strings.Join(spawnToolNames, ", ")
+	var newer []string
+	seen := map[string]bool{}
+	for _, s := range d.reply.Sessions {
+		if !s.Live || s.Version == "" || seen[s.Version] {
+			continue
+		}
+		seen[s.Version] = true
+		if compareVersions(s.Version, spawnToolNamesConfirmedAgainst) > 0 {
+			newer = append(newer, s.Version)
+		}
+	}
+	if len(seen) == 0 {
+		// Nothing was read, so nothing was compared. Saying "measured against 2.1.267" here
+		// would read as "checked against what is running on this machine" when no version was
+		// observed at all — and on a host with no session registry that is the DEFAULT output,
+		// not a rare one. The sibling sessions check states its own limit for this reason and
+		// so does this.
+		d.add("spawn", pass, fmt.Sprintf(
+			"%s, measured against Claude Code %s — no running version seen here to compare against",
+			names, spawnToolNamesConfirmedAgainst), "")
+		return
+	}
+	if len(newer) == 0 {
+		d.add("spawn", pass, fmt.Sprintf("%s, measured against Claude Code %s",
+			names, spawnToolNamesConfirmedAgainst), "")
+		return
+	}
+	sort.Strings(newer)
+	d.add("spawn", pass, fmt.Sprintf(
+		"%s, measured against Claude Code %s — NOT re-checked against %s, which is running here",
+		names, spawnToolNamesConfirmedAgainst, strings.Join(newer, " and ")), "")
+}
+
+// compareVersions orders two dotted numeric versions. Non-numeric or ragged input compares
+// equal rather than guessing, because the only thing this drives is whether to add a caveat
+// and a wrong guess would either cry wolf or stay silent when it mattered.
+func compareVersions(a, b string) int {
+	as, bs := strings.Split(a, "."), strings.Split(b, ".")
+	for i := 0; i < len(as) && i < len(bs); i++ {
+		x, err1 := strconv.Atoi(as[i])
+		y, err2 := strconv.Atoi(bs[i])
+		if err1 != nil || err2 != nil {
+			return 0
+		}
+		if x != y {
+			if x > y {
+				return 1
+			}
+			return -1
+		}
+	}
+	return 0
+}
+
+// ---------------------------------------------------------------------------
+// sessions
+// ---------------------------------------------------------------------------
+
+// sessionVerdict is what became of one live session.
+type sessionVerdict struct {
+	stat sessionStat
+	// why is the reason it is ungoverned, empty when it is governed.
+	why string
+}
+
+// label names a session in terms a person can act on. A bare UUID is not something anyone
+// can find in a window.
+func (v sessionVerdict) label() string {
+	if v.stat.CWD != "" {
+		return filepath.Base(v.stat.CWD)
+	}
+	if len(v.stat.Session) > 8 {
+		return v.stat.Session[:8]
+	}
+	return v.stat.Session
+}
+
+// checkSessions compares the sessions running on this machine against the sessions the
+// daemon has actually heard from.
+//
+// THIS IS THE CHECK GOV-29 EXISTS FOR. Hooks are bound at session start, so a session that
+// was already open when the governor was installed never loaded the gate and is ungoverned
+// for the rest of its life. Nothing else in this command can see that: every other check
+// reads a file, a version or a socket, and all of them are perfectly happy on a machine
+// where not one spawn is being governed. On 2026-09-09 this machine ran six sessions, four
+// of them ungoverned, and doctor reported 8 of 8.
+//
+// The evidence has to come from outside the hook surface, because the hooks of an ungoverned
+// session never run. It comes from the harness's own session registry
+// (docs/hook-surface.md section 17), joined to the daemon's session table on session_id.
+func (d *diagnosis) checkSessions() {
+	if !d.up {
+		d.add("sessions", skip, "no daemon to ask which sessions have registered (see daemon above)", "")
+		return
+	}
+	if !d.reply.SessionsKnown {
+		// Either this Claude Code keeps no session registry, or the daemon predates GOV-29.
+		// Neither is a failure and neither is a skip: a skip in this command means "downstream
+		// of a check that already failed and already named its fix", and nothing here failed.
+		// It is reported as a pass that states its own limit, on the rule that makes an
+		// unmeasurable thermal state nominal rather than critical — an instrument that cannot
+		// read says so instead of guessing a reading.
+		//
+		// The detail leads with "not verified" deliberately. This is the one line in the
+		// report where "ok" would otherwise be read as "checked and fine", and that misreading
+		// is the entire defect this check was added to remove.
+		d.add("sessions", pass,
+			"not verified — the daemon did not say which sessions are live "+
+				"(a daemon older than this binary, or a host with no session registry)", "")
+		return
+	}
+
+	if d.gate == nil || d.reply.HooksInstalled == "" {
+		// There is no gate hook to have loaded, so of course no session loaded one. Saying
+		// "restart these sessions" here would name a fix that fixes nothing — restarting into
+		// a machine with no hooks installed leaves it exactly as ungoverned. The hooks check
+		// above has already failed and already named the real fix, which is what a skip means.
+		d.add("sessions", skip, "no gate hook for a session to have loaded (see hooks above)", "")
+		return
+	}
+
+	var live, ungoverned []sessionVerdict
+	registered, replaced := 0, 0
+	for _, s := range d.reply.Sessions {
+		if !s.Live {
+			continue
+		}
+		v := sessionVerdict{stat: s}
+		live = append(live, v)
+		switch g := classify(d.reply.statusResponse, s); g {
+		case govRegistered:
+			registered++
+		case govPreviousDaemon:
+			replaced++
+		default:
+			// Only an interactive session is reported. Restarting is the sole fix an
+			// ungoverned session has, and that is not an action that exists for a headless
+			// `claude -p` run — which will have exited before anyone reads the advice.
+			// A missing kind is treated as interactive: it is the case where this cannot
+			// tell, and staying quiet about a real terminal session would lose the finding.
+			if g.ungoverned() && (s.Kind == "" || s.Kind == "interactive") {
+				v.why = g.why()
+				ungoverned = append(ungoverned, v)
+			}
+		}
+	}
+
+	if len(live) == 0 {
+		d.add("sessions", pass, "no Claude Code sessions running", "")
+		return
+	}
+	if len(ungoverned) == 0 {
+		detail := fmt.Sprintf("%d of %d live session(s) registered with the daemon", registered, len(live))
+		if replaced > 0 {
+			// Said out loud rather than folded into the count. Otherwise a healthy machine
+			// straight after an upgrade reads "0 of 5 registered" over an ok, which is the
+			// sort of line that gets a working install debugged.
+			detail += fmt.Sprintf("; %d registered with a daemon that has since been replaced", replaced)
+		}
+		d.add("sessions", pass, detail, "")
+		return
+	}
+
+	names := make([]string, 0, len(ungoverned))
+	for _, v := range ungoverned {
+		names = append(names, fmt.Sprintf("%s (%s)", v.label(), v.why))
+	}
+	d.add("sessions", fail,
+		fmt.Sprintf("%d of %d live session(s) are ungoverned: %s",
+			len(ungoverned), len(live), strings.Join(names, ", ")),
+		fmt.Sprintf("restart %s — hooks are bound when a session starts, so an open session never picks them up",
+			pluralSessions(ungoverned)))
+}
+
+// pluralSessions names what to restart, by directory where there is one.
+func pluralSessions(v []sessionVerdict) string {
+	if len(v) == 1 {
+		return "the Claude Code session in " + v[0].label()
+	}
+	names := make([]string, 0, len(v))
+	for _, s := range v {
+		names = append(names, s.label())
+	}
+	return "the Claude Code sessions in " + strings.Join(names, ", ")
 }
 
 // report prints the findings and returns the process exit code.
@@ -459,6 +672,62 @@ func hookSources() ([]hookSource, error) {
 	}, nil
 }
 
+// gateHooksInstalledAt is when the file holding the PreToolUse gate hook was last written,
+// or the zero time when no such registration exists anywhere.
+//
+// This is the pivot GOV-29 turns on. Hooks bind at session start (docs/hook-surface.md
+// section 17), so a session that started before this instant is running whatever hooks
+// existed then — for a session older than the install, none — and no amount of restarting the
+// daemon will govern it. Only restarting the session will.
+//
+// IT MUST BE THE FILE THAT ACTUALLY HOLDS THE GATE, not the newest of the files that could.
+// The first thing hookSources lists is ~/.claude/settings.json, which is the USER'S file:
+// accepting a permission prompt, editing /config or installing any other tool rewrites it.
+// Taking the newest mtime across all three — which this did until it was reviewed — meant an
+// unrelated settings edit moved this instant to now, placed every live session before it, and
+// reported the whole machine as ungoverned with a fix telling the user to restart six working
+// sessions. That is the false-positive the story calls a serious defect, fired by ordinary
+// use rather than by an edge case.
+//
+// It is a sound marker rather than a churning one because installer.writeFile leaves a file
+// whose content already matches strictly alone, so reinstalling the same build does not move
+// it.
+func gateHooksInstalledAt() time.Time {
+	sources, err := hookSources()
+	if err != nil {
+		return time.Time{}
+	}
+	var newest time.Time
+	for _, src := range sources {
+		refs, err := scanHooks(src)
+		if err != nil {
+			continue
+		}
+		holdsGate := false
+		for _, ref := range refs {
+			// Matched on event AND subcommand, the same pair wantedHooks uses. A file
+			// carrying somebody else's PreToolUse hook is not a file that governs spawns.
+			if ref.event == "PreToolUse" && ref.args == "gate" {
+				holdsGate = true
+				break
+			}
+		}
+		if !holdsGate {
+			continue
+		}
+		fi, err := os.Stat(src.path)
+		if err != nil {
+			continue
+		}
+		// Newest across the files that DO hold a gate, because where a gate is registered in
+		// more than one place the last write is what describes a session starting now.
+		if m := fi.ModTime(); m.After(newest) {
+			newest = m
+		}
+	}
+	return newest
+}
+
 // checkHooks reports whether all five hooks are registered and point at a binary that runs.
 func (d *diagnosis) checkHooks() {
 	sources, err := hookSources()
@@ -533,7 +802,12 @@ func (d *diagnosis) checkHooks() {
 		return
 	}
 	d.add("hooks", pass,
-		fmt.Sprintf("all %d registered in %s → %s",
+		// "on disk" is not padding. This check reads a FILE; it cannot tell whether any
+		// running session has loaded what is in it, and hooks bind at session start so the
+		// two genuinely come apart. Reported as "all 5 registered" alone, it read as proof
+		// that the machine was governed on a day when four of six sessions were not — see
+		// the sessions check below, which is the half that can actually tell.
+		fmt.Sprintf("all %d registered on disk in %s → %s",
 			len(wantedHooks), shortList(sortedKeys(seen)), short(d.gate.bin)), "")
 }
 

@@ -893,3 +893,164 @@ under 1000 characters, so it is not close to either bound.
   `stream-json`; the SDK path was not tested.
 - Truncation behaviour at the caps above.
 - Linux. Every measurement in this section is macOS.
+
+---
+
+## 17. Hooks are bound at session start, and how to see which sessions loaded them
+
+**Measured on `claude --version` = `2.1.267 (Claude Code)`, macOS/arm64, 2026-09-09 (GOV-29).**
+
+A Claude Code session loads its hooks when it starts. A session that was already open when a
+plugin was installed does not pick them up later — not on the next turn, not on the next
+spawn, not ever. It is ungoverned for the rest of its life, and only restarting it changes
+that.
+
+Nothing in sections 1–5 can observe this, and that is the point: the hooks of an ungoverned
+session never run, so the evidence has to come from outside the hook surface entirely.
+
+### 17.1 The evidence
+
+Three facts settled it, none of them inference:
+
+1. Session `b99c1ee8` (edgefinder-v2) had existed since at least 2026-09-08 17:29, the mtime
+   of its tool-results directory.
+2. `~/.claude/skills/claude-governor/hooks/hooks.json` was written 2026-09-09 18:57 and its
+   binary 19:09. The session predates the gate by about twenty-six hours.
+3. The Phase 0 trace hooks live in `~/.claude/settings.json` and were installed 2026-09-08,
+   **before** that session started — which is exactly why trace captured every spawn in the
+   window while the gate captured none. Two load paths, two install times, one old session.
+
+Two runs twelve minutes apart on the same machine, same version, same repo, same background
+path: in the old session, three subagents demonstrably alive and `governor status` polled at
+1 Hz read `in_use=0` at all forty-seven ticks. In a session started after the install,
+`in_use` climbed 0-1-2-3 and held.
+
+Three hypotheses were eliminated by measurement and must not be re-investigated: tentative
+TTL reaping (the zero was read 17 s after launch, before the 30 s TTL could fire), a tool
+rename on 2.1.267 (`PostToolUse` carries `tool_name":"Agent"` verbatim), and background
+spawns emitting no `PreToolUse` (the working run was also a background spawn).
+
+### 17.2 `~/.claude/sessions/<pid>.json` — the harness's own live-session registry
+
+This is what makes the condition visible, and it is the only enumeration method that works.
+One file per **live** session, named by PID, alongside a `<pid>.<hash>.key` that is an auth
+token and must never be opened.
+
+```jsonc
+{
+  "pid": 5364,
+  "sessionId": "2bcbd3bd-a469-4be6-add4-e528a09b4e34",  // the join key
+  "cwd": "/Users/peterho/Repos/claude-governor",
+  "startedAt": 1788998089326,                 // epoch ms, UTC
+  "procStart": "Wed Sep  9 23:54:48 2026",    // UTC, "Mon Jan _2 15:04:05 2006"
+  "version": "2.1.267",
+  "status": "busy",                           // busy | idle
+  "kind": "interactive", "entrypoint": "cli",
+  "messagingSocketPath": "/tmp/cc-socks/5364.sock",
+  "name": …, "nameSource": …, "nameSince": …, "peerProtocol": …, "peerFeatures": …,
+  "pidDomain": …, "updatedAt": …, "statusUpdatedAt": …, "bridgeSessionId": …
+}
+```
+
+`sessionId` is the same value that arrives on every hook payload (section 5) and on the
+statusline payload (section 14.1), so "running on this machine" and "registered with the
+daemon" can be joined directly. The governor reads seven of those fields and ignores the
+rest: the file is the harness's, not ours, and parsing fields we have no use for is how a
+version bump breaks something that did not need to care.
+
+`kind` is read as well as the six fields above: only an `interactive` session can be
+restarted, and restarting is the only fix an ungoverned session has. A headless `claude -p`
+run is left out of that advice rather than told to do something it cannot.
+
+The `procStart` comparison that guards against a recycled PID is a **two-second tolerance,
+not an equality**. The two sides do not derive the number the same way — on Linux gopsutil
+computes a start time from the jiffy counter plus `/proc/stat`'s `btime`, which can disagree
+with whatever the harness wrote by about a second — so an exact match would reject every entry
+on that platform and report a busy machine as empty.
+
+**It is cleaned up on a clean exit.** Watched across two sessions ending and one restarting,
+the file count tracked `ps` exactly. Stale files after an unclean exit are the exception, not
+the rule — but they are why `procStart` is compared against the process's real start time
+before an entry is believed, since a PID the kernel has recycled would otherwise present an
+unrelated process as a live session.
+
+**Measured cost: 1.2 ms** for four sessions — `readdir`, a JSON parse each, and one liveness
+check per candidate. Re-measured against `ps` at the same instant and it agreed exactly, four
+PIDs for four processes.
+
+The alternatives were measured and are worse:
+
+| Method | Verdict |
+|---|---|
+| `~/.claude/sessions/*.json` + liveness | **1.2 ms, exact.** The only one that yields a session id at all |
+| `ps -Ao pid,command` | ~28 ms, and a session shows as bare `claude` with no recoverable session id |
+| `/tmp/cc-socks/*.sock` | **20 sockets for 6 live sessions.** Stale sockets are not cleaned up |
+| `lsof -p <pid>` | ~140 ms *per pid*, and it does not hold the transcript open, so it adds nothing |
+| `.jsonl` mtime under `projects/` | Every session that ever ran, dead or alive. Not a liveness signal |
+
+**This surface is undocumented**, so anything built on it must degrade to *unknown* when it
+is absent — never to "no sessions running", which reads as a clean machine and is precisely
+the false negative GOV-29 exists to remove. `signals.LiveSessions` returns `ErrNoRegistry`
+for exactly this, and `governor doctor` reports "not verified" rather than a pass or a
+failure.
+
+The same rule covers a registry that is *present but unintelligible*, which is the more likely
+future: a version that renames `sessionId` or reformats `procStart` would leave every file in
+place and every one unparseable. Files skipped because they could not be **read** are counted
+and, where none could, reported as unknown; files skipped because their **process is gone** are
+not, because a directory of stale entries genuinely does mean nothing is running. Collapsing
+those two into "zero sessions" is the same false all-clear arriving by a different door.
+
+### 17.3 `scratchpad_dir`, and other fields that arrived without notice
+
+`scratchpad_dir` is present on **365 of the last 400** hook payloads on this machine and
+appears in none of the payloads documented in sections 1–5. It is on `PreToolUse`,
+`PostToolUse`, `SubagentStart`, `SubagentStop` and `Stop`.
+
+Nothing depends on it. It is recorded because the drift is only visible at all thanks to
+GOV-02's decision to store `raw_keys` — key names, never values — on every traced payload.
+That one choice is what let a four-version change be read off an existing trace instead of
+costing another probe, and it is worth keeping for that reason alone.
+
+### 17.4 The foreground `Agent` spawn still exists — a claim in GOV-29 corrected
+
+GOV-29 was filed asserting that "on 2.1.267 the Agent tool has no foreground option at all —
+every `PostToolUse` in the trace reads `tool_status=async_launched`". **The trace does not
+support that**, and it is corrected here rather than propagated.
+
+Of 33 `PostToolUse`/`Agent` records in `samples.jsonl`, 28 read `async_launched` and **five
+read `completed`**, with real durations:
+
+```
+2026-09-09T22:13:25Z  completed  dur=1390 ms
+2026-09-09T22:58:38Z  completed  dur=8943 ms
+2026-09-09T22:59:15Z  completed  dur=5843 ms
+2026-09-09T22:59:16Z  completed  dur=5636 ms
+2026-09-09T22:59:18Z  completed  dur=5461 ms
+```
+
+A foreground spawn returns its result inline and reports how long it took; a background one
+returns immediately with no duration. Both shapes are present.
+
+The trace carries no per-record Claude Code version, so those five **cannot** be attributed
+to 2.1.267 specifically — the sessions that produced them were not among those live when the
+version was read. What can be said is that the strong form of the claim is unsupported by the
+evidence cited for it, and no measurement here establishes that the foreground path has been
+removed.
+
+**It changes nothing about the gate**, which is why this is a correction and not a defect:
+both paths raise `PreToolUse` before the spawn, and that is the only event the gate acts on.
+`tool_status` is read at `PostToolUse`, after the decision. The reason to get it right is that
+this file is the record other stories build on, and section 8.3's spawn-path table would be
+wrong if this one were written down as filed.
+
+### 17.5 Still unmeasured
+
+- Whether `~/.claude/sessions/` exists on Linux, and whether it has the same shape. Every
+  measurement in this section is macOS.
+- Whether a session whose hooks file changes *mid-session* picks up the change on some later
+  event. The binding is asserted here only for the start of a session; nothing was tested
+  that rewrote hooks under a running session and then spawned.
+- Whether `disableAllHooks` or an unaccepted trust prompt leaves a session in the registry
+  looking identical to a governed one. It would, on everything measured here, and doctor
+  would then report it as ungoverned with the wrong fix.

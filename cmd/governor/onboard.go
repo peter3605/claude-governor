@@ -99,7 +99,9 @@ and thermal load. A spawn is delayed or refused, never altered.
 
 Status line: ` + "`3/5 slots`" + ` is agents running out of the current budget, ` + "`(1 yours)`" + ` how many
 are this session's, and ` + "`cpu 61%`" + ` / ` + "`thermal ok`" + ` the readings the budget moves on.
-` + "`governor: daemon not running - spawns ungoverned`" + ` means nothing is being capped.`
+` + "`governor: daemon not running - spawns ungoverned`" + ` means nothing is being capped, and
+` + "`governor: ungoverned - restart to enable`" + ` means this session started before the governor
+did — hooks are bound when a session opens, so only restarting it will govern this one.`
 
 // firstRunNoticeBudget is the allowance for claiming the marker and rendering the notice.
 //
