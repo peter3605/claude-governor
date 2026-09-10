@@ -9,6 +9,7 @@ import (
 	"os"
 	"time"
 
+	"github.com/peter3605/claude-governor/internal/config"
 	"github.com/peter3605/claude-governor/internal/signals"
 	"github.com/peter3605/claude-governor/internal/transport"
 )
@@ -16,9 +17,14 @@ import (
 // Version strings reported by `governor version`. The protocol version is the "v" field
 // every wire message carries (section 7); the config schema version is the "schema" key in
 // config.json (section 13.4). All three move independently.
+//
+// configSchemaVersion is config.Schema rather than a second literal 1. `doctor` compares the
+// file's schema against this constant while config.FileStore migrates against its own, and
+// two constants that must agree but can be edited apart is how a binary comes to report a
+// schema it does not write.
 const (
 	protocolVersion     = 1
-	configSchemaVersion = 1
+	configSchemaVersion = config.Schema
 )
 
 // binaryVersion is a var rather than a const so that a release build can stamp the tag into

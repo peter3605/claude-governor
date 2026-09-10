@@ -33,6 +33,11 @@ type Config struct {
 	WaitMaxMS int
 	// Unknown holds keys this binary does not recognise, so a round trip through an older
 	// version preserves a newer version's settings.
+	//
+	// Its values are json.RawMessage holding the original bytes verbatim. Decoding them
+	// through `any` would round every number through float64, so a newer version's large
+	// integer would come back mangled — preserved in name and corrupted in value, which is
+	// worse than dropping it because it looks like it worked.
 	Unknown map[string]any
 }
 
