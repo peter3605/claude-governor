@@ -28,7 +28,9 @@ curl -fsSL https://raw.githubusercontent.com/peter3605/claude-governor/main/inst
 That fetches the binary for this OS and architecture and hands off to `governor install`,
 which writes a plugin to `~/.claude/skills/claude-governor/`, merges a `statusLine` key into
 `~/.claude/settings.json` after backing it up, and starts the daemon. It prints every path it
-touched. Sessions already running pick the hooks up when they next start.
+touched. **Claude Code binds hooks when a session starts, so every session you already have
+open stays ungoverned until you restart it** — install counts them and names them, and
+`governor doctor` fails while any of them is still running.
 
 **It then checks its own work.** `governor install` finishes by running `governor doctor` and
 printing the report, and exits non-zero if any check fails. An install can write every file

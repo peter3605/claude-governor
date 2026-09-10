@@ -758,6 +758,14 @@ The statusline earns its place: `3/5 slots - cpu 61% - thermal ok` in every sess
 invisible policy into something watchable, which is most of what makes a governor
 trustworthy. Ship it in Phase 1, not as polish.
 
+GOV-29 added one more line it can render, and it replaces the slot count rather than joining
+it: `governor: ungoverned - restart to enable`, in a session whose hooks never loaded. Such a
+session holds no leases, so it rendered `0/4 slots` — true, and identical to what a fully
+governed idle session shows. A person watched that line read zero while two subagents ran and
+concluded the governor was working. The count was the thing being misread, so the count is
+what goes; and this is the one state where what a reader needs is not a number but an
+instruction.
+
 GOV-10 shipped it, and the line above is what it actually renders. Two departures from the
 `◐ 3/5 · cpu 61% · thermal ok` this section originally illustrated, both deliberate. There is
 no leading glyph, because an animated one would have to come from somewhere and the statusline
@@ -969,11 +977,11 @@ being asked of them is to run a hook on every subagent spawn.
 | `install.sh` | curl-able bootstrap: detect OS/arch, fetch the matching binary, hand off to `governor install` |
 | `governor install` | write the plugin (manifest, hooks, binary), merge the statusline into settings (after backup), start the daemon, print exactly what it touched, then run `doctor` and exit non-zero if it fails |
 | `governor uninstall` | reverse all of it, restore the settings backup, stop the daemon, remove state on `--purge` |
-| `governor doctor` | daemon reachable? hooks registered? matcher matches the real tool name? binary and plugin versions agree? config schema current? each failure names its fix |
+| `governor doctor` | daemon reachable? hooks registered? matcher matches the real tool name? **are the sessions running right now actually governed?** binary and plugin versions agree? config schema current? each failure names its fix |
 | `governor calibrate` | measure cores, performance cores, RAM and a short load probe; write setpoint and B_max for *this* machine |
 | `governor version` | binary version, protocol version, config schema version |
 
-GOV-20 shipped `doctor`, and it reports eight findings rather than the six checks this table
+GOV-20 shipped `doctor`, and it reports ten findings rather than the six checks this table
 lists — `binary`, `protocol` and `config` are the three halves of "versions agree", split
 because they have three different fixes and a line carrying three fixes is a line nobody acts
 on. Three details are worth stating because they are decisions rather than implementation:
@@ -995,6 +1003,42 @@ on. Three details are worth stating because they are decisions rather than imple
   which is precisely why: that section says registering only `Task` "would have worked by
   luck", and a diagnostic that passes something for working by luck will pass it on the
   version where the luck runs out. The matcher must cover `Agent`, `Task` and `SendMessage`.
+
+GOV-29 added the two findings that make the rest of them mean anything, because every check
+above reads a file, a socket or a version and **all of them pass on a machine where not one
+spawn is being governed**. That is not hypothetical: on 2026-09-09 this machine ran six
+sessions, four of them ungoverned for twenty-nine hours, and doctor reported 8 of 8.
+
+- **`sessions` compares what is running against what has registered.** Hooks bind at session
+  start (hook-surface.md §17), so a session already open at install time never loads the gate
+  and never will. The live set comes from the harness's own registry and is joined to the
+  daemon's session table on `session_id`. It FAILS naming each session by its directory,
+  because the fix is a person restarting a particular window and a bare uuid is not something
+  anyone can act on.
+  - It must not blame a **daemon restart**. The session table is in memory and `install`
+    restarts the daemon, so straight after any upgrade every live session is missing from it,
+    including governed ones. A session that started before this daemon did is treated as
+    having registered with a previous one, which is the ordinary state and not a fault. The
+    check has three inputs for this reason — the registered set, the daemon's start time, and
+    the hook file's mtime — and only the last of those is decisive on its own.
+  - Where the registry cannot be read it reports **"not verified"**, as a pass that states its
+    own limit rather than a skip. A skip in this command means "downstream of a check that
+    already failed and already named its fix", and nothing has failed here. The wording leads
+    with "not verified" because this is the one line where `ok` would otherwise be read as
+    "checked and fine", which is the exact misreading being removed.
+- **`spawn` dates the tool names against the version actually running.** `matcher` reads the
+  matcher off disk and tests it against `spawnToolNames`, which catches a hand-edited or stale
+  matcher — but `install` writes that matcher *from* the same list, so on a stock install the
+  two agree by construction and a rename in Claude Code would leave both agreeing while
+  nothing was governed. This finding cannot detect a rename either, and does not claim to. It
+  states the version the names were last measured on, so that "the matcher is correct" becomes
+  "the matcher was correct as of 2.1.267" — a claim that expires. It is deliberately **not** a
+  failure when a newer Claude Code is running: that is routine, is not fixable by anyone who
+  is not maintaining this program, and a red line after every upgrade teaches people that a
+  red line means nothing.
+
+Neither finding writes anything. `~/.claude/sessions/` is read-only to the governor and adds
+no row to §13.3.
 
 "Stranded" is also a precise thing rather than a feeling. The reaper collects a lease three
 ways — its TTL expires, its session's process is gone, or `Liveness` says its owner is gone —

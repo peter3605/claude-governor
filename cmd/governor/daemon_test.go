@@ -68,6 +68,19 @@ func startTestDaemon(t *testing.T, limit int) (string, *daemon) {
 // test can drive the clock rather than sleep out a thirty-second TTL.
 func startTestDaemonWithLeases(t *testing.T, limit int, opt lease.Options) (string, *daemon) {
 	t.Helper()
+	return startTestDaemonConfigured(t, limit, opt, nil)
+}
+
+// startTestDaemonConfigured is startTestDaemonWithLeases with a hook to configure the daemon
+// BEFORE it starts serving.
+//
+// The ordering is the reason it exists rather than a convenience. A test that reached into
+// the returned *daemon to swap a field would be writing it while the serve goroutine reads
+// it, which is a data race `go test -race` is right to fail even when the test happens to
+// set it before the first request. Anything a test needs to change about a daemon's view of
+// the machine is changed here, while nothing is looking.
+func startTestDaemonConfigured(t *testing.T, limit int, opt lease.Options, configure func(*daemon)) (string, *daemon) {
+	t.Helper()
 
 	dir, err := os.MkdirTemp("", "govd")
 	if err != nil {
@@ -83,6 +96,9 @@ func startTestDaemonWithLeases(t *testing.T, limit int, opt lease.Options) (stri
 
 	ctx, cancel := context.WithCancel(context.Background())
 	d := newDaemonWithLeases(limit, io.Discard, opt)
+	if configure != nil {
+		configure(d)
+	}
 	ln, err := transport.Listen{}.Listen(ctx, endpoint)
 	if err != nil {
 		cancel()

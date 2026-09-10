@@ -95,10 +95,17 @@ type statusResponse struct {
 	// CPU is a pointer because the daemon has no sampler until GOV-12 and sends null
 	// rather than a fabricated 0.0. Null means "not measured"; rendering it as "cpu 0%"
 	// would tell the reader the machine is idle, which is a claim and not a reading.
-	CPU      *float64        `json:"cpu"`
-	Thermal  signals.Thermal `json:"thermal"`
-	Sources  []sourceStat    `json:"sources"`
-	Sessions []sessionStat   `json:"sessions"`
+	CPU     *float64        `json:"cpu"`
+	Thermal signals.Thermal `json:"thermal"`
+	Sources []sourceStat    `json:"sources"`
+	// The governance fields (GOV-29). A daemon from before that story sends none of them,
+	// which reads as SessionsKnown false — "this daemon cannot tell me" — and every consumer
+	// then says nothing rather than guessing. That is the whole reason they are additive
+	// rather than a protocol bump.
+	DaemonStarted  string        `json:"daemon_started"`
+	HooksInstalled string        `json:"hooks_installed"`
+	SessionsKnown  bool          `json:"sessions_known"`
+	Sessions       []sessionStat `json:"sessions"`
 }
 
 // cachedStatus is one status reply plus when it was taken.
@@ -179,6 +186,15 @@ type statusView struct {
 	// confirmed together. A tentative lease is a spawn in flight and counting it is right:
 	// it is a slot this session is currently consuming.
 	Mine int
+	// Ungoverned is set when THIS session's hooks are not loaded, so nothing it spawns is
+	// being capped (GOV-29).
+	//
+	// It is the difference between a truthful number and a useful one. A session whose hooks
+	// never loaded holds no leases, so it renders "0/4 slots" — accurate, and exactly what a
+	// fully governed idle session shows. On 2026-09-09 that reading is what a person saw
+	// while two subagents ran, and the reasonable conclusion drawn from it was that the
+	// governor was working and the machine was quiet.
+	Ungoverned bool
 }
 
 // fetch resolves the current status for the statusline, from the cache if it is fresh and
@@ -240,10 +256,15 @@ func view(c cachedStatus, session string) statusView {
 		return v
 	}
 	for _, s := range c.Reply.Sessions {
-		if s.Session == session {
-			v.Mine = s.Tentative + s.Confirmed
-			break
+		if s.Session != session {
+			continue
 		}
+		v.Mine = s.Tentative + s.Confirmed
+		// Only this session's own verdict is rendered. The line has room for one machine and
+		// one session, and a person reading it is asking about the window in front of them.
+		// Whether some other session is ungoverned is doctor's question to answer.
+		v.Ungoverned = classify(c.Reply, s).ungoverned()
+		break
 	}
 	return v
 }
@@ -262,6 +283,16 @@ func render(v statusView, width int) string {
 		// an unreachable daemon is reported on it in the words a person needs: not that a
 		// dial failed, but that nothing is being governed right now.
 		line, _ := fit([]string{"governor: daemon not running", "spawns ungoverned"}, width)
+		return line
+	}
+
+	if v.Ungoverned {
+		// Said instead of the slot count, not beside it. The count is the thing that would be
+		// misread, so leaving it on the line and appending a warning would keep the misreading
+		// available; and this is the one state where what a person needs is not a number but
+		// an instruction. The daemon-down line above is worded the same way for the same
+		// reason — both mean "nothing is capping this", and both name what to do about it.
+		line, _ := fit([]string{"governor: ungoverned", "restart to enable"}, width)
 		return line
 	}
 

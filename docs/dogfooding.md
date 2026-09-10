@@ -5,13 +5,58 @@ This is that note. It is written in two halves — the method and the reading ru
 result afterwards — because the question is the kind that is easy to answer by feel, and a
 week of impressions is exactly the evidence this repo does not accept anywhere else.
 
-**Status: week in progress. Started 2026-09-09.** The Results section below is empty on
-purpose and is filled in at the end, not as it goes.
+**Status: week RESTARTED 2026-09-09 after a dead window. Originally started 2026-09-09.**
+The Results section below is empty on purpose and is filled in at the end, not as it goes.
 
 Installed 2026-09-09 on macOS arm64 (Darwin 25.4.0), Claude Code 2.1.265, through
 `governor install` and not by hand. `governor doctor` reported 8/8 immediately afterwards, a
 second `install` changed nothing and did not restart the daemon, and the day-zero checks
 below were run before the week's ordinary use began.
+
+### The dead window, 2026-09-09 18:57 to 2026-09-10 — recorded, not quietly skipped
+
+**The first hours of this week measured almost nothing, and the dates are not being moved to
+hide it.** GOV-29 found that hooks are bound at session start, so every Claude Code session
+that was already open when `governor install` ran never loaded the gate and was ungoverned for
+its whole life. At 19:40 on the 9th this machine had six live sessions and **four of them were
+in that state**, having started the previous afternoon — twenty-nine hours before the hooks
+file was written at 18:57:50.
+
+Why it matters more than a lost afternoon: the log from that window is not merely thin, it is
+**actively misleading**. Four of six sessions could not contribute a peak, a park or a denial
+no matter what they did, so the reading it invites — "no denials all week, four was generous"
+— is the exact wrong conclusion, reached from real data, with every instrument reporting
+healthy. `doctor` said 8 of 8 throughout.
+
+What was actually being measured in that window was roughly one third of the machine's
+sessions, and there is no way to recover which spawns the other four made. The window is
+therefore **discarded rather than adjusted**: no partial credit, and no attempt to scale the
+numbers up to what six sessions would have produced.
+
+The week restarts from a point where every live session postdates the install. What makes that
+verifiable now rather than assumed is the `sessions` check GOV-29 added — `governor doctor`
+FAILS while any live session predates the hooks, and naming the sessions by directory is what
+turns "restart your sessions" into something a person can act on.
+
+**Restarted and verified 2026-09-09.** All five live sessions now postdate the hooks file
+(written 18:57:50), and `governor doctor` reports `sessions ok` for all five:
+
+| PID | Started | Claude Code | Repo |
+|---|---|---|---|
+| 5364 | 19:54:49 | 2.1.267 | claude-governor |
+| 75024 | 20:33:31 | 2.1.267 | concertFinder |
+| 75484 | 20:33:42 | 2.1.267 | budgetr |
+| 4006 | 21:09:31 | 2.1.267 | muncheez |
+| 59012 | 22:08:26 | 2.1.267 | nightcrew |
+
+The two that had been ungoverned since the 8th — nightcrew and muncheez — are the two doctor
+named, and restarting them is what cleared the check. Every session on the machine now runs
+2.1.267; the 2.1.263 sessions that were live during the dead window are gone, which is a second
+piece of evidence they were the stale ones.
+
+**The clock starts from 22:08 on 2026-09-09**, the newest session, since that is the first
+instant at which the whole machine was governed. Anything in `daemon.log` before it belongs to
+the dead window and is not evidence.
 
 ---
 

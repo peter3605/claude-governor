@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -189,15 +190,32 @@ type ackReply struct {
 }
 
 // statusReply answers status, for the statusline, doctor and /governor.
+//
+// The three governance fields below were added by GOV-29 and are additive on purpose: the
+// protocol version is NOT bumped for them. A gate or statusline from an older build ignores
+// what it does not know and keeps working, where a bump would make every un-upgraded hook on
+// the machine fail open the moment the daemon restarted — trading a display defect for an
+// ungoverned machine, which is the wrong way round.
 type statusReply struct {
-	V        int             `json:"v"`
-	Budget   int             `json:"budget"`
-	InUse    int             `json:"in_use"`
-	Waiting  int             `json:"waiting"`
-	CPU      *float64        `json:"cpu"`
-	Thermal  signals.Thermal `json:"thermal"`
-	Sources  []sourceStat    `json:"sources"`
-	Sessions []sessionStat   `json:"sessions"`
+	V       int             `json:"v"`
+	Budget  int             `json:"budget"`
+	InUse   int             `json:"in_use"`
+	Waiting int             `json:"waiting"`
+	CPU     *float64        `json:"cpu"`
+	Thermal signals.Thermal `json:"thermal"`
+	Sources []sourceStat    `json:"sources"`
+	// DaemonStarted is when this daemon came up, RFC3339. See daemon.started.
+	DaemonStarted string `json:"daemon_started,omitempty"`
+	// HooksInstalled is the mtime of the gate's hooks file, RFC3339, empty when there is no
+	// such file. A session that started before it could not have loaded the gate and is
+	// ungoverned for the rest of its life, which is the whole of GOV-29's defect.
+	HooksInstalled string `json:"hooks_installed,omitempty"`
+	// SessionsKnown is false when the harness's session registry could not be read at all,
+	// which makes every Live field below meaningless. It is a separate field rather than an
+	// empty list because "no registry on this machine" and "no sessions running" are
+	// different answers and only one of them is a reason to stay quiet.
+	SessionsKnown bool          `json:"sessions_known"`
+	Sessions      []sessionStat `json:"sessions"`
 }
 
 type sourceStat struct {
@@ -212,6 +230,23 @@ type sessionStat struct {
 	Weight    int    `json:"weight"`
 	Tentative int    `json:"tentative"`
 	Confirmed int    `json:"confirmed"`
+	// Registered is true when this session ran the SessionStart hook against this daemon.
+	// It is the only positive proof that a session's hooks are loaded — a session holding no
+	// leases is indistinguishable from an ungoverned one by lease count alone, which is
+	// exactly how a machine with four ungoverned sessions read as healthy.
+	Registered bool `json:"registered"`
+	// Live is true when a claude process for this session is running right now, from the
+	// harness registry rather than from anything the governor was told.
+	Live bool `json:"live,omitempty"`
+	// Started, CWD and Version come from that registry and are set for live sessions only.
+	// CWD is carried so a diagnostic can name the session a person has to restart in terms
+	// they can act on; a bare UUID is not one.
+	Started string `json:"started,omitempty"`
+	CWD     string `json:"cwd,omitempty"`
+	Version string `json:"version,omitempty"`
+	// Kind is the harness's session kind. Only an interactive session can be restarted, which
+	// is the only fix an ungoverned session has.
+	Kind string `json:"kind,omitempty"`
 }
 
 // maxRequest bounds one request line. Requests are small and fixed in shape; a client that
@@ -236,6 +271,48 @@ type daemon struct {
 	// rises and never otherwise — see event.
 	peakMu sync.Mutex
 	peak   int
+	// started is when this daemon process came up. It is reported in status so a reader can
+	// tell "this session never registered" from "this session registered with a daemon that
+	// has since been replaced" — the session table is in memory and does not survive a
+	// restart, and `governor install` restarts the daemon on every upgrade.
+	started time.Time
+	// liveSessions enumerates the Claude Code sessions running on this machine, and
+	// hooksInstalledAt reports when the gate's hooks file was written. Both are injectable
+	// because both read a directory this package does not own, and a test that had to
+	// fabricate a live process to exercise the merge would be a test nobody trusts.
+	liveSessions     func() ([]signals.LiveSession, error)
+	hooksInstalledAt func() time.Time
+	// machineMu guards the cached answer below.
+	machineMu   sync.Mutex
+	machineAt   time.Time
+	machineSeen []signals.LiveSession
+	machineErr  error
+	machineHook time.Time
+}
+
+// machineTTL is how long the daemon reuses its reading of this host's live sessions.
+//
+// Without it the cost is quadratic in sessions: every session's status line polls roughly
+// once a second, and each poll would cost a readdir plus a file read and a process lookup per
+// session. Six sessions is thirty-six process lookups a second on the machine this program
+// exists to keep quiet. It matches the statusline's own cache for the same reason that one is
+// a second — nothing here moves faster than a person reads, and a session that started a
+// second ago is covered by classify's grace window anyway.
+const machineTTL = time.Second
+
+// observe returns this host's live sessions and hook install time, at most once per
+// machineTTL. The error is cached with the answer: a host with no registry must not pay a
+// failed directory read on every status call either.
+func (d *daemon) observe() (live []signals.LiveSession, hooksAt time.Time, err error) {
+	d.machineMu.Lock()
+	defer d.machineMu.Unlock()
+	if !d.machineAt.IsZero() && time.Since(d.machineAt) < machineTTL {
+		return d.machineSeen, d.machineHook, d.machineErr
+	}
+	d.machineSeen, d.machineErr = d.liveSessions()
+	d.machineHook = d.hooksInstalledAt()
+	d.machineAt = time.Now()
+	return d.machineSeen, d.machineHook, d.machineErr
 }
 
 // The budget event log (GOV-11).
@@ -312,6 +389,8 @@ func runDaemon(args []string, stdout, stderr io.Writer) int {
 	defer stop()
 
 	d := newDaemon(*limit, stderr)
+	// The one place the daemon is allowed to look at the real machine.
+	d.observeThisMachine()
 	ln, err := transport.Listen{}.Listen(ctx, ep)
 	if err != nil {
 		fmt.Fprintf(stderr, "governor daemon: %v\n", err)
@@ -432,13 +511,35 @@ func newDaemonWithLeases(limit int, diag io.Writer, opt lease.Options) *daemon {
 	}
 	table := lease.NewTable(opt)
 	return &daemon{
-		table:   table,
-		sources: []budget.Source{budget.LocalSource{N: limit, InUse: table.InUse}},
-		thermal: signals.ReadThermal,
-		waits:   &waitQueue{},
-		denials: newDenyLog(nil),
-		diag:    &syncWriter{w: diag},
+		table:            table,
+		sources:          []budget.Source{budget.LocalSource{N: limit, InUse: table.InUse}},
+		thermal:          signals.ReadThermal,
+		waits:            &waitQueue{},
+		denials:          newDenyLog(nil),
+		diag:             &syncWriter{w: diag},
+		started:          time.Now(),
+		liveSessions:     noLiveSessions,
+		hooksInstalledAt: func() time.Time { return time.Time{} },
 	}
+}
+
+// noLiveSessions is the default answer to "what is running on this machine": unknown.
+//
+// The real enumerator is wired in by runDaemon and nowhere else, deliberately. Both of these
+// functions read directories under the developer's real home, and TestMain in this package
+// exists because anything that reaches for a real home without being told does not fail — it
+// quietly measures the machine it runs on. A default that read the registry made four of this
+// package's tests assert against whichever sessions happened to be open, which is precisely
+// the accident that file was written to stop. Unknown is also the honest default for a daemon
+// on a host whose harness keeps no registry.
+func noLiveSessions() ([]signals.LiveSession, error) { return nil, signals.ErrNoRegistry }
+
+// observeThisMachine points a daemon at the real host: the harness's session registry and the
+// mtime of the hook file a session starting now would load. runDaemon calls it; tests that
+// want session data assign their own stubs instead.
+func (d *daemon) observeThisMachine() {
+	d.liveSessions = func() ([]signals.LiveSession, error) { return signals.LiveSessions("") }
+	d.hooksInstalledAt = gateHooksInstalledAt
 }
 
 // serve accepts connections until ctx is cancelled, reaping leases on a ticker throughout.
@@ -825,22 +926,79 @@ func (d *daemon) status() statusReply {
 	for _, q := range quotas {
 		sources = append(sources, sourceStat{Name: q.Name, Budget: q.Budget, InUse: q.InUse})
 	}
-	sessions := make([]sessionStat, 0, len(snap.Sessions))
+	// Each stat is allocated on its own and collected at the end. Holding pointers INTO a
+	// slice that is still being appended to is a bug, not a style: one reallocation and every
+	// pointer taken before it addresses the abandoned array, so the updates land on memory
+	// that is then discarded. It presented as two live sessions silently missing from the
+	// merge, which is the direction that under-reports a problem.
+	// Read before the snapshot below, not after. A session that registers between the two
+	// reads appears live-and-unregistered for one reply, and the statusline caches that for a
+	// second — long enough for the first thing a brand-new session ever shows its user to be
+	// an accusation that it is broken. Taking the registry first makes the race point the
+	// harmless way: a session can only be missing from the registry and present in the table,
+	// which classify already treats as registered.
+	live, hookAt, liveErr := d.observe()
+
+	byID := map[string]*sessionStat{}
+	order := make([]string, 0, len(snap.Sessions))
 	for _, s := range snap.Sessions {
-		sessions = append(sessions, sessionStat{
+		byID[s.ID] = &sessionStat{
 			Session: s.ID, PID: s.PID, Weight: s.Weight,
 			Tentative: s.Tentative, Confirmed: s.Confirmed,
-		})
+			// A session in the table's snapshot registered unless it is one of the synthetic
+			// entries Snapshot invents for a lease whose session it never saw, which carry
+			// no PID and no start time. Those are the ones worth telling apart.
+			Registered: s.PID != 0 || !s.StartedAt.IsZero(),
+		}
+		order = append(order, s.ID)
+	}
+
+	// Merge in what is actually running. A live session absent from the table above is one
+	// the daemon has never heard from, and it is the reason this whole field exists.
+	known := false
+	if liveErr == nil {
+		known = true
+		for _, ls := range live {
+			st, ok := byID[ls.ID]
+			if !ok {
+				st = &sessionStat{Session: ls.ID}
+				byID[ls.ID] = st
+				order = append(order, ls.ID)
+			}
+			st.Live = true
+			st.CWD = ls.CWD
+			st.Version = ls.Version
+			st.Kind = ls.Kind
+			if st.PID == 0 {
+				st.PID = ls.PID
+			}
+			if !ls.Started.IsZero() {
+				st.Started = ls.Started.UTC().Format(time.RFC3339)
+			}
+		}
+	}
+	sessions := make([]sessionStat, 0, len(order))
+	for _, id := range order {
+		sessions = append(sessions, *byID[id])
+	}
+	sort.Slice(sessions, func(i, j int) bool { return sessions[i].Session < sessions[j].Session })
+
+	hooks := ""
+	if !hookAt.IsZero() {
+		hooks = hookAt.UTC().Format(time.RFC3339)
 	}
 	return statusReply{
 		V: protocolVersion, Budget: limit, InUse: snap.InUse,
 		// Parked acquires, from the FIFO of design.md section 6.2.
 		Waiting: d.waits.len(),
 		// Null until the daemon has a sampler (GOV-12). Zero would read as an idle machine.
-		CPU:      nil,
-		Thermal:  d.thermal(),
-		Sources:  sources,
-		Sessions: sessions,
+		CPU:            nil,
+		Thermal:        d.thermal(),
+		Sources:        sources,
+		DaemonStarted:  d.started.UTC().Format(time.RFC3339),
+		HooksInstalled: hooks,
+		SessionsKnown:  known,
+		Sessions:       sessions,
 	}
 }
 

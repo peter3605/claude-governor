@@ -142,6 +142,17 @@ func TestTheNoticeDescribesTheStatusLineThatActuallyRenders(t *testing.T) {
 	if down := render(statusView{}, 0); !strings.Contains(onboardingNotice, down) {
 		t.Errorf("the notice does not quote the daemon-down line, which renders as %q", down)
 	}
+
+	// And the ungoverned line (GOV-29), for the same reason and more so: it is the one line
+	// that asks the reader to do something, and a notice that explained a line the renderer
+	// no longer prints would send them looking for text that never appears.
+	ungoverned := render(statusView{OK: true, Ungoverned: true}, 0)
+	if !strings.Contains(onboardingNotice, ungoverned) {
+		t.Errorf("the notice does not quote the ungoverned line, which renders as %q", ungoverned)
+	}
+	if !strings.Contains(onboardingNotice, "restarting") {
+		t.Errorf("the notice quotes the ungoverned line without saying what to do about it")
+	}
 }
 
 // It stays silent when it cannot record itself, rather than repeating forever.
