@@ -7,6 +7,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -14,6 +15,7 @@ import (
 	"time"
 
 	"github.com/peter3605/claude-governor/internal/lease"
+	"github.com/peter3605/claude-governor/internal/signals"
 	"github.com/peter3605/claude-governor/internal/transport"
 )
 
@@ -572,11 +574,12 @@ func TestStatuslineDropsTheSessionSuffixBeforeCutting(t *testing.T) {
 // first clause is always the slot count or the daemon-down text, and both are ASCII. So a
 // multi-byte thermal value is dropped as a whole clause long before any cut happens.
 //
-// It is kept, and tested here rather than deleted as dead code, because design.md section
-// 9's own illustration of this line is "◐ 3/5 · cpu 61% · thermal ok" — a leading glyph and
-// multi-byte separators. The day anyone renders that, a byte cut splits a character in the
-// one place on screen reserved for the governor's own report, and the failure is a
-// replacement glyph that looks like a font problem rather than like a bug here.
+// It is kept, and tested here rather than deleted as dead code, because design.md section 9
+// illustrated this line with a leading glyph and multi-byte separators until GOV-B09 deleted
+// that illustration — which is to say the multi-byte line is one edit away rather than
+// unimaginable. The day anyone renders one, a byte cut splits a character in the one place on
+// screen reserved for the governor's own report, and the failure is a replacement glyph that
+// looks like a font problem rather than like a bug here.
 func TestFit(t *testing.T) {
 	tests := []struct {
 		name    string
@@ -739,5 +742,142 @@ func TestGovernorStatusWhenTheDaemonIsDown(t *testing.T) {
 	}
 	if strings.Contains(stdout.String(), "budget ") {
 		t.Errorf("stdout = %q, want no budget line when there is no daemon to have set one", stdout.String())
+	}
+}
+
+// The docs illustrate the line the renderer actually prints (GOV-B09).
+//
+// design.md is the file this repo tells every session to read before writing code, and its
+// section 9 is where a stranger forms their picture of the one surface they will look at
+// every day. It illustrated the line with a leading spinner glyph and middle-dot separators
+// for a year after GOV-10 shipped it with neither, because prose is not compiled: the
+// correction landed in the paragraph above the illustration and left the illustration alone,
+// and by the time GOV-22 rewrote section 13's account of the same line, two sections of one
+// document disagreed about it.
+//
+// Set equality, not containment in either direction, and that is the whole design. Requiring
+// only that every illustration renders passes when a file illustrates nothing at all, which
+// is the guard going quiet rather than red — the failure mode this repo distrusts most.
+// Requiring only that every rendered line is illustrated passes when someone deletes an
+// example. Matching the two sets exactly makes a new illustration, a deleted illustration
+// and a changed renderer each red, and each red names which.
+//
+// The corpus is the views the docs illustrate, not every view render can produce. Adding an
+// example therefore costs naming the view that produces it, which is the intended price: an
+// illustration nobody can name a view for is an illustration nobody checked.
+func TestTheDocsIllustrateTheStatusLineThatActuallyRenders(t *testing.T) {
+	cpu := 0.61
+	renders := map[string]string{} // line -> the view that produced it
+	for name, v := range map[string]statusView{
+		"section 9, a governed session with both load signals": {
+			OK: true, InUse: 3, Budget: 5, CPU: &cpu, Thermal: signals.Nominal,
+		},
+		"section 9, the idle count GOV-29 found was being misread": {
+			OK: true, InUse: 0, Budget: 4,
+		},
+		"section 9, a session whose hooks never loaded": {
+			OK: true, Ungoverned: true,
+		},
+		"section 13, a budget filled by leases that outlived their agents": {
+			OK: true, InUse: 4, Budget: 4,
+		},
+	} {
+		renders[render(v, 0)] = name
+	}
+
+	// Shape, not a list of known strings: a list cannot notice a sixth illustration being
+	// added. Matched anywhere in the span rather than anchored, because the illustration this
+	// story deleted opened with a glyph and would have slipped an anchored pattern — the one
+	// thing the guard exists to catch must be a thing it can see.
+	shaped := regexp.MustCompile(`\d+/\d+ slots|\bcpu \d+%|\bthermal (ok|fair|serious|critical)\b|\d+ waiting|governor: (ungoverned|daemon not running)`)
+	span := regexp.MustCompile("`([^`]*)`")
+
+	illustrated := map[string]string{} // span -> file:line
+	for _, doc := range []string{
+		filepath.Join("..", "..", "docs", "design.md"),
+		filepath.Join("..", "..", "README.md"),
+	} {
+		b, err := os.ReadFile(doc)
+		if err != nil {
+			t.Fatalf("read %s: %v", doc, err)
+		}
+		for i, line := range strings.Split(string(b), "\n") {
+			for _, m := range span.FindAllStringSubmatch(line, -1) {
+				if shaped.MatchString(m[1]) {
+					illustrated[m[1]] = fmt.Sprintf("%s:%d", doc, i+1)
+				}
+			}
+		}
+	}
+
+	for line, where := range illustrated {
+		if _, ok := renders[line]; !ok {
+			t.Errorf("%s illustrates the status line as %q, which render never prints",
+				where, line)
+		}
+	}
+	for line, view := range renders {
+		if _, ok := illustrated[line]; !ok {
+			t.Errorf("render prints %q for %s, and neither design.md nor README.md "+
+				"illustrates it", line, view)
+		}
+	}
+}
+
+// Section 9's state-directory summary names every file section 13.3 does (GOV-B09).
+//
+// The second instance of this story's defect, found in the same section as the first. §13.3
+// is the normative list of paths — CLAUDE.md says so, and TestUninstallLeavesNothing depends
+// on it — while §9 carries a one-line summary of the part under ~/.claude/governor/ for the
+// package tour. Four paths reached §13.3 without reaching the summary: daemon.start (GOV-11),
+// onboarded (GOV-22), and the sampler's lock and log (GOV-02).
+//
+// Nobody was careless. A summary in a fenced tree eighty lines from the table it summarises
+// is not something a change to the table reminds anyone about, and the only thing that ever
+// would is a test. So this is deliberately not a check of §9 against the filesystem or
+// against install.go: those already have their own guards, and a third would drift from both.
+// It holds one claim only — that the two places in this document naming these paths name the
+// same ones — because that is the claim that went false.
+func TestSectionNineNamesEveryStateFile(t *testing.T) {
+	b, err := os.ReadFile(filepath.Join("..", "..", "docs", "design.md"))
+	if err != nil {
+		t.Fatalf("read design.md: %v", err)
+	}
+	doc := string(b)
+
+	// Every ~/.claude/governor/<file> path the document names anywhere, which in practice is
+	// §13.3's two tables. Matched by shape rather than by locating the section, so that
+	// renumbering a section cannot quietly empty this set.
+	named := map[string]bool{}
+	for _, m := range regexp.MustCompile("`~/\\.claude/governor/([^`/]+)`").FindAllStringSubmatch(doc, -1) {
+		named[m[1]] = true
+	}
+	if len(named) == 0 {
+		t.Fatal("found no state-directory paths in design.md at all, so this test is checking nothing")
+	}
+
+	// The summary, which is the text between the tree's "state  →" arrow and the "config  →"
+	// line below it, and may wrap over several lines.
+	sum := regexp.MustCompile(`(?s)state\s+→ ~/\.claude/governor/\s+(.*?)\nconfig\s+→`).FindStringSubmatch(doc)
+	if sum == nil {
+		t.Fatal("section 9's tree no longer has a `state  → ~/.claude/governor/` line to check")
+	}
+	summarised := map[string]bool{}
+	for _, f := range strings.FieldsFunc(sum[1], func(r rune) bool {
+		return r == ',' || r == ' ' || r == '\n' || r == '\t'
+	}) {
+		summarised[f] = true
+	}
+
+	for f := range named {
+		if !summarised[f] {
+			t.Errorf("§13.3 names ~/.claude/governor/%s and section 9's summary does not", f)
+		}
+	}
+	for f := range summarised {
+		if !named[f] {
+			t.Errorf("section 9's summary names %s, which §13.3's table does not — so either "+
+				"the summary invented it or uninstall does not know about it", f)
+		}
 	}
 }

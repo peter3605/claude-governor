@@ -119,8 +119,10 @@ func TestTheNoticeLeadsWithHowToTurnItOff(t *testing.T) {
 // This is the assertion that stops the notice quietly becoming a lie. The status line is a
 // row of numbers that means nothing unexplained, so the notice explains it by example — and
 // an example that drifts out of date teaches a stranger to read a line that no longer exists.
-// design.md section 9 illustrates the line as "◐ 3/5 · cpu 61% · thermal ok"; GOV-10 shipped
-// it with no glyph and " - " separators, which is exactly the kind of drift this catches.
+// design.md section 9 illustrated the line with a leading glyph and middle-dot separators for
+// a year after GOV-10 shipped it with neither, which is exactly the kind of drift this
+// catches — and GOV-B09 had to catch it there too, in
+// TestTheDocsIllustrateTheStatusLineThatActuallyRenders.
 func TestTheNoticeDescribesTheStatusLineThatActuallyRenders(t *testing.T) {
 	cpu := 0.61
 	live := render(statusView{

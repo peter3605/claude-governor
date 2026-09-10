@@ -723,9 +723,19 @@ claude-governor/                  the repo
 ├── hooks/hooks.json              the five hooks in section 4.1
 └── bin/governor                  the binary those hooks run
 
-state  → ~/.claude/governor/      sock, daemon.pid, daemon.log, statusline.json, samples.jsonl
+state  → ~/.claude/governor/      sock, daemon.pid, daemon.log, daemon.start, statusline.json,
+                                  onboarded, samples.jsonl, sampler.lock, sampler.log
 config → ${CLAUDE_PLUGIN_DATA}/config.json, falling back to the state directory
 ```
+
+**§13.3's table is the normative list of paths; the state line above is a summary of the part
+of it under `~/.claude/governor/`.** GOV-B09 found it naming five of nine — `daemon.start`
+(GOV-11), `onboarded` (GOV-22) and the sampler's lock and log (GOV-02) had each been added to
+§13.3 without this line following, which is the same drift as the status line a few
+paragraphs down and in the same section. `TestSectionNineNamesEveryStateFile` holds the two
+together now, because a summary nobody can check is how the first one survived. Adding a path
+means adding it to §13.3, as §13.3 already requires; the summary then has to follow or the
+suite is red.
 
 **The installed plugin goes in `~/.claude/skills/`, not `~/.claude/plugins/`.** GOV-21
 measured why ([hook-surface.md](hook-surface.md) §15): `~/.claude/plugins` holds a marketplace
@@ -792,13 +802,27 @@ worst case from a lease changing to the line showing it is the interval plus a 3
 plus up to a second of cache, which at two seconds is 3.3 s — inside the tens of seconds a
 fan-out worth watching lasts.
 
-GOV-10 shipped it, and the line above is what it actually renders. Two departures from the
-`◐ 3/5 · cpu 61% · thermal ok` this section originally illustrated, both deliberate. There is
-no leading glyph, because an animated one would have to come from somewhere and the statusline
-is stateless. And every clause after the slot count is conditional: `cpu` is absent until
-GOV-12 lands the sampler, and `thermal` is absent on any host reporting `unknown`, which is
-every Linux host by design. A clause naming a fact the daemon did not send would be a
-fabricated reading on the one surface whose value is being trusted at a glance.
+GOV-10 shipped it, and the line above is what it actually renders. Two departures from what
+this section originally illustrated, both deliberate. There is no leading spinner glyph,
+because an animated one would have to come from somewhere and the statusline is stateless,
+and the separator is the plain hyphen above rather than a middle dot. And every clause after
+the slot count is conditional: `cpu` is absent until GOV-12 lands the sampler, and `thermal`
+is absent on any host reporting `unknown`, which is every Linux host by design. A clause
+naming a fact the daemon did not send would be a fabricated reading on the one surface whose
+value is being trusted at a glance.
+
+**GOV-B09 deleted the superseded illustration and pinned the ones that remain.** It outlived
+its own correction because prose is not compiled: GOV-10 fixed the line this section leads
+with and left the old one standing a paragraph below as history, GOV-22 then corrected §13's
+account of the same line, and a reader arriving cold met two halves of one document
+disagreeing about the single surface they would look at every day. The illustration stays
+prose — moving it into the code would file it where nobody reading the design would find it —
+so a test reaches into the prose instead.
+`TestTheDocsIllustrateTheStatusLineThatActuallyRenders` extracts every status-line-shaped
+span from this file and from README.md and requires that set to equal, exactly, the set of
+lines `render` produces for the views it enumerates. An illustration that stops rendering is
+red, an undocumented new one is red, and so is deleting them all — which is the failure a
+one-directional check would have passed.
 
 ---
 
