@@ -655,6 +655,110 @@ func TestUninstallLeavesSomebodyElsesStatusLine(t *testing.T) {
 	}
 }
 
+// ---------------------------------------------------------------------------
+// the refresh interval (GOV-B07)
+// ---------------------------------------------------------------------------
+
+// Install writes a refreshInterval, and it is longer than the cache it has to see past.
+//
+// Without the key Claude Code runs the status line on events only, so a session waiting on a
+// fan-out — which produces no assistant message until the fan-out ends — displays whatever
+// it captured before the spawns, for the whole duration of the thing worth watching.
+//
+// The second assertion ties the interval to statuslineCacheTTL rather than to the literal 2,
+// because that relationship is the load-bearing half of the choice: at an interval equal to
+// the TTL a lone session's timer fires exactly at expiry and whether it reads the daemon or
+// a stale cache is a race. Pinning only the number would let someone shorten the interval,
+// or lengthen the TTL, and pass.
+func TestInstallWritesAStatusLineRefreshInterval(t *testing.T) {
+	p := stagedHome(t)
+	installOK(t)
+
+	sl, ok := readJSON(t, p.settings)["statusLine"].(map[string]any)
+	if !ok {
+		t.Fatal("install wrote no statusLine")
+	}
+	got, ok := sl["refreshInterval"].(float64)
+	if !ok {
+		t.Fatalf("statusLine has no refreshInterval: %v", sl)
+	}
+	if got != statuslineRefreshInterval {
+		t.Errorf("refreshInterval is %v, want %d", got, statuslineRefreshInterval)
+	}
+	if interval := time.Duration(got) * time.Second; interval <= statuslineCacheTTL {
+		t.Errorf("refreshInterval of %v is not longer than the %v cache; a timer firing at "+
+			"expiry races the cache instead of reading through it", interval, statuslineCacheTTL)
+	}
+}
+
+// Installing over a governor statusLine from before this key existed adds it.
+//
+// The upgrade path, and the one that silently does nothing if idempotency is keyed on the
+// wrong fields. Every machine already running the plugin has a statusLine with our command
+// and no refreshInterval; an equality check over only the keys the old version wrote would
+// call that "unchanged", print a line saying it had looked, and leave exactly the population
+// this story exists for on the event-only status line.
+func TestInstallAddsTheRefreshIntervalToAnOlderGovernorStatusLine(t *testing.T) {
+	p := stagedHome(t)
+	installOK(t)
+
+	// What a pre-GOV-B07 install left behind: our command, no interval.
+	settings := readJSON(t, p.settings)
+	sl, _ := settings["statusLine"].(map[string]any)
+	delete(sl, "refreshInterval")
+	settings["statusLine"] = sl
+	writeJSON(t, p.settings, settings)
+
+	out := installOK(t)
+
+	after, _ := readJSON(t, p.settings)["statusLine"].(map[string]any)
+	if _, ok := after["refreshInterval"]; !ok {
+		t.Errorf("install over an older statusLine did not add refreshInterval: %v", after)
+	}
+	if !strings.Contains(out, "updated") {
+		t.Errorf("install reported nothing as updated while adding the key:\n%s", out)
+	}
+}
+
+// Uninstall gives back a status line that had a refreshInterval of the user's own, exactly.
+//
+// The byte-identical restore is asserted over the whole home directory elsewhere, but not
+// with this key on both sides of the replacement. Ours is removed surgically rather than by
+// restoring the backup wholesale (design.md section 13.3), so adding a subkey changes what
+// "ours" looks like — and a user whose own status line refreshes every 10 s must get 10 s
+// back, not our 2, and not a key we introduced to their file.
+func TestUninstallRestoresAStatusLineThatHadItsOwnRefreshInterval(t *testing.T) {
+	const theirs = `{
+  "statusLine": {
+    "type": "command",
+    "command": "~/bin/my-own-statusline.sh",
+    "refreshInterval": 10
+  }
+}
+`
+	p := stagedHome(t)
+	mkdirAll(t, filepath.Dir(p.settings))
+	writeFileT(t, p.settings, theirs)
+
+	installOK(t)
+
+	during, _ := readJSON(t, p.settings)["statusLine"].(map[string]any)
+	if during["refreshInterval"] != float64(statuslineRefreshInterval) {
+		t.Errorf("installed refreshInterval is %v, want ours (%d)",
+			during["refreshInterval"], statuslineRefreshInterval)
+	}
+
+	uninstallOK(t)
+
+	got, err := os.ReadFile(p.settings)
+	if err != nil {
+		t.Fatalf("read settings after uninstall: %v", err)
+	}
+	if string(got) != theirs {
+		t.Errorf("settings.json is not byte-identical after uninstall.\n got: %q\nwant: %q", got, theirs)
+	}
+}
+
 // A `governor` already on the PATH is not ours to replace, and not ours to delete.
 func TestInstallLeavesSomebodyElsesBinaryOnThePath(t *testing.T) {
 	p := stagedHome(t)
