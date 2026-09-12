@@ -177,13 +177,76 @@ that overhead is not the governor's.
 
 ## Results
 
-*Empty until the week is up. Filled in from `daemon.log`, against the table above, without
-revising the table.*
+Filled in 2026-09-12 from `daemon.log`, against the reading rule above and without revising
+it. The observed window is **2026-09-09 22:08 → 2026-09-12**, about **three days** at five to
+six concurrent sessions — not the seven originally planned. Why it was closed early is in the
+Verdict.
+
+### What the log contains
+
+`daemon.log` holds **17 budget events**, and **every one of them falls before 2026-09-09
+22:08** — inside the dead window recorded at the top of this document. In the observed window
+there are **zero parks, zero capacity denials and zero new peaks**.
+
+### The high-water mark is unavailable for this window, and that is an instrument defect
+
+The reading rule leans on the peak because "no denials all week" is otherwise ambiguous
+between *the budget was well chosen* and *nothing ever came close to it*. That disambiguation
+**could not be made from the peak here**, for a reason worth recording:
+
+`peak` is a **monotonic high-water mark held in daemon memory**, and it logs only on a new
+maximum. It reached `in_use=4/4` at 2026-09-09T19:59:04 — inside the dead window — and 4 is
+the budget, so no further peak line could ever be written. The daemon then ran continuously
+from 2026-09-09 18:58:29 until it was replaced on 2026-09-12, carrying that saturated value
+across the boundary between the discarded window and the real one.
+
+So the instrument built to prevent exactly this ambiguity was **disabled by a single early
+saturation in a window that was subsequently thrown away**. The verdict below therefore rests
+on parks and capacity denials, which are per-event and unaffected, rather than on the peak.
+Anything that reads the high-water mark across a discard boundary needs to reset it, and
+nothing currently does.
+
+### The mechanism does work end to end — from the discarded window
+
+Not evidence for the verdict, and deliberately kept separate from it. At 20:00–20:01 on
+2026-09-09 a single session (`286a8d57`) fanned out hard: the budget reached 4/4, parked five
+spawns, granted two of them after 733 ms and 6.25 s, expired three at the full 20 s, and
+denied three for capacity. That is the gate, the lease table, the park path, the wait queue
+and the deny path all behaving as designed under real contention.
+
+It also lands on the reading rule's fourth row — *repeated denies to one session for one
+fan-out* — which would make GOV-16 urgent if it were reproduced in a valid window. It was
+not, so it is recorded as a mechanism check rather than promoted to a finding.
 
 ### Session failures attributable to the governor
 
-*To be recorded. Nil is a result and gets stated.*
+**Nil.** No session failure attributable to the governor was observed in the window.
+
+What was actually checked, rather than merely not noticed: `daemon.log` carries nine error
+lines, all `write reply: broken pipe` or `read request: EOF`. Those are the gate hanging up
+before the daemon answered — the fail-open path doing its job, with the spawn proceeding
+ungoverned rather than stalling. They are not session failures. `governor doctor` reports 10
+checks passing after a reinstall from `main`, including `sessions`, which now verifies rather
+than reporting that it could not.
 
 ### Verdict
 
-*To be recorded.*
+**The budget never bound. The semaphore did nothing in the observed window.** That is row one
+of the reading rule, reached on its own terms and stated plainly: *the pain, if any, was not
+concurrency.*
+
+It is corroborated from a second instrument rather than from this one alone. `docs/phase-0-findings.md`
+measures agents live for **1.2% of a 101-hour window**, 34 reconstructable lifetimes, and
+**zero spawns on each of the last two days**. A budget of four could not bind against that,
+and no additional days of the same work would have changed it.
+
+**The week was closed at three days rather than run to seven, deliberately.** The reading
+rule's first row sends the question to GOV-14; GOV-03 then answered the underlying question —
+*did a fixed budget of four help?* — by measurement rather than by impression, and answered it
+decisively: the budget rations roughly 0.4–0.9 cores of an eight-core machine, capping a
+quantity whose p99 is a fifth of a core, while the quantity that reaches 7.8 cores is
+ungoverned. Four more days could not have improved on that, and the project has since pivoted
+its control variable away from agent count entirely.
+
+The honest summary is that **this note's question has been superseded by a better-instrumented
+one**, and the four days were spent on the answer instead of on more of the same evidence.

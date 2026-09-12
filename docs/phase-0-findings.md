@@ -285,8 +285,19 @@ plausible. This is not an implementation detail of a matcher.
 
 ### Gating `Bash` makes the gate a real hot path, and that re-prices the fail-open work
 
-Today the gate runs **88 times in 101 hours**. On `Bash` it would run **thousands of times a
-day**. Every latency assumption in the current design was set for a rare event and must be
+Counted from this machine's transcripts: **18,929 `Bash` calls against 86 gate-matched calls**
+(`Agent`, `Task`, `SendMessage`) — a ratio of about **220×**. Per day the gate fires between 0
+and 37 times; `Bash` fires between 184 and 2,221 times.
+
+> **Correction, 2026-09-12.** This paragraph first read "the gate runs 88 times in 101 hours,
+> measured from the Phase 0 `PreToolUse` records". That was wrong. `PreToolUse` is **not** one
+> of the registered trace hooks — the five in `settings.json` are `SubagentStart`,
+> `SubagentStop`, `Stop`, `PostToolUse` and `SessionStart` — so those 88 records came from a
+> temporary registration on 2026-09-09 alone, not from continuous instrumentation. The figure
+> both misdescribed its source and understated the rate. The numbers above are counted from
+> the transcripts instead, which is where the call actually appears.
+
+Every latency assumption in the current design was set for a rare event and must be
 re-derived:
 
 - the **p99 under 15 ms** budget was chosen for something that happens a few dozen times a
