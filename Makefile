@@ -1,7 +1,7 @@
 # The shipped artefact is one file. Everything here builds that file.
 BIN := bin/governor
 
-.PHONY: build test vet fmt check clean cross
+.PHONY: build test vet fmt check clean cross leakcheck
 
 build:
 	go build -o $(BIN) ./cmd/governor
@@ -14,6 +14,12 @@ vet:
 
 fmt:
 	gofmt -w ./cmd ./internal
+
+# A test that leaves a daemon running is a test that degrades the machine it measures, and
+# the residue is invisible: a governor on a scratch socket collides with nothing and is not a
+# descendant of any `claude`, so neither `doctor` nor the Phase 0 sampler can see it (GOV-B11).
+leakcheck:
+	./tools/leakcheck.sh
 
 check: vet test
 	@unformatted=$$(gofmt -l ./cmd ./internal); \

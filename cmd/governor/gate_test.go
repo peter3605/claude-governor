@@ -87,6 +87,11 @@ func sockDir(t *testing.T) string {
 	if err != nil {
 		t.Fatalf("temp dir: %v", err)
 	}
+	// GOV-B11: registered before the removal is queued, so that if a test points a daemon at
+	// this directory and fails before it can reap it, TestMain still has a pid file to find.
+	// Removing the tree with a daemon still listening inside it is what turns a leaked
+	// process into an undiscoverable one.
+	registerStateDir(dir)
 	t.Cleanup(func() { os.RemoveAll(dir) })
 	return dir
 }

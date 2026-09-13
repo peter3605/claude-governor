@@ -73,6 +73,23 @@ const (
 	// reachable downstream of a check that has already failed, so nothing goes unreported,
 	// and it does not move the exit code because there is no defect to report.
 	skip
+	// warn is something found, worth saying, and not a defect in this installation.
+	//
+	// It exists because GOV-B11 needed a check whose finding is "untidy, not broken": a
+	// foreign governor daemon on a scratch socket collides with nothing and double-leases
+	// nothing, so failing on it would cry wolf, and passing on it is how four of them ran
+	// for up to 28 days while doctor reported ten checks all passing. Neither existing state
+	// could say it. A warning appears in the list, is counted separately in the summary, and
+	// deliberately does NOT move the exit code — a warning that fails the command is a
+	// failure wearing a different label.
+	//
+	// GOV-30 GENERALISES THIS, and should extend it rather than re-derive it. That story is
+	// about checks that report `ok` when they could not actually verify anything — spawn
+	// against an unmeasured Claude Code version, sessions before the daemon could say which
+	// were live. Those are a different finding ("could not verify") from this one ("verified,
+	// and found something untidy"), and GOV-30 may well want a fourth state or a different
+	// exit-code rule for them. What it should not have to do is invent the plumbing again.
+	warn
 )
 
 func (s checkState) label() string {
@@ -81,6 +98,8 @@ func (s checkState) label() string {
 		return "ok"
 	case fail:
 		return "FAIL"
+	case warn:
+		return "warn"
 	default:
 		return "skip"
 	}
@@ -117,6 +136,9 @@ type diagnosis struct {
 	hooks []hookRef
 	// gate is the PreToolUse gate registration, if there is one. The matcher check reads it.
 	gate *hookRef
+	// strayMinAge overrides how old a foreign daemon must be before checkStrayDaemons reports
+	// it. Zero means strayMinimumAge, which is what every caller outside a test leaves it at.
+	strayMinAge time.Duration
 }
 
 // doctorStatus is a status reply, plus the two fields an `unsupported_version` refusal
@@ -156,6 +178,79 @@ func (d *diagnosis) run() {
 	d.checkConfig()
 	d.checkSessions()
 	d.checkLeases()
+	d.checkStrayDaemons()
+}
+
+// ---------------------------------------------------------------------------
+// stray daemons
+// ---------------------------------------------------------------------------
+
+// checkStrayDaemons reports governor daemons running on this machine other than this one.
+//
+// Last, because it is the only check that is not about whether THIS installation works. It
+// answers a different question — what else is running that nobody asked for — and it is the
+// question nothing in this project was asking when four orphaned daemons accumulated over
+// twenty-eight days behind a clean bill of health. See strays.go for what it matches and,
+// more importantly, what it deliberately does not.
+func (d *diagnosis) checkStrayDaemons() {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	own := 0
+	if pid, ok := readPIDFileAt(d.pidPath()); ok {
+		own = pid
+	}
+	sock, _ := socketPath(d.endpoint)
+
+	minAge := d.strayMinAge
+	if minAge == 0 {
+		minAge = strayMinimumAge
+	}
+	strays := scanForStrays(ctx, own, sock, minAge)
+	if len(strays) == 0 {
+		d.add("strays", pass,
+			"no other governor daemon is running on this machine", "")
+		return
+	}
+
+	lines := make([]string, 0, len(strays))
+	for _, s := range strays {
+		lines = append(lines, s.describe())
+	}
+	// The plural is worth getting right: this output is read by someone deciding whether to
+	// kill a process, and "1 other governor daemon" reads very differently from "4".
+	noun := "daemon is"
+	if len(strays) > 1 {
+		noun = "daemons are"
+	}
+	d.add("strays", warn,
+		fmt.Sprintf("%d other governor %s running, on their own sockets — nothing here is "+
+			"double-leased, and a daemon you started yourself is expected:\n      %s",
+			len(strays), noun, strings.Join(lines, "\n      ")),
+		fmt.Sprintf("if you did not start it, stop it: kill %s", strayPIDs(strays)))
+}
+
+// strayPIDs renders the pids as a kill(1) argument list, so the fix is a command that can be
+// typed rather than a suggestion to go and find them.
+func strayPIDs(strays []strayDaemon) string {
+	pids := make([]string, 0, len(strays))
+	for _, s := range strays {
+		pids = append(pids, strconv.Itoa(s.pid))
+	}
+	return strings.Join(pids, " ")
+}
+
+// readPIDFileAt reads a daemon pid file, tolerating every way it can be absent or malformed.
+func readPIDFileAt(path string) (int, bool) {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return 0, false
+	}
+	pid, err := strconv.Atoi(strings.TrimSpace(string(raw)))
+	if err != nil || pid <= 0 {
+		return 0, false
+	}
+	return pid, true
 }
 
 // ---------------------------------------------------------------------------
@@ -375,9 +470,18 @@ func pluralSessions(v []sessionVerdict) string {
 // cannot tell "your install is broken" from "you typed the command wrong" is a script that
 // will conflate them.
 func (d *diagnosis) report(stdout io.Writer) int {
-	failed := 0
+	failed, warned := 0, 0
 	for _, f := range d.findings {
 		fmt.Fprintf(stdout, "%-4s  %-8s  %s\n", f.state.label(), f.name, f.detail)
+		// A warning carries a fix too — it is something a person can act on — but it is not
+		// a failure, so it neither counts toward the failure total nor changes the exit code.
+		if f.state == warn {
+			warned++
+			if f.fix != "" {
+				fmt.Fprintf(stdout, "      %-8s  %s\n", "fix", f.fix)
+			}
+			continue
+		}
 		if f.state != fail {
 			continue
 		}
@@ -392,8 +496,22 @@ func (d *diagnosis) report(stdout io.Writer) int {
 		fmt.Fprintf(stdout, "      %-8s  %s\n", "fix", fix)
 	}
 	if failed == 0 {
+		// "all passing" is a claim, and it may only be made when it is true. A run with a
+		// warning in it is the exact case GOV-B11 was filed about — ten green lines above
+		// four orphaned daemons — so the summary names the warning rather than rounding it
+		// off. The exit code stays 0: nothing here is broken.
+		if warned > 0 {
+			fmt.Fprintf(stdout, "\n%d checks, %d passing and %d to look at.\n",
+				len(d.findings), len(d.findings)-warned, warned)
+			return 0
+		}
 		fmt.Fprintf(stdout, "\n%d checks, all passing.\n", len(d.findings))
 		return 0
+	}
+	if warned > 0 {
+		fmt.Fprintf(stdout, "\n%d of %d checks failed, and %d more to look at.\n",
+			failed, len(d.findings), warned)
+		return 1
 	}
 	fmt.Fprintf(stdout, "\n%d of %d checks failed.\n", failed, len(d.findings))
 	return 1
