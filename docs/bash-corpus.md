@@ -22,7 +22,7 @@ half way.
 | Expensive | **115** of 1,587 — 7.2% |
 | Catch rate | **53.0%** of expensive commands (35.2% held out) |
 | False positives | **35.7%** of cheap commands (28.8% held out) |
-| Gated share | **20.2%** of all `Bash` calls |
+| Gated share | **18.4%** of all `Bash` calls |
 | Cost captured | **78.6%** of measured child core-seconds |
 
 Everything below is reproduced by:
@@ -166,15 +166,15 @@ Measured over the corpus:
 | **Catch rate** | **53.0%** — 61 of 115 expensive commands |
 | **False positives** | **35.7%** — 526 of 1,472 cheap commands |
 | Precision | 10.4% |
-| **Gated share of all `Bash` calls** | **20.2%** — 4,053 of 20,105 |
+| **Gated share of all `Bash` calls** | **18.4%** — 3,706 of 20,105 |
 | Cost captured | 78.6% of measured child core-seconds |
 
 Both directions are reported because a predicate with only one of them is trivially gamed: gate
 everything and the catch rate is perfect, gate nothing and the false-positive rate is.
 
 Two of those parsing rules earn their place by measurement rather than by looking tidy.
-**Unwrapping runners** — treating `uv run pytest` as pytest rather than as uv — is worth 4.2
-points of gated share (24.4% → 20.2%) and 5.4 points of false-positive rate (41.1% → 35.7%) at
+**Unwrapping runners** — treating `uv run pytest` as pytest rather than as uv — is worth 4.3
+points of gated share (22.7% → 18.4%) and 5.4 points of false-positive rate (41.1% → 35.7%) at
 *exactly* the same catch rate, 53.0% either way: gating the wrapper instead of the wrapped is
 pure loss. **Stripping heredoc bodies** is not a refinement at all but a correctness fix: before
 it, the Python inside `python3 - <<'PY' … PY` was scanned as shell, and the first cost ranking
@@ -220,12 +220,37 @@ high precision. The 35.7% false-positive rate is **real build tools invoked chea
 gated 303 times in the labelled set and only 13.5% of those were expensive; `pytest` 189 times
 at 2.6%.
 
-**20.2% of all `Bash` calls taking a lease is not small, and clause 3 asked for small.** Put in
-traffic rather than percentages: `Bash` fires 184–2,221 times a day on this machine, so the
-predicate leases 37–449 times a day, against the 0–37 the gate fires today. It converts a 220×
-problem into roughly a 12× one. That is a real reduction and it is not the same as cheap, and
-GOV-15's re-derivation of the latency budget (its clause 4) has to be done against the 12×
-figure, not against today's.
+**18.4% of all `Bash` calls taking a lease is not small in the ordinary sense of the word, and
+clause 3 asked for small.** Put in traffic rather than percentages: `Bash` fires 184–2,221 times
+a day on this machine, so the predicate leases 34–409 times a day against the 0–37 the gate
+fires today. It converts a 220× problem into roughly an 11× one. That is a real reduction and it
+is not the same as cheap; GOV-15's re-derivation of the latency budget (its clause 4) has to be
+done against the 11× figure, not against today's.
+
+**But the composition says the number is a fact about the workload, not a defect in the
+predicate.** Every gated call, counted by the tool it names:
+
+| | Calls | Share of all `Bash` calls |
+|---|---:|---:|
+| `go` | 1,186 | 5.9% |
+| `pytest` | 1,185 | 5.9% |
+| `xcodebuild` | 625 | 3.1% |
+| `xcodegen` | 175 | 0.9% |
+| `mypy` | 171 | 0.9% |
+| `make` | 145 | 0.7% |
+| `npm` / `npx` | 181 | 0.9% |
+
+There is no `grep` or `cat` inflating it and nothing left to trim without deleting a real build
+tool. Roughly one in five shell commands on this machine genuinely invokes build tooling —
+which is what a machine whose job is building software looks like. The failure clause 3 names
+by example (`cat`, `grep`, `git status`, `ls`) is at **zero**, asserted over 900 real commands
+from the corpus.
+
+**Three rounds of trimming got it there, each one measured.** Dropping `ruff`, unwrapping
+runners, and making dispatchers subcommand-aware — `docker ps`, `terraform output` and
+`xcrun simctl list` are control-plane, not compute — took the gated share from 24.4% to 18.4%
+**with the catch rate unchanged at 53.0% throughout**. Every point removed was a lease that
+caught nothing.
 
 ### The same tool is not the same cost in two repositories
 
@@ -275,7 +300,7 @@ round numbers are:
 the only gated tool in a command — 20 calls, the only ones whose cost is attributable to it
 alone — its median peak was 0.02 cores, p90 0.05, and none was expensive. It is a linter
 written to be instant, and gating it bought false positives and no captured cost: removing it
-took the gated share from 21.3% to 20.2% with the catch rate unchanged at 53.0%. `black` goes
+took 1.1 points off the gated share with the catch rate unchanged at 53.0%. `black` goes
 with it by analogy and was not separately measured here. `mypy` measured slower (p90 0.67,
 n=22) and stays gated.
 
@@ -290,7 +315,7 @@ evidence.
 
 ## 6. What this means for GOV-15
 
-1. **Gate on the predicate, not on `Bash`.** 20.2% of calls, not 100%.
+1. **Gate on the predicate, not on `Bash`.** 18.4% of calls, not 100%.
 2. **Re-derive the latency budget against 12× today's gate traffic** — clause 4 of GOV-15, and
    the clause its traps flag as most likely to be skipped. Classification is gate-side and
    costs ~5 µs per call (`TestClassifyIsCheapEnoughToRunOnEveryCall`), so a cheap command never

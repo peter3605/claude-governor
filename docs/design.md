@@ -625,7 +625,7 @@ top of it:**
 |---|---|
 | Catch rate | 53.0% of expensive commands (35.2% held out) |
 | False positives | 35.7% of cheap commands (28.8% held out) |
-| Gated share | 20.2% of all `Bash` calls |
+| Gated share | 18.4% of all `Bash` calls |
 | Cost captured | 78.6% of measured child core-seconds |
 | Cost of classifying | ~5 µs per call |
 
@@ -650,8 +650,8 @@ the machine. A per-host table keyed on command shape, seeded from these classes 
 from what the sampler observes, is the design this points at. The seed exists so the first
 decision is not random; it is not the last word.
 
-**20.2% of calls taking a lease is a reduction, not cheapness.** It turns a 220× problem into
-roughly a 12× one. §4.4's performance budget was priced for a gate firing a few dozen times a
+**18.4% of calls taking a lease is a reduction, not cheapness.** It turns a 220× problem into
+roughly an 11× one. §4.4's performance budget was priced for a gate firing a few dozen times a
 week and must be re-derived against the 12× figure before `Bash` is actually gated.
 
 ---

@@ -13,7 +13,7 @@
 //
 //	catch rate      53.0% of expensive commands (35.2% held out)
 //	false positives 35.7% of cheap commands   (28.8% held out)
-//	gated share     20.2% of all Bash calls ever recorded
+//	gated share     18.4% of all Bash calls ever recorded
 //	cost captured   78.6% of measured child core-seconds
 //
 // WHY THE CATCH RATE IS NOT HIGHER, AND WHY THAT IS A PROPERTY OF THE PROBLEM RATHER THAN OF
@@ -164,28 +164,39 @@ var toolchain = map[string]Class{
 	"xcodebuild": Heavy, "xcodegen": Medium, "swiftc": Heavy, "xcrun": Medium,
 	// .NET.
 	"dotnet": Medium,
-	// Containers and infra: these pull and build images, which is the heaviest thing a laptop
-	// does that is not a compiler.
-	"docker": Heavy, "podman": Heavy, "terraform": Medium,
+	// NOTE: docker, podman, terraform and xcrun are deliberately NOT here. They are
+	// dispatchers whose common subcommands are control-plane, not compute — `docker ps`,
+	// `terraform output`, `xcrun simctl list`. Blanket-gating them cost 1.5%, 0.7% and 1.5% of
+	// ALL Bash calls on this corpus for almost no captured cost. They gate through heavySub
+	// and dispatcher below, on the subcommands that actually build something.
 }
 
 // heavySub covers binaries that are free in their common form and expensive in one particular
 // subcommand. `git status` must never gate; `git clone` should.
 var heavySub = map[pair]Class{
-	{"git", "clone"}:      Medium,
-	{"git", "gc"}:         Medium,
-	{"git", "repack"}:     Medium,
-	{"git", "fsck"}:       Medium,
-	{"brew", "install"}:   Medium,
-	{"brew", "upgrade"}:   Heavy,
-	{"apt", "install"}:    Medium,
-	{"swift", "build"}:    Heavy,
-	{"swift", "test"}:     Heavy,
-	{"pip", "install"}:    Medium,
-	{"pip3", "install"}:   Medium,
-	{"uv", "sync"}:        Medium,
-	{"uv", "lock"}:        Medium,
-	{"poetry", "install"}: Medium,
+	{"git", "clone"}:       Medium,
+	{"git", "gc"}:          Medium,
+	{"git", "repack"}:      Medium,
+	{"git", "fsck"}:        Medium,
+	{"brew", "install"}:    Medium,
+	{"brew", "upgrade"}:    Heavy,
+	{"apt", "install"}:     Medium,
+	{"swift", "build"}:     Heavy,
+	{"swift", "test"}:      Heavy,
+	{"pip", "install"}:     Medium,
+	{"pip3", "install"}:    Medium,
+	{"docker", "build"}:    Heavy,
+	{"docker", "compose"}:  Heavy,
+	{"docker", "run"}:      Medium,
+	{"docker", "pull"}:     Medium,
+	{"docker", "push"}:     Medium,
+	{"podman", "build"}:    Heavy,
+	{"terraform", "plan"}:  Medium,
+	{"terraform", "apply"}: Medium,
+	{"terraform", "init"}:  Medium,
+	{"uv", "sync"}:         Medium,
+	{"uv", "lock"}:         Medium,
+	{"poetry", "install"}:  Medium,
 }
 
 // light is the exception list: subcommands of a gated binary that ask the tool about itself
@@ -208,8 +219,8 @@ var light = map[pair]bool{
 // it: `uv run pytest` is pytest, while `uv run python -c "print(1)"` is not a build.
 //
 // This distinction is not cosmetic, and the effect was measured rather than assumed. Gating the
-// runners themselves instead of what they run costs 4.2 points of gated share (24.4% against
-// 20.2% of all Bash calls) and 5.4 points of false-positive rate (41.1% against 35.7%), for
+// runners themselves instead of what they run costs 4.3 points of gated share (22.7% against
+// 18.4% of all Bash calls) and 5.4 points of false-positive rate (41.1% against 35.7%), for
 // EXACTLY the same catch rate — 53.0% either way. It is pure loss.
 var runner = map[string]bool{
 	"uv": true, "npx": true, "poetry": true, "pipenv": true,
@@ -234,6 +245,15 @@ func isPython(b string) bool {
 // runSub is the subcommand a runner uses to mean "now execute this". `uv run X` and
 // `poetry run X` wrap X; `uv sync` does not wrap anything.
 func runSub(b string) bool { return b == "run" || b == "exec" }
+
+// dispatcher is a tool whose FIRST operand is the real command, with no `run` keyword in
+// between. `xcrun swiftc x.swift` is swiftc; `xcrun simctl list devices` is simctl, which
+// builds nothing.
+//
+// Same reasoning as runner, measured the same way: gating xcrun itself put 1.5% of every Bash
+// call on this machine through the daemon to catch a handful of compiler invocations that the
+// dispatched name catches anyway.
+var dispatcher = map[string]bool{"xcrun": true}
 
 type invocation struct{ bin, sub string }
 
@@ -264,6 +284,11 @@ func invocations(cmd string) []invocation {
 		// `python -m pytest` is pytest.
 		if isPython(bin) && sub != "" && pyModule[sub] && hasFlag(rest, "-m") {
 			out = append(out, invocation{sub, ""})
+			return
+		}
+		// `xcrun swiftc x.swift` is swiftc.
+		if dispatcher[bin] && sub != "" {
+			out = append(out, invocation{base(sub), firstOperandAfter(rest, sub)})
 			return
 		}
 		// `uv run pytest -q` is pytest. Only for the run/exec form: `uv sync` is uv's own work.
