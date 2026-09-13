@@ -1133,8 +1133,16 @@ func TestInstallVerifiesItselfWithDoctor(t *testing.T) {
 			t.Errorf("install did not run doctor:\n%s", stdout)
 		}
 		// See TestDoctorPassesEveryCheckAfterAnInstall: a warning about another daemon on the
-		// machine is not this install failing, so either summary is a pass here. A FAIL is not.
-		if !strings.Contains(stdout, "all passing") && !strings.Contains(stdout, "to look at") {
+		// machine is not this install failing, so any of these summaries is a pass here. A
+		// FAIL is not.
+		//
+		// "could not be verified" is the usual one on a clean machine, and GOV-30 had to add
+		// it: a freshly installed host has spawned nothing, so the spawn check has no observed
+		// payload to confirm the matcher against, and CI has no session registry either. It
+		// passed locally without this only because the developer's machine has a real governor
+		// daemon running, which made `strays` warn and satisfied the middle clause by accident.
+		if !strings.Contains(stdout, "all passing") && !strings.Contains(stdout, "to look at") &&
+			!strings.Contains(stdout, "could not be verified") {
 			t.Errorf("install ran doctor but did not print a passing report:\n%s\n%s",
 				stdout, daemonLog(t, p))
 		}
