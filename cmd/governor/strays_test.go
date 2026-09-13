@@ -128,6 +128,46 @@ func TestAWarningIsNotReportedAsAllPassing(t *testing.T) {
 			wantCode: 1,
 			wantLine: "1 of 2 checks failed, and 1 more to look at.",
 		},
+		// GOV-30's state, through the same summary machinery. "all passing" must not survive
+		// a check that could not verify itself, and the exit code must say so distinctly —
+		// see doctorExitUnverified for why it is 3 and not 1.
+		{
+			name:     "a check that could not verify is not passing",
+			findings: []finding{{name: "a", state: pass}, {name: "b", state: unverified, fix: "spawn one"}},
+			wantCode: doctorExitUnverified,
+			wantLine: "2 checks, 1 passing and 1 that could not be verified.",
+		},
+		{
+			name: "a warning and an unverified check are counted apart",
+			findings: []finding{
+				{name: "a", state: pass},
+				{name: "b", state: warn, fix: "kill 1"},
+				{name: "c", state: unverified, fix: "spawn one"},
+			},
+			wantCode: doctorExitUnverified,
+			wantLine: "3 checks, 1 passing, 1 to look at and 1 that could not be verified.",
+		},
+		{
+			// A failure outranks it: the machine is broken, and that is the more urgent of
+			// the two things the summary has to say.
+			name: "a failure outranks a check that could not verify",
+			findings: []finding{
+				{name: "a", state: fail, fix: "governor install"},
+				{name: "b", state: unverified, fix: "spawn one"},
+			},
+			wantCode: 1,
+			wantLine: "1 of 2 checks failed, and 1 more that could not be verified.",
+		},
+		{
+			name: "everything at once still reads as a sentence",
+			findings: []finding{
+				{name: "a", state: fail, fix: "governor install"},
+				{name: "b", state: warn, fix: "kill 1"},
+				{name: "c", state: unverified, fix: "spawn one"},
+			},
+			wantCode: 1,
+			wantLine: "1 of 3 checks failed, with 1 to look at and 1 that could not be verified.",
+		},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			var out strings.Builder

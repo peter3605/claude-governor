@@ -772,7 +772,8 @@ claude-governor/                  the repo
 └── bin/governor                  the binary those hooks run
 
 state  → ~/.claude/governor/      sock, daemon.pid, daemon.log, daemon.start, statusline.json,
-                                  onboarded, samples.jsonl, sampler.lock, sampler.log
+                                  onboarded, surface.json, surface.json.tmp, samples.jsonl,
+                                  sampler.lock, sampler.log
 config → ${CLAUDE_PLUGIN_DATA}/config.json, falling back to the state directory
 ```
 
@@ -877,9 +878,21 @@ one-directional check would have passed.
 ## 10. Hook surface — confirmed
 
 **Confirmed against `claude --version` = `2.1.263 (Claude Code)` on macOS/arm64, 2026-09-07
-(GOV-01).** Raw payloads are in [hook-surface.md](hook-surface.md); this section is the
-conclusion only. Nothing below is inferred from documentation. A session that needs a
-detail not stated here MUST measure it and extend both files, not guess.
+(GOV-01), and RE-CONFIRMED against `2.1.270` on macOS/arm64, 2026-09-13 (GOV-30,
+[hook-surface.md](hook-surface.md) section 18).** All four facts below were re-measured on
+2.1.270 by GOV-01's own method and none of them moved; section 18 records what did change,
+none of it load-bearing for the gate. Raw payloads are in
+[hook-surface.md](hook-surface.md); this section is the conclusion only. Nothing below is
+inferred from documentation. A session that needs a detail not stated here MUST measure it
+and extend both files, not guess.
+
+**That version stamp is no longer what `governor doctor` judges by.** GOV-30 found that
+comparing the measured-against version to the running one can only ever report that a
+measurement is old — it cannot tell a stale-but-still-correct matcher from one that has
+stopped firing altogether, and those two are exactly what had to be told apart. Doctor now
+asks a ledger of the tool names the gate has actually been seen to catch, per Claude Code
+version (§10.4). This section stays the written record, and a test binds the two: the matcher
+may not name a tool that no measured payload in hook-surface.md carries.
 
 ### 10.1 The four answers
 
@@ -986,6 +999,39 @@ Named so they are not mistaken for settled:
 - Whether `SubagentStart` fires for a subagent restored by session resume.
 - Linux: every measurement above is macOS. Re-run the probe on Linux before trusting §10 there.
 
+### 10.4 The surface is re-confirmed continuously, not re-asserted
+
+The gate runs **only because** the PreToolUse matcher fired. Every acquire the daemon receives
+is therefore a real payload the matcher caught, and the `tool_name` on it is what the harness
+actually emitted — not what this repo believes it emits. GOV-30 turned that into the check:
+
+- The gate forwards the payload's `tool_name` on the acquire (`tool`, additive, **no protocol
+  bump** — an older daemon ignores it and an older gate omits it, and in both cases the
+  machine keeps governing spawns while the ledger simply stays empty).
+- The daemon records `(Claude Code version, tool name)` in `~/.claude/governor/surface.json`,
+  off the acquire path, and only when the pair is new. On a settled machine that is one write
+  per Claude Code upgrade.
+- `governor doctor` passes the `spawn` check only when every Claude Code version running here
+  has a recorded sighting **of a tool that starts a subagent**. Otherwise it is `unknown` —
+  never `ok`, and never a failure.
+
+**Only `Agent` and `Task` confirm; `SendMessage` does not.** The matcher covers three names but
+only two of them start a subagent — `SendMessage` *resumes* one (§8.3 path 2). A rename of the
+spawn tool would stop `Agent` matching while `SendMessage` kept matching, kept reaching the
+gate and kept landing sightings on the new version; confirming on any sighting at all would let
+the tool that still works cover for the one that broke, and print `ok` over an ungoverned
+machine. The confirming set is therefore deliberately narrower than the matched set.
+
+**Silence is the signal.** A Claude Code that renames the spawn tool does not announce it: the
+matcher stops matching, the gate is never invoked, and every other check stays green because
+the daemon is healthy and the matcher on disk is exactly the one this binary asks for. The
+absence of a sighting on the running version is the only evidence available, so the check is
+built to speak on it.
+
+**What this must never become is a wider matcher.** Nothing in the ledger feeds
+`spawnToolNames`. A matcher extended to catch every plausible name is not safer — it is
+untested in a new way, and it would hide the very drift this exists to detect.
+
 ---
 
 ## 11. Prior art
@@ -1082,7 +1128,7 @@ being asked of them is to run a hook on every subagent spawn.
 GOV-20 shipped `doctor`, and it reports eleven findings rather than the six checks this table
 lists — `binary`, `protocol` and `config` are the three halves of "versions agree", split
 because they have three different fixes and a line carrying three fixes is a line nobody acts
-on; `strays` is GOV-B11's, below. Four details are worth stating because they are decisions
+on; `strays` is GOV-B11's, below. Five details are worth stating because they are decisions
 rather than implementation:
 
 - **A finding can be `skip`.** With the daemon down there is no protocol version to compare
@@ -1095,6 +1141,21 @@ rather than implementation:
   failure wearing a different label — but a run containing one says "N checks, M passing and
   K to look at" rather than "all passing". The claim "all passing" may only be made when it
   is true, which is the whole of what GOV-B11 was filed about.
+- **A finding can be `unknown`,** printed when a check could not answer its own question —
+  not "looked and it is fine", not "looked and it is broken", but "could not look". GOV-30
+  added it after finding the spawn check reporting `ok` on a line that said, in its own
+  detail, that it had not re-checked anything; the summary underneath then said "10 checks,
+  all passing". **It is not a failure** — nothing is known to be broken — and it does not
+  print as one. **It does move the exit code**, to `3`, because a report that cannot be
+  trusted must not script as success, and because `1` already means "broken, here are the
+  fixes". Two checks reach it today: `spawn`, until the gate has been seen to catch a real
+  spawn on the Claude Code version running here, and `sessions`, when the harness keeps no
+  session registry this daemon can read.
+
+  **`governor install` treats exit 3 as success** and says why. A freshly installed machine
+  has not spawned anything yet, so `spawn` is legitimately unconfirmed at the moment install
+  finishes; failing there would put a red line in front of every first run, which is how a red
+  line comes to mean nothing.
 - **It reads every file that can hold one.** `~/.claude/settings.json`,
   `~/.claude/skills/claude-governor/hooks/hooks.json` — where GOV-21's installer actually
   writes them — and `~/.claude/plugins/claude-governor/hooks/hooks.json`, the directory 13.3
@@ -1198,6 +1259,8 @@ Uninstall is only verifiable if this list is exhaustive, so it is normative.
 | `~/.claude/governor/statusline.json` | `statusline`, when the directory already exists | uninstall |
 | `~/.claude/governor/daemon.start` | the gate, when it lazily starts a daemon and the directory already exists | uninstall |
 | `~/.claude/governor/onboarded` | `session start`, only in the fallback below, and only when the directory already exists | uninstall |
+| `~/.claude/governor/surface.json` | daemon, when it first sees a spawn tool name it has not recorded for that Claude Code version (GOV-30) | uninstall |
+| `~/.claude/governor/surface.json.tmp` | daemon, staging the file above before the rename | uninstall |
 | `~/.claude/governor/` | daemon (`transport.Listen`) | uninstall, only once it is empty; `--purge` regardless |
 | `~/.claude/plugins/data/claude-governor-skills-dir/` (`${CLAUDE_PLUGIN_DATA}`: config, onboarding marker) | Claude Code creates it; the governor writes config.json and `onboarded` | uninstall `--purge` only |
 
@@ -1213,6 +1276,12 @@ it added" and "removes things it did not":
 - **`~/.claude/skills/` and `~/.claude/governor/` are removed only if empty.** `os.Remove`
   refuses a non-empty directory, which is exactly the test: a machine with other skills-dir
   plugins, or with `samples.jsonl` still in it, keeps the directory and loses only our files.
+- **`surface.json.tmp` has a FIXED name, not a random one.** It is written by a goroutine
+  nothing waits for, so a `SIGTERM` between staging and rename can leave it behind — and
+  uninstall removes files it can name. A `CreateTemp`-style random suffix would be exactly the
+  residue that keeps `~/.claude/governor/` from emptying, which is the one difference between
+  "removes everything it added" and "removes most of it". Safe only because the ledger
+  serialises its writers; see `surfaceLedger.writeMu`.
 - **`samples.jsonl` survives a plain uninstall**, per the Phase 0 table below. It is the
   measurement the setpoint is derived from and it is not reconstructable.
 - **The `statusLine` value is restored, not deleted.** There is only one status line, so

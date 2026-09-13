@@ -96,6 +96,9 @@ type request struct {
 	ToolUseID string    `json:"tool_use_id"`
 	Depth     int       `json:"depth"`
 	WaitMS    int       `json:"wait_ms"`
+	// Tool is the tool_name off the PreToolUse payload the gate matched (GOV-30). Recorded,
+	// never acted on: nothing in the daemon's decisions may depend on it.
+	Tool string `json:"tool"`
 
 	// confirm / release
 	Lease        string `json:"lease"`
@@ -271,6 +274,20 @@ type statusReply struct {
 	// different answers and only one of them is a reason to stay quiet.
 	SessionsKnown bool          `json:"sessions_known"`
 	Sessions      []sessionStat `json:"sessions"`
+	// SpawnSurface is every (Claude Code version, spawn tool name) pair this daemon has
+	// actually seen the matcher catch — GOV-30's ledger, see surface.go. Additive like the
+	// fields above, and read only by doctor.
+	SpawnSurface []spawnSighting `json:"spawn_surface,omitempty"`
+	// SpawnSurfaceKnown says this daemon keeps that ledger at all, which an empty SpawnSurface
+	// cannot say on its own.
+	//
+	// It exists because the field above is additive and the protocol version is deliberately
+	// NOT bumped for it, so a doctor from this build talking to a daemon from an older one
+	// receives no ledger and no explanation. Without this flag it cannot tell "recording, and
+	// nothing has spawned yet" from "not recording" — and it accused the user of running an
+	// ungoverned machine on the strength of the second. Mirrors SessionsKnown, which was added
+	// for exactly this shape of mistake.
+	SpawnSurfaceKnown bool `json:"spawn_surface_known"`
 }
 
 type sourceStat struct {
@@ -350,6 +367,10 @@ type daemon struct {
 	// fabricate a live process to exercise the merge would be a test nobody trusts.
 	liveSessions     func() ([]signals.LiveSession, error)
 	hooksInstalledAt func() time.Time
+	// surface is the spawn-surface ledger of GOV-30: which tool names the matcher has
+	// actually been seen to catch, per Claude Code version. Written off the acquire path,
+	// read by doctor through the status reply. Never consulted for a decision.
+	surface *surfaceLedger
 	// machineMu guards the cached answer below.
 	machineMu   sync.Mutex
 	machineAt   time.Time
@@ -400,6 +421,41 @@ func (d *daemon) observe() (live []signals.LiveSession, hooksAt time.Time, err e
 	d.machineHook = d.hooksInstalledAt()
 	d.machineAt = time.Now()
 	return d.machineSeen, d.machineHook, d.machineErr
+}
+
+// noteSpawnSurface records that the matcher caught tool on the Claude Code version this
+// session is running (GOV-30). It is the only writer of the ledger.
+//
+// OFF THE HOT PATH, TWICE OVER. The version lookup goes through observe(), which caches for a
+// second and takes a mutex, and the disk write is an fsync-less rename — neither belongs in
+// front of a spawn Claude Code is blocked on. So the whole thing runs on its own goroutine
+// and the caller returns immediately. Nothing waits for it, nothing fails if it loses: the
+// worst case is a sighting not recorded, which reads as "not confirmed" and is corrected by
+// the next spawn.
+//
+// The version may come back empty — an unregistered session, or a host with no registry at
+// all. That is recorded as an empty version rather than dropped, because a sighting still
+// proves the matcher fired even when nothing can say against which version.
+func (d *daemon) noteSpawnSurface(session, tool string) {
+	if tool == "" {
+		return
+	}
+	go func() {
+		version := ""
+		if live, _, err := d.observe(); err == nil {
+			for _, s := range live {
+				if s.ID == session {
+					version = s.Version
+					break
+				}
+			}
+		}
+		if d.surface.note(version, tool) {
+			// Only a NEW (version, tool) pair reaches the disk. On a settled machine that is
+			// one write per Claude Code upgrade, not one per spawn.
+			d.surface.save()
+		}
+	}()
 }
 
 // The budget event log (GOV-11).
@@ -478,6 +534,14 @@ func runDaemon(args []string, stdout, stderr io.Writer) int {
 	d := newDaemon(*limit, stderr)
 	// The one place the daemon is allowed to look at the real machine.
 	d.observeThisMachine()
+	// And the one place its spawn-surface ledger is given a file. Derived from the endpoint
+	// rather than from transport.StateDir for the reason daemonPIDPath is: a daemon started
+	// with --endpoint elsewhere must not write over the ledger of the one serving the
+	// default socket. A directory that cannot be resolved leaves the ledger in memory, which
+	// costs the evidence on restart and nothing else.
+	if dir, err := stateDirFor(ep); err == nil {
+		d.surface = newSurfaceLedger(dir)
+	}
 	ln, err := transport.Listen{}.Listen(ctx, ep)
 	if err != nil {
 		fmt.Fprintf(stderr, "governor daemon: %v\n", err)
@@ -608,6 +672,10 @@ func newDaemonWithLeases(limit int, diag io.Writer, opt lease.Options) *daemon {
 		started:          time.Now(),
 		liveSessions:     noLiveSessions,
 		hooksInstalledAt: func() time.Time { return time.Time{} },
+		// Pathless by default, for the same reason liveSessions defaults to noLiveSessions:
+		// a daemon constructed in a test must not write to the developer's real state
+		// directory. runDaemon gives it a path; everything else keeps the ledger in memory.
+		surface: newSurfaceLedger(""),
 	}
 }
 
@@ -870,6 +938,11 @@ type parkedAcquire struct {
 func (d *daemon) acquire(req request) any {
 	limit, quotas := budget.Min(context.Background(), d.sources)
 	src := sourceName(quotas)
+
+	// GOV-30. Recorded for every acquire, including the ones about to be denied: the ledger's
+	// question is "did the matcher fire", and a spawn refused for capacity answers it just as
+	// well as one that was granted. Off the reply path entirely — see noteSpawnSurface.
+	d.noteSpawnSurface(req.Session, req.Tool)
 
 	// The depth limit comes first, and deliberately never waits. A nested spawn is not
 	// short of a slot, it is not allowed one, and parking it for twenty seconds before
@@ -1145,14 +1218,16 @@ func (d *daemon) status() statusReply {
 	out := statusReply{
 		V: d.speaks, Budget: limit, InUse: snap.InUse,
 		// Parked acquires, from the FIFO of design.md section 6.2.
-		Waiting:        d.waits.len(),
-		BinaryVersion:  binaryVersion,
-		Thermal:        d.thermal(),
-		Sources:        sources,
-		DaemonStarted:  d.started.UTC().Format(time.RFC3339),
-		HooksInstalled: hooks,
-		SessionsKnown:  known,
-		Sessions:       sessions,
+		Waiting:           d.waits.len(),
+		BinaryVersion:     binaryVersion,
+		Thermal:           d.thermal(),
+		Sources:           sources,
+		DaemonStarted:     d.started.UTC().Format(time.RFC3339),
+		HooksInstalled:    hooks,
+		SessionsKnown:     known,
+		Sessions:          sessions,
+		SpawnSurface:      d.surface.sightings(),
+		SpawnSurfaceKnown: true,
 	}
 	d.fillSignals(&out)
 	return out

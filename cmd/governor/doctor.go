@@ -90,7 +90,40 @@ const (
 	// and found something untidy"), and GOV-30 may well want a fourth state or a different
 	// exit-code rule for them. What it should not have to do is invent the plumbing again.
 	warn
+	// unverified is a check that could not answer its own question. Not "I looked and it is
+	// fine", not "I looked and it is broken" — "I could not look".
+	//
+	// GOV-30 added it, taking the invitation above. The case that forced it: the spawn check
+	// compares the Claude Code version the tool names were measured against to the version
+	// actually running, and when those differ it had no way to say so except `ok` with a
+	// sentence of caveat after it. The summary then said "10 checks, all passing" and exit 0.
+	// A stranger sees ten green lines. This repo's founding notice is that "a wrong tool name
+	// means the hook silently never fires and everything downstream looks like it works" — so
+	// the one check written to catch that was reporting the pre-failure condition as a pass.
+	//
+	// IT IS NOT A FAILURE, and that distinction is the whole point of adding a state rather
+	// than reclassifying to fail. Nothing is known to be broken; something is unconfirmed. A
+	// newer Claude Code is a routine event and failing on it would put a red line in front of
+	// every user after every upgrade, which teaches them that a red line means nothing — the
+	// exact cost checkSpawnTools's own comment was written to avoid.
+	//
+	// IT DOES MOVE THE EXIT CODE, to doctorExitUnverified rather than 1, because a report
+	// that cannot be trusted must not be scriptable as success. Giving it its own code is
+	// what lets `governor install` tell "this install is broken" from "this install is fine
+	// and one claim is not yet earned" — see verifyInstall.
+	unverified
 )
+
+// doctorExitUnverified is the exit status when nothing failed but at least one check could
+// not verify what it claims.
+//
+// It is a third code because the two it sits between already mean something a script acts
+// on: 0 is "this machine is good", 1 is "this machine is broken and here are the fixes",
+// and 2 is "you typed the command wrong". "I could not tell" is none of those, and folding
+// it into 1 would fail every `governor install` run on a Claude Code version nobody has
+// measured yet — which is every version, eventually, since that is what measurement expiring
+// means.
+const doctorExitUnverified = 3
 
 func (s checkState) label() string {
 	switch s {
@@ -100,8 +133,16 @@ func (s checkState) label() string {
 		return "FAIL"
 	case warn:
 		return "warn"
-	default:
+	case unverified:
+		return "unknown"
+	case skip:
 		return "skip"
+	default:
+		// Every state is named above. A new one reaching here would otherwise print as some
+		// other state's label and be silently dropped by doctor_test's parser — the same
+		// "mislabelled, and everything downstream looks fine" shape this command exists to
+		// remove. So it is loud instead.
+		return "BUG?"
 	}
 }
 
@@ -109,7 +150,7 @@ func (s checkState) label() string {
 type finding struct {
 	// name is the short column label — the subsystem, not the sentence.
 	name string
-	// state is pass, fail or skip.
+	// state is pass, fail, skip, warn or unverified.
 	state checkState
 	// detail is what was actually found, in the words of the thing that was inspected.
 	detail string
@@ -275,39 +316,138 @@ func readPIDFileAt(path string) (int, bool) {
 // who is not maintaining this program, not a fixable one; failing on it would put a red line
 // in front of every user after every upgrade and teach them that a red line means nothing.
 // The whole report is worth less than that costs.
+// describeSightings renders a version -> tools map as "Agent on 2.1.270; Task on 2.2.0",
+// sorted, skipping the undated bucket's version label since there is none to print.
+func describeSightings(by map[string][]string) string {
+	out := make([]string, 0, len(by))
+	for v, tools := range by {
+		if len(tools) == 0 {
+			continue
+		}
+		if v == "" {
+			out = append(out, strings.Join(tools, ", ")+" on an unknown version")
+			continue
+		}
+		out = append(out, fmt.Sprintf("%s on %s", strings.Join(tools, ", "), v))
+	}
+	sort.Strings(out)
+	return strings.Join(out, "; ")
+}
+
 func (d *diagnosis) checkSpawnTools() {
 	names := strings.Join(spawnToolNames, ", ")
-	var newer []string
+
+	// A daemon that predates GOV-30 sends no ledger at all, and an empty ledger from a daemon
+	// that does is a different fact entirely: one is "nobody is recording", the other is
+	// "recording, and nothing has spawned". Mirrors SessionsKnown, and for the same reason —
+	// see the fix this branch names, which is an upgrade rather than an accusation.
+	if !d.reply.SpawnSurfaceKnown {
+		d.add("spawn", unverified, fmt.Sprintf(
+			"%s — the daemon does not report which spawn tools it has caught, so nothing here confirms the matcher fires",
+			names),
+			"restart the daemon on this binary with `governor install` — a daemon older than "+
+				"this build keeps no record of what the gate caught")
+		return
+	}
+
+	// What the gate has actually been seen to catch, by Claude Code version — restricted to
+	// the names that prove the SPAWN path is matched. See spawnConfirmingTools: a SendMessage
+	// resume reaches the gate even on a version where the spawn tool has been renamed, so
+	// counting it as confirmation would let a working tool cover for a broken one.
+	confirmed := map[string][]string{}
+	seenAnywhere := map[string][]string{}
+	for _, o := range d.reply.SpawnSurface {
+		var proving []string
+		for _, tool := range o.Tools {
+			if confirmsSpawnPath(tool) {
+				proving = append(proving, tool)
+			}
+		}
+		if len(o.Tools) > 0 {
+			seenAnywhere[o.Version] = o.Tools
+		}
+		if len(proving) > 0 {
+			confirmed[o.Version] = proving
+		}
+	}
+
+	// The versions running here, which are the ones the claim has to hold for.
+	var running []string
 	seen := map[string]bool{}
 	for _, s := range d.reply.Sessions {
 		if !s.Live || s.Version == "" || seen[s.Version] {
 			continue
 		}
 		seen[s.Version] = true
-		if compareVersions(s.Version, spawnToolNamesConfirmedAgainst) > 0 {
-			newer = append(newer, s.Version)
+		running = append(running, s.Version)
+	}
+	sort.Strings(running)
+
+	if len(running) == 0 {
+		// No version could be read, so there is nothing to hold the claim against. Before
+		// GOV-30 this said `ok` with a caveat, and on a host with no session registry that
+		// was the DEFAULT output rather than a rare one — ten green lines on a machine where
+		// nothing had been checked at all.
+		detail := fmt.Sprintf("%s — no Claude Code version seen here, so nothing confirms the matcher fires on it", names)
+		if caught := describeSightings(seenAnywhere); caught != "" {
+			// The evidence is real but it cannot be dated, and a sighting that cannot be
+			// dated cannot expire — which is the unfalsifiable claim this story removed. So
+			// it is printed and still not treated as confirmation.
+			detail = fmt.Sprintf("%s — the gate has caught %s, but no Claude Code version could be read here to date that against",
+				names, caught)
+		}
+		d.add("spawn", unverified, detail,
+			"nothing to type if this host keeps no session registry — the sessions check above "+
+				"says which case this is; a sighting that cannot be dated cannot expire, so it "+
+				"is not treated as confirmation")
+		return
+	}
+
+	var missing []string
+	var held []string
+	for _, v := range running {
+		if tools, ok := confirmed[v]; ok {
+			held = append(held, fmt.Sprintf("%s on %s", strings.Join(tools, ", "), v))
+			continue
+		}
+		missing = append(missing, v)
+	}
+
+	if len(missing) == 0 {
+		// The strong statement, and the only one this check is now willing to make as a pass:
+		// on every version running here, the harness has been observed to send a tool name
+		// this matcher caught. That is not a belief about a version number, it is a payload.
+		d.add("spawn", pass, fmt.Sprintf("%s — matcher confirmed firing by real spawns (%s)",
+			names, strings.Join(held, "; ")), "")
+		return
+	}
+
+	// UNVERIFIED, NOT FAILED. Silence has two causes and this check cannot tell them apart:
+	// either nothing has spawned a subagent on that version yet, or Claude Code renamed the
+	// tool and the matcher has stopped firing entirely. The first is routine; the second is
+	// the failure this project exists to catch. Reporting `ok` covered both, which is the
+	// defect GOV-30 was filed for.
+	detail := fmt.Sprintf("%s — no spawn seen yet on Claude Code %s, so nothing confirms the matcher still fires there",
+		names, joinClauses(missing))
+	switch {
+	case len(held) > 0:
+		detail += fmt.Sprintf(" (confirmed on %s)", strings.Join(held, "; "))
+	default:
+		// Evidence from a version that is no longer running is still worth printing, and in
+		// the case this check was written for it is the most informative line in the report:
+		// "the matcher was firing on the version you were on yesterday and has not been seen
+		// since you upgraded" is what a rename looks like from the outside. Without it the
+		// reader cannot tell a matcher that broke from one that has simply never been tried.
+		if last := describeSightings(confirmed); last != "" {
+			detail += fmt.Sprintf(" (last seen firing: %s)", last)
 		}
 	}
-	if len(seen) == 0 {
-		// Nothing was read, so nothing was compared. Saying "measured against 2.1.267" here
-		// would read as "checked against what is running on this machine" when no version was
-		// observed at all — and on a host with no session registry that is the DEFAULT output,
-		// not a rare one. The sibling sessions check states its own limit for this reason and
-		// so does this.
-		d.add("spawn", pass, fmt.Sprintf(
-			"%s, measured against Claude Code %s — no running version seen here to compare against",
-			names, spawnToolNamesConfirmedAgainst), "")
-		return
+	fix := "spawn a subagent in a session running " + missing[0]
+	if len(missing) > 1 {
+		fix = "spawn a subagent in a session on each of those versions"
 	}
-	if len(newer) == 0 {
-		d.add("spawn", pass, fmt.Sprintf("%s, measured against Claude Code %s",
-			names, spawnToolNamesConfirmedAgainst), "")
-		return
-	}
-	sort.Strings(newer)
-	d.add("spawn", pass, fmt.Sprintf(
-		"%s, measured against Claude Code %s — NOT re-checked against %s, which is running here",
-		names, spawnToolNamesConfirmedAgainst, strings.Join(newer, " and ")), "")
+	d.add("spawn", unverified, detail, fix+", then re-run `governor doctor` — if it still says "+
+		"this afterwards, the matcher is not firing and those spawns are not being governed")
 }
 
 // compareVersions orders two dotted numeric versions. Non-numeric or ragged input compares
@@ -376,16 +516,17 @@ func (d *diagnosis) checkSessions() {
 		// Either this Claude Code keeps no session registry, or the daemon predates GOV-29.
 		// Neither is a failure and neither is a skip: a skip in this command means "downstream
 		// of a check that already failed and already named its fix", and nothing here failed.
-		// It is reported as a pass that states its own limit, on the rule that makes an
-		// unmeasurable thermal state nominal rather than critical — an instrument that cannot
-		// read says so instead of guessing a reading.
 		//
-		// The detail leads with "not verified" deliberately. This is the one line in the
-		// report where "ok" would otherwise be read as "checked and fine", and that misreading
-		// is the entire defect this check was added to remove.
-		d.add("sessions", pass,
+		// It USED TO BE A PASS whose detail led with "not verified", on the reasoning that
+		// saying so plainly was enough. GOV-30 disagreed with that in general and with this
+		// line in particular: the summary underneath still counted it toward "N checks, all
+		// passing", and the one word a hurried reader takes from a report is the one in the
+		// state column. An instrument that cannot read now says so in the column too.
+		d.add("sessions", unverified,
 			"not verified — the daemon did not say which sessions are live "+
-				"(a daemon older than this binary, or a host with no session registry)", "")
+				"(a daemon older than this binary, or a host with no session registry)",
+			"upgrade the daemon with `governor install` if it is older than this binary; "+
+				"otherwise this host keeps no session registry and there is nothing to fix")
 		return
 	}
 
@@ -463,22 +604,61 @@ func pluralSessions(v []sessionVerdict) string {
 	return "the Claude Code sessions in " + strings.Join(names, ", ")
 }
 
+// stateColumn is the width of the leading state column, and fixIndent aligns a fix line
+// under the check it belongs to.
+//
+// Seven, because "unknown" is seven characters. GOV-30 widened it from four and chose the
+// whole word over an abbreviation that fit: this column is the first thing read and the
+// state it was added for exists precisely because an unclear report cost a week of trusting
+// green lines. fixIndent is stateColumn+2 and must stay so — doctor_test's parser attaches a
+// fix line to the finding above it by that indent.
+const (
+	stateColumn = 7
+	fixIndent   = stateColumn + 2
+)
+
+// joinClauses renders a list as prose: "a", "a and b", "a, b and c".
+func joinClauses(c []string) string {
+	switch len(c) {
+	case 0:
+		return ""
+	case 1:
+		return c[0]
+	default:
+		return strings.Join(c[:len(c)-1], ", ") + " and " + c[len(c)-1]
+	}
+}
+
 // report prints the findings and returns the process exit code.
 //
-// Non-zero if any check failed, per this story's acceptance criterion. It is 1 rather than
+// Non-zero if any check failed, per GOV-20's acceptance criterion. It is 1 rather than
 // 2, because 2 is what this binary already returns for a usage error and a script that
 // cannot tell "your install is broken" from "you typed the command wrong" is a script that
-// will conflate them.
+// will conflate them. GOV-30 added a third non-zero code for a third thing a script needs to
+// tell apart — see doctorExitUnverified.
 func (d *diagnosis) report(stdout io.Writer) int {
-	failed, warned := 0, 0
+	failed, warned, unknowns, skipped := 0, 0, 0, 0
 	for _, f := range d.findings {
-		fmt.Fprintf(stdout, "%-4s  %-8s  %s\n", f.state.label(), f.name, f.detail)
+		if f.state == skip {
+			// Counted so the summary's "N passing" does not quietly include checks that never
+			// ran. Skips are only reachable downstream of a failure today, which takes the
+			// other branch — but GOV-30 made the no-failures-with-extras branch reachable for
+			// the first time, so the arithmetic now has to be right in a case it never met.
+			skipped++
+		}
+		fmt.Fprintf(stdout, "%-*s  %-8s  %s\n", stateColumn, f.state.label(), f.name, f.detail)
 		// A warning carries a fix too — it is something a person can act on — but it is not
 		// a failure, so it neither counts toward the failure total nor changes the exit code.
-		if f.state == warn {
-			warned++
+		// An unverified check is the same shape: it is worth acting on (the fix is usually
+		// what would let it verify) without being a defect.
+		if f.state == warn || f.state == unverified {
+			if f.state == warn {
+				warned++
+			} else {
+				unknowns++
+			}
 			if f.fix != "" {
-				fmt.Fprintf(stdout, "      %-8s  %s\n", "fix", f.fix)
+				fmt.Fprintf(stdout, "%*s%-8s  %s\n", fixIndent, "", "fix", f.fix)
 			}
 			continue
 		}
@@ -493,27 +673,67 @@ func (d *diagnosis) report(stdout io.Writer) int {
 			// on the spot than to ship a check that quietly stops earning its keep.
 			fix = "no fix recorded for this check — that is a bug in governor doctor"
 		}
-		fmt.Fprintf(stdout, "      %-8s  %s\n", "fix", fix)
+		fmt.Fprintf(stdout, "%*s%-8s  %s\n", fixIndent, "", "fix", fix)
+	}
+	// The clauses the summary needs beyond the headline, in the order they read best. The
+	// count is kept apart from the phrase because the two branches below word them
+	// differently — "1 to look at" when nothing failed, "1 more to look at" when something
+	// did — and reassembling one from the other by string surgery is how a summary line
+	// starts lying about arithmetic.
+	var extra []struct {
+		n      int
+		phrase string
+	}
+	if warned > 0 {
+		extra = append(extra, struct {
+			n      int
+			phrase string
+		}{warned, "to look at"})
+	}
+	if unknowns > 0 {
+		extra = append(extra, struct {
+			n      int
+			phrase string
+		}{unknowns, "that could not be verified"})
+	}
+	clause := func(prefix string) []string {
+		out := make([]string, 0, len(extra))
+		for _, e := range extra {
+			out = append(out, fmt.Sprintf("%d %s%s", e.n, prefix, e.phrase))
+		}
+		return out
 	}
 	if failed == 0 {
 		// "all passing" is a claim, and it may only be made when it is true. A run with a
 		// warning in it is the exact case GOV-B11 was filed about — ten green lines above
-		// four orphaned daemons — so the summary names the warning rather than rounding it
-		// off. The exit code stays 0: nothing here is broken.
-		if warned > 0 {
-			fmt.Fprintf(stdout, "\n%d checks, %d passing and %d to look at.\n",
-				len(d.findings), len(d.findings)-warned, warned)
+		// four orphaned daemons — and a run with an unverified check in it is GOV-30's,
+		// where the tenth green line was a check saying it had not looked. Both are named
+		// here rather than rounded off.
+		if len(extra) == 0 {
+			fmt.Fprintf(stdout, "\n%d checks, all passing.\n", len(d.findings))
 			return 0
 		}
-		fmt.Fprintf(stdout, "\n%d checks, all passing.\n", len(d.findings))
+		clauses := append([]string{fmt.Sprintf("%d passing", len(d.findings)-warned-unknowns-skipped)}, clause("")...)
+		fmt.Fprintf(stdout, "\n%d checks, %s.\n", len(d.findings), joinClauses(clauses))
+		if unknowns > 0 {
+			return doctorExitUnverified
+		}
+		// A warning on its own still exits 0: nothing here is broken.
 		return 0
 	}
-	if warned > 0 {
-		fmt.Fprintf(stdout, "\n%d of %d checks failed, and %d more to look at.\n",
-			failed, len(d.findings), warned)
-		return 1
+	// A failure outranks everything below it. The exit code says "broken" even when something
+	// also could not be verified, because that is the more urgent of the two and the fixes
+	// printed above are for it.
+	switch {
+	case len(extra) == 0:
+		fmt.Fprintf(stdout, "\n%d of %d checks failed.\n", failed, len(d.findings))
+	case len(extra) == 1:
+		fmt.Fprintf(stdout, "\n%d of %d checks failed, and %s.\n",
+			failed, len(d.findings), clause("more ")[0])
+	default:
+		fmt.Fprintf(stdout, "\n%d of %d checks failed, with %s.\n",
+			failed, len(d.findings), joinClauses(clause("")))
 	}
-	fmt.Fprintf(stdout, "\n%d of %d checks failed.\n", failed, len(d.findings))
 	return 1
 }
 

@@ -158,7 +158,11 @@ type line struct {
 	fix    string
 }
 
-var findingRE = regexp.MustCompile(`^(ok|FAIL|skip|warn)\s+(\S+)\s+(.*)$`)
+// Every state label the report can print. A state missing from this alternation does not
+// fail loudly — every line in it is silently dropped from the parsed map, and the test then
+// complains that a check is absent from a report it is plainly in. Add the label here in the
+// same change that adds the state.
+var findingRE = regexp.MustCompile(`^(ok|FAIL|skip|warn|unknown)\s+(\S+)\s+(.*)$`)
 
 // doctor runs the command against whatever the world currently holds and parses its report.
 func doctor(t *testing.T) (int, map[string]line, string) {
@@ -170,7 +174,7 @@ func doctor(t *testing.T) (int, map[string]line, string) {
 	found := map[string]line{}
 	var order []string
 	for _, raw := range strings.Split(out, "\n") {
-		if strings.HasPrefix(raw, "      ") {
+		if strings.HasPrefix(raw, strings.Repeat(" ", fixIndent)) {
 			// A fix line, belonging to the finding above it.
 			if len(order) == 0 {
 				t.Fatalf("fix line with no finding above it:\n%s", out)
@@ -304,16 +308,32 @@ func TestDoctorPassesOnAWorkingInstall(t *testing.T) {
 	w.writeHooks(w.settings, selfBinary(t), goodHooks())
 
 	code, found, out := doctor(t)
+	// NOTHING TO FIX is the property, and it is asserted as "nothing failed" rather than
+	// "everything says ok". This world has no session registry and no daemon that has ever
+	// seen a spawn, so two checks genuinely cannot verify themselves in it and GOV-30 made
+	// them say so. Demanding ok from them here would be demanding the report lie — which is
+	// the bug GOV-30 was filed for, reintroduced through its test.
+	//
+	// TestDoctorPassesEveryCheckOnAFullyObservableMachine is the other half: give those two
+	// checks what they need and every line does go green.
+	unverifiable := map[string]bool{"sessions": true, "spawn": true}
 	for name, f := range found {
-		if f.state != "ok" {
+		switch {
+		case f.state == "ok":
+		case f.state == "unknown" && unverifiable[name]:
+		default:
 			t.Errorf("%s: %s (%s), want ok\n%s", name, f.state, f.detail, out)
 		}
 	}
-	if code != 0 {
-		t.Fatalf("exit %d on a working install, want 0:\n%s", code, out)
+	if code != doctorExitUnverified {
+		t.Fatalf("exit %d on a working install with nothing to verify against, want %d:\n%s",
+			code, doctorExitUnverified, out)
 	}
-	if !strings.Contains(out, "all passing") {
-		t.Errorf("report does not say it passed:\n%s", out)
+	if strings.Contains(out, "FAIL") {
+		t.Errorf("a working install reported a failure:\n%s", out)
+	}
+	if !strings.Contains(out, "could not be verified") {
+		t.Errorf("report does not name what it could not verify:\n%s", out)
 	}
 }
 

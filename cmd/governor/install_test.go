@@ -1075,8 +1075,13 @@ func TestDoctorPassesEveryCheckAfterAnInstall(t *testing.T) {
 	t.Cleanup(func() { runReal(t, p, "uninstall", "--purge") })
 
 	code, out, _ := runReal(t, p, "doctor")
-	if code != 0 {
-		t.Errorf("governor doctor: exit %d after a clean install, want 0\n%s\n%s", code, out, daemonLog(t, p))
+	// Zero, or GOV-30's "could not verify". A freshly installed machine has not spawned
+	// anything yet, so the spawn check has no observed payload to confirm the matcher against
+	// and says so — which is the honest answer and the reason that state exists. What must
+	// not appear is a failure.
+	if code != 0 && code != doctorExitUnverified {
+		t.Errorf("governor doctor: exit %d after a clean install, want 0 or %d\n%s\n%s",
+			code, doctorExitUnverified, out, daemonLog(t, p))
 	}
 	if strings.Contains(out, "FAIL") {
 		t.Errorf("governor doctor reported a failure after a clean install:\n%s", out)
@@ -1093,7 +1098,8 @@ func TestDoctorPassesEveryCheckAfterAnInstall(t *testing.T) {
 	// and demanding the literal words "all passing" here would make this test fail for a
 	// reason that has nothing to do with install. The clauses above still hold the line that
 	// matters: no FAIL, and no skip.
-	if !strings.Contains(out, "all passing") && !strings.Contains(out, "to look at") {
+	if !strings.Contains(out, "all passing") && !strings.Contains(out, "to look at") &&
+		!strings.Contains(out, "could not be verified") {
 		t.Errorf("governor doctor did not report every check passing:\n%s", out)
 	}
 
@@ -1127,8 +1133,16 @@ func TestInstallVerifiesItselfWithDoctor(t *testing.T) {
 			t.Errorf("install did not run doctor:\n%s", stdout)
 		}
 		// See TestDoctorPassesEveryCheckAfterAnInstall: a warning about another daemon on the
-		// machine is not this install failing, so either summary is a pass here. A FAIL is not.
-		if !strings.Contains(stdout, "all passing") && !strings.Contains(stdout, "to look at") {
+		// machine is not this install failing, so any of these summaries is a pass here. A
+		// FAIL is not.
+		//
+		// "could not be verified" is the usual one on a clean machine, and GOV-30 had to add
+		// it: a freshly installed host has spawned nothing, so the spawn check has no observed
+		// payload to confirm the matcher against, and CI has no session registry either. It
+		// passed locally without this only because the developer's machine has a real governor
+		// daemon running, which made `strays` warn and satisfied the middle clause by accident.
+		if !strings.Contains(stdout, "all passing") && !strings.Contains(stdout, "to look at") &&
+			!strings.Contains(stdout, "could not be verified") {
 			t.Errorf("install ran doctor but did not print a passing report:\n%s\n%s",
 				stdout, daemonLog(t, p))
 		}

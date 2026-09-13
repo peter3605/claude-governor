@@ -126,7 +126,8 @@ func resolvePaths() (paths, error) {
 // measurement, and throwing it away on uninstall would throw away the phase. The directory
 // itself is removed only once it is empty, so a machine that still has its samples keeps
 // them and everything else goes.
-var stateFiles = []string{"sock", "statusline.json", daemonPIDFile, daemonLogFile, daemonStartFile, onboardMarker}
+var stateFiles = []string{"sock", "statusline.json", daemonPIDFile, daemonLogFile, daemonStartFile, onboardMarker,
+	surfaceFile, surfaceTempFile}
 
 // ---------------------------------------------------------------------------
 // the plugin's files
@@ -423,6 +424,18 @@ func verifyInstall(stdout, stderr io.Writer) int {
 	fmt.Fprintln(stdout, "\n--- governor doctor ---")
 	code := runDoctor(nil, stdout, stderr)
 	if code == 0 {
+		return 0
+	}
+	// A check that could not verify is not a failed install, and install must not exit
+	// non-zero for one (GOV-30). It is the EXPECTED state of a fresh install: the spawn
+	// surface is confirmed by watching a real spawn go past the gate, and nothing has spawned
+	// anything yet at the moment install finishes. Failing here would make every first run of
+	// install.sh report a broken machine, which is how a red line comes to mean nothing.
+	if code == doctorExitUnverified {
+		fmt.Fprintln(stdout, "\nThe install is complete. One or more checks above could not confirm")
+		fmt.Fprintln(stdout, "themselves — each says what it could not see and what, if anything, to do")
+		fmt.Fprintln(stdout, "about it. On most machines the spawn check settles the first time you")
+		fmt.Fprintln(stdout, "run a subagent. Re-run: governor doctor")
 		return 0
 	}
 	fmt.Fprintln(stdout, "\nThe files are installed, but this machine is not governing anything yet.")

@@ -48,6 +48,20 @@ governor status       # budget, holders, CPU, thermal
 governor uninstall    # remove all of it
 ```
 
+**A check can say `unknown`, and that is not a failure.** It means the check could not answer
+its own question rather than that something is broken — most often the `spawn` check on a
+freshly installed machine, which confirms the hook really fires by watching a real subagent
+spawn go past it, and has not seen one yet. `doctor` exits `3` for that (`1` is a genuine
+failure, `0` is all clear), and on most machines it settles the first time you run a subagent.
+Each `unknown` line says what it could not see and what, if anything, you can do — on a host
+whose Claude Code keeps no session registry for the governor to read, some of them cannot be
+settled at all, and say so rather than pretending otherwise.
+
+The reason any of this is reported instead of rounded up to `ok`: if a future Claude Code
+renamed the tool the hook matches on, nothing would error. The hook would simply stop firing,
+every other check would stay green, and no subagent would ever be governed again. Silence is
+the only evidence that exists, so the report is built to say when all it has is silence.
+
 **Removing it leaves nothing.** `governor uninstall` deletes the plugin, restores whatever
 `statusLine` you had before — byte for byte, formatting and key order included — stops the
 daemon and removes its socket. `--purge` also removes the config, the first-run notice marker and the

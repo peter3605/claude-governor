@@ -107,6 +107,16 @@ type acquireRequest struct {
 	ToolUseID string    `json:"tool_use_id"`
 	Depth     int       `json:"depth"`
 	WaitMS    int       `json:"wait_ms"`
+	// Tool is the tool_name the harness actually put on this PreToolUse payload, passed
+	// through so the daemon can record what the matcher really caught (GOV-30, surface.go).
+	//
+	// Additive, and the protocol version is NOT bumped for it, exactly as GOV-12's and
+	// GOV-29's status fields were not: an older daemon ignores a key it does not know, and a
+	// newer daemon reading an older gate's request simply gets "" and records nothing. Both
+	// halves of a mixed-version machine keep governing spawns, which is the property that
+	// matters; the ledger merely stays empty and doctor reports the surface as unconfirmed,
+	// which is true. A bump would instead make every un-upgraded gate fail open.
+	Tool string `json:"tool,omitempty"`
 }
 
 // acquireResponse is the granted and refused replies of design.md section 7, decoded into
@@ -175,6 +185,42 @@ var agentIDShape = regexp.MustCompile(`^[0-9a-f]{17}$`)
 // a matcher that silently stops covering a spawn path.
 var spawnToolNames = []string{"Agent", "Task", "SendMessage"}
 
+// spawnConfirmingTools are the names whose arrival PROVES the spawn path is still matched.
+//
+// It is a subset of spawnToolNames, and the difference between the two lists is the whole
+// point. `Agent` and `Task` are two spellings of the tool that STARTS a subagent. SendMessage
+// RESUMES one that already exists (docs/hook-surface.md section 8.3, path 2) — a real spawn
+// worth governing, but not evidence about the path that creates them.
+//
+// GOV-30's first cut confirmed the surface on any sighting at all, and an adversarial review
+// found the hole: rename the spawn tool and `Agent` stops matching, so every fresh spawn goes
+// ungoverned — while `SendMessage` keeps matching, keeps reaching the gate, and keeps landing
+// sightings on the new version. Doctor would print ok on the strength of a tool that never
+// broke, and the silence that was supposed to be the signal would be covered. So the ledger's
+// question is narrower than "did anything fire": it is "did the thing that starts subagents
+// fire". TestASendMessageSightingDoesNotConfirmTheSpawnPath is that hole, held open.
+var spawnConfirmingTools = []string{"Agent", "Task"}
+
+// matchedSpawnTool reports whether a tool name is one the gate's matcher is built from.
+func matchedSpawnTool(tool string) bool {
+	for _, n := range spawnToolNames {
+		if n == tool {
+			return true
+		}
+	}
+	return false
+}
+
+// confirmsSpawnPath reports whether an observed tool name proves the spawn path is matched.
+func confirmsSpawnPath(tool string) bool {
+	for _, n := range spawnConfirmingTools {
+		if n == tool {
+			return true
+		}
+	}
+	return false
+}
+
 // spawnToolNamesConfirmedAgainst is the Claude Code version the list above was last MEASURED
 // against, not merely believed correct for.
 //
@@ -188,10 +234,18 @@ var spawnToolNames = []string{"Agent", "Task", "SendMessage"}
 //
 // A version stamp cannot detect a rename either. What it can do is stop the claim from being
 // unfalsifiable: it turns "the matcher is correct" into "the matcher was correct as of
-// 2.1.267", which is a statement that expires and can be re-earned by re-running the probe in
+// 2.1.270", which is a statement that expires and can be re-earned by re-running the probe in
 // docs/hook-surface.md section 12. GOV-28 and GOV-29 between them changed the answer twice in
 // four patch versions, so it does expire.
-const spawnToolNamesConfirmedAgainst = "2.1.267"
+//
+// GOV-30 TOOK THE OTHER HALF OF THE PROBLEM AWAY FROM IT. This constant is now the stamp on
+// the DOCUMENTED measurement and nothing else: doctor no longer decides anything by comparing
+// it to the running version, because that comparison could only ever say "the measurement is
+// old", never "the matcher stopped firing". Doctor asks the ledger in surface.go instead,
+// which is built from tool names the harness actually sent. What this constant still does is
+// tie the repo's written record to a version, and TestRecordedSurfaceMatchesTheMatcher holds
+// it to docs/hook-surface.md so the two cannot drift.
+const spawnToolNamesConfirmedAgainst = "2.1.270"
 
 // governsSpawn reports whether this payload puts a subagent on the CPU, and if not, why.
 //
@@ -468,6 +522,7 @@ func acquireRequestFor(p hookPayload, speaks int) acquireRequest {
 		Principal: localPrincipal(),
 		Session:   p.SessionID,
 		ToolUseID: p.ToolUseID,
+		Tool:      p.ToolName,
 		Depth:     depth,
 		// What the gate is willing to be held for. The daemon parks the request for at most
 		// this long and answers either way; a gate that cannot perform a wait sends zero,
