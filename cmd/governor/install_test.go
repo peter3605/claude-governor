@@ -1086,7 +1086,14 @@ func TestDoctorPassesEveryCheckAfterAnInstall(t *testing.T) {
 	if strings.Contains(out, "skip") {
 		t.Errorf("governor doctor skipped a check after a clean install:\n%s", out)
 	}
-	if !strings.Contains(out, "all passing") {
+	// "no check failed", not "all passing". GOV-B11 added a check that reports on the whole
+	// MACHINE rather than on this installation — other governor daemons running on it — and
+	// that is a warning by design, because a daemon somebody started by hand is not a defect
+	// in the install this test just performed. A developer's machine legitimately has one,
+	// and demanding the literal words "all passing" here would make this test fail for a
+	// reason that has nothing to do with install. The clauses above still hold the line that
+	// matters: no FAIL, and no skip.
+	if !strings.Contains(out, "all passing") && !strings.Contains(out, "to look at") {
 		t.Errorf("governor doctor did not report every check passing:\n%s", out)
 	}
 
@@ -1119,8 +1126,14 @@ func TestInstallVerifiesItselfWithDoctor(t *testing.T) {
 		if !strings.Contains(stdout, "governor doctor ---") {
 			t.Errorf("install did not run doctor:\n%s", stdout)
 		}
-		if !strings.Contains(stdout, "all passing") {
+		// See TestDoctorPassesEveryCheckAfterAnInstall: a warning about another daemon on the
+		// machine is not this install failing, so either summary is a pass here. A FAIL is not.
+		if !strings.Contains(stdout, "all passing") && !strings.Contains(stdout, "to look at") {
 			t.Errorf("install ran doctor but did not print a passing report:\n%s\n%s",
+				stdout, daemonLog(t, p))
+		}
+		if strings.Contains(stdout, "FAIL") {
+			t.Errorf("install ran doctor and it reported a failure:\n%s\n%s",
 				stdout, daemonLog(t, p))
 		}
 	})

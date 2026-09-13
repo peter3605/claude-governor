@@ -663,11 +663,12 @@ func startDetachedDaemon(t *testing.T, binary string, p paths) {
 	}
 	pid := cmd.Process.Pid
 	_ = cmd.Process.Release()
-	t.Cleanup(func() {
-		if procAlive(pid) {
-			_ = syscallKill(pid)
-		}
-	})
+	// GOV-B11: killDaemon rather than a bare SIGTERM. Released and Setsid, this process is no
+	// longer a child of the test binary, so nothing reaps it implicitly and nothing waits for
+	// it — the old cleanup signalled and returned, and a daemon that ignored SIGTERM, or was
+	// merely slower than the next test's bind, stayed. killDaemon escalates to SIGKILL and
+	// waits for the process to actually leave the table.
+	t.Cleanup(func() { killDaemon(pid) })
 	// The daemon writes its own pid file, and install's replace path reads it. Waiting for
 	// the file rather than only for the socket is what makes the staging complete: a socket
 	// with no pid file is a different scenario, and not the one being staged here.

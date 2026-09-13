@@ -7,8 +7,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -334,18 +334,46 @@ func runRealGate(t *testing.T, state, endpoint string) (stdout, stderr string) {
 // A leaked daemon outlives the test's temp directory — it holds a socket that has been
 // deleted underneath it and stays resident until the machine reboots — so this is cleanup
 // that has to happen rather than tidiness.
+// GOV-B11 rewrote the body. Two things were wrong with reading the pid file once and
+// returning quietly when it was not there.
+//
+// First, THE FILE IS WRITTEN ASYNCHRONOUSLY. The gate forks the daemon and exits without
+// waiting for it — deliberately, because invariant 1 says the spawn may not be delayed —
+// so a test that fails anywhere between the fork and the bind reaches this function before
+// the daemon has written anything. The old code read ENOENT, concluded there was nothing to
+// clean up, and returned; the daemon arrived a few milliseconds later, and by then sockDir's
+// own cleanup had removed the directory out from under it. That is not a hypothetical
+// ordering — it is the documented orphan shape, a daemon holding a socket that no longer
+// exists, and it is why this waits for the file rather than sampling for it.
+//
+// Second, os.FindProcess never fails on unix — it returns a Process for any pid, live or
+// not — so `if err == nil` read as a liveness check that is always true, and p.Kill()'s
+// error was discarded. Nothing in the old body could report that the daemon had survived.
 func stopLazilyStartedDaemon(t *testing.T, state string) {
 	t.Helper()
-	raw, err := os.ReadFile(filepath.Join(state, daemonPIDFile))
-	if err != nil {
+	path := filepath.Join(state, daemonPIDFile)
+
+	// Bounded, and short. The daemon writes its pid immediately after binding; a second is
+	// many times that, and if it has not appeared the fork failed and there is nothing to
+	// reap. TestMain's sweep is the backstop for anything slower than this.
+	pid, ok := 0, false
+	deadline := time.Now().Add(time.Second)
+	for {
+		if pid, ok = readPIDFileAt(path); ok {
+			break
+		}
+		if time.Now().After(deadline) {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	if !killDaemon(pid) {
 		return
 	}
-	pid, err := strconv.Atoi(strings.TrimSpace(string(raw)))
-	if err != nil || pid <= 0 {
-		return
-	}
-	if p, err := os.FindProcess(pid); err == nil {
-		_ = p.Kill()
+	if syscall.Kill(pid, 0) == nil {
+		t.Errorf("daemon %d survived cleanup; it holds a socket under %s, which is about to "+
+			"be removed underneath it", pid, state)
 	}
 }
 

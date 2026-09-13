@@ -205,7 +205,7 @@ func TestDaemonServesTheFullLeaseLifecycle(t *testing.T) {
 
 	if r := call(t, endpoint, map[string]any{
 		"v": protocolVersion, "op": "confirm", "session": "s1", "lease": got.Lease,
-		"agent_id": "ag_1", "pid": os.Getpid(), "pid_started_at": time.Now().Unix(),
+		"agent_id": "ag_1", "pid": os.Getpid(), "pid_started_at": processStartUnix(t, os.Getpid()),
 	}); r.OK == nil || !*r.OK {
 		t.Fatalf("confirm refused: %+v", r)
 	}
@@ -617,10 +617,18 @@ func TestInteractiveFanOutKeepsALeasePerRunningAgent(t *testing.T) {
 	clock := &testClock{now: time.Now()}
 	endpoint, d := startTestDaemonWithLeases(t, 4, lease.Options{Now: clock.Now})
 
+	// processStartUnix, not time.Now(). The owner here is the test process itself, and
+	// PIDLiveness accepts a start time only within startTimeTolerance — two seconds — of the
+	// one the process table reports. time.Now() satisfied that by accident, for as long as
+	// the test binary was under two seconds old, so the suite passed at -count=1 and this
+	// test failed on the second iteration of -count=2: the fabricated start time had drifted
+	// out of tolerance, the reaper read that as a recycled PID, and it collected three leases
+	// whose owner was alive. GOV-B11 found it because a leak check has to be able to run the
+	// suite twice.
 	if r := call(t, endpoint, map[string]any{
 		"v": protocolVersion, "op": "session", "action": "start",
 		"principal": map[string]any{"user": "tester"},
-		"session":   "s1", "pid": os.Getpid(), "pid_started_at": time.Now().Unix(), "weight": 1,
+		"session":   "s1", "pid": os.Getpid(), "pid_started_at": processStartUnix(t, os.Getpid()), "weight": 1,
 	}); r.OK == nil || !*r.OK {
 		t.Fatalf("session start refused: %+v", r)
 	}
@@ -643,7 +651,7 @@ func TestInteractiveFanOutKeepsALeasePerRunningAgent(t *testing.T) {
 	for _, ag := range agents {
 		if r := call(t, endpoint, map[string]any{
 			"v": protocolVersion, "op": "confirm", "session": "s1",
-			"agent_id": ag, "pid": os.Getpid(), "pid_started_at": time.Now().Unix(),
+			"agent_id": ag, "pid": os.Getpid(), "pid_started_at": processStartUnix(t, os.Getpid()),
 		}); r.OK == nil || !*r.OK {
 			t.Fatalf("confirm for %s refused: %+v", ag, r)
 		}

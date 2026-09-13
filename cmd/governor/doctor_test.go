@@ -158,7 +158,7 @@ type line struct {
 	fix    string
 }
 
-var findingRE = regexp.MustCompile(`^(ok|FAIL|skip)\s+(\S+)\s+(.*)$`)
+var findingRE = regexp.MustCompile(`^(ok|FAIL|skip|warn)\s+(\S+)\s+(.*)$`)
 
 // doctor runs the command against whatever the world currently holds and parses its report.
 func doctor(t *testing.T) (int, map[string]line, string) {

@@ -1,8 +1,10 @@
 package main
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/peter3605/claude-governor/internal/transport"
@@ -48,8 +50,29 @@ func TestMain(m *testing.M) {
 	// path carrying a test name blows that (see sockDir).
 	os.Setenv(transport.StateDirEnv, dir)
 	os.Setenv(transport.EndpointEnv, "unix://"+filepath.Join(dir, "sock"))
+	registerStateDir(dir)
+
+	// The stray-daemon scan reads the whole process table, which is the one thing in doctor
+	// that no test can stage (GOV-B11). Left live, every test asserting "all passing" fails on
+	// any machine with a governor daemon running on it — including the machine this story was
+	// filed from. strays_test.go puts the real scan back for the tests that are about it.
+	scanForStrays = noStrays
 
 	code := m.Run()
+
+	// Reap before removing, and in that order (GOV-B11). A daemon still running here holds a
+	// socket inside dir; removing the tree first unlinks that socket without stopping the
+	// process, which is how a governor ends up resident for 28 days answering on a path that
+	// no longer exists. Reaping second would leave nothing to find the pid file in.
+	if killed := reapStrayDaemons(); len(killed) > 0 {
+		fmt.Fprintf(os.Stderr, "\nTestMain reaped %d daemon(s) the tests left running:\n  %s\n"+
+			"That is a reaping bug in whichever test started them, not a clean run — the\n"+
+			"backstop exists to stop the machine accumulating them, not to excuse them.\n",
+			len(killed), strings.Join(killed, "\n  "))
+		if code == 0 {
+			code = 1
+		}
+	}
 	os.RemoveAll(dir)
 	os.Exit(code)
 }

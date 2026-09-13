@@ -1079,15 +1079,22 @@ being asked of them is to run a hook on every subagent spawn.
 | `governor calibrate` | measure cores, performance cores, RAM and a short load probe; write setpoint and B_max for *this* machine |
 | `governor version` | binary version, protocol version, config schema version |
 
-GOV-20 shipped `doctor`, and it reports ten findings rather than the six checks this table
+GOV-20 shipped `doctor`, and it reports eleven findings rather than the six checks this table
 lists — `binary`, `protocol` and `config` are the three halves of "versions agree", split
 because they have three different fixes and a line carrying three fixes is a line nobody acts
-on. Three details are worth stating because they are decisions rather than implementation:
+on; `strays` is GOV-B11's, below. Four details are worth stating because they are decisions
+rather than implementation:
 
 - **A finding can be `skip`.** With the daemon down there is no protocol version to compare
   and no lease table to read, and reporting those as further *failures* would print four
   problems and four fixes for one cause. A skip is only ever reachable downstream of a check
   that already failed and already named its fix, and it does not move the exit code.
+- **A finding can be `warn`,** and the summary line may not round one off. GOV-B11 added a
+  fourth state for a finding that is real, worth printing, and not a defect in this
+  installation. It does not move the exit code — a warning that fails the command is a
+  failure wearing a different label — but a run containing one says "N checks, M passing and
+  K to look at" rather than "all passing". The claim "all passing" may only be made when it
+  is true, which is the whole of what GOV-B11 was filed about.
 - **It reads every file that can hold one.** `~/.claude/settings.json`,
   `~/.claude/skills/claude-governor/hooks/hooks.json` — where GOV-21's installer actually
   writes them — and `~/.claude/plugins/claude-governor/hooks/hooks.json`, the directory 13.3
@@ -1137,6 +1144,33 @@ sessions, four of them ungoverned for twenty-nine hours, and doctor reported 8 o
 
 Neither finding writes anything. `~/.claude/sessions/` is read-only to the governor and adds
 no row to §13.3.
+
+GOV-B11 added `strays`, which is the only finding that reports on the **machine** rather than
+on this installation, and the only one that is a `warn`.
+
+- **`strays` names every long-lived governor daemon that is not this one**, with its pid,
+  path, age and the socket it holds. It exists because four governor-shaped processes — two
+  daemons on scratch sockets, aged three days each, and two abandoned `go run` binaries aged
+  twenty and twenty-eight days — were found running on the dev machine while doctor reported
+  ten checks all passing, with the daemon check showing nothing in use and nothing waiting.
+  Each held a socket of its own, so nothing was double-leased and no existing check could have
+  seen them. Harmless and invisible, and
+  the invisibility is the half worth fixing: the blind spot that hid four idle daemons would
+  equally hide one that was busy, and a stray daemon's CPU is invisible to the Phase 0
+  sampler too, because it is not a descendant of any `claude` process.
+- **It is scoped on two axes, and widening either is a mistake.** The process must have a
+  `daemon` argv — which is what structurally excludes the Phase 0 sampler (`governor trace
+  sample`), rather than a special case that can go stale — and must be older than
+  `strayMinimumAge` (ten minutes). Matching "any process named governor" would fire on a
+  developer's own `go run ./cmd/governor` during ordinary work on this repo, and a check that
+  fires during normal work is a check that gets silenced.
+- **The socket comes from `lsof`,** bounded like every other subprocess doctor runs. gopsutil
+  cannot supply it on darwin: `OpenFiles` and `Environ` both return "not implemented yet" and
+  `Connections` returns nothing for a process holding a unix socket. The path comes from
+  `argv[0]` resolved against the process's working directory, **not** from `Exe()`, which
+  fails outright for a process whose binary has been deleted — the state both scratch daemons
+  on the dev machine were in, and exactly the case worth reporting.
+- It writes nothing, and adds no row to §13.3.
 
 "Stranded" is also a precise thing rather than a feeling. The reaper collects a lease three
 ways — its TTL expires, its session's process is gone, or `Liveness` says its owner is gone —
