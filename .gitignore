@@ -1,6 +1,10 @@
 bin/
 dist/
 *.jsonl
+# ...except the classifier's fixture, which is REAL commands sampled from this machine's
+# transcripts and is the only thing that makes GOV-14 clause 3 testable. Screened for
+# secret-shaped content before it was checked in; see docs/bash-corpus.md.
+!internal/classify/testdata/*.jsonl
 .claude/.current-story
 .claude/.nudged
 _to_delete/
