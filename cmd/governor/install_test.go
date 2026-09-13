@@ -1075,8 +1075,13 @@ func TestDoctorPassesEveryCheckAfterAnInstall(t *testing.T) {
 	t.Cleanup(func() { runReal(t, p, "uninstall", "--purge") })
 
 	code, out, _ := runReal(t, p, "doctor")
-	if code != 0 {
-		t.Errorf("governor doctor: exit %d after a clean install, want 0\n%s\n%s", code, out, daemonLog(t, p))
+	// Zero, or GOV-30's "could not verify". A freshly installed machine has not spawned
+	// anything yet, so the spawn check has no observed payload to confirm the matcher against
+	// and says so — which is the honest answer and the reason that state exists. What must
+	// not appear is a failure.
+	if code != 0 && code != doctorExitUnverified {
+		t.Errorf("governor doctor: exit %d after a clean install, want 0 or %d\n%s\n%s",
+			code, doctorExitUnverified, out, daemonLog(t, p))
 	}
 	if strings.Contains(out, "FAIL") {
 		t.Errorf("governor doctor reported a failure after a clean install:\n%s", out)
@@ -1093,7 +1098,8 @@ func TestDoctorPassesEveryCheckAfterAnInstall(t *testing.T) {
 	// and demanding the literal words "all passing" here would make this test fail for a
 	// reason that has nothing to do with install. The clauses above still hold the line that
 	// matters: no FAIL, and no skip.
-	if !strings.Contains(out, "all passing") && !strings.Contains(out, "to look at") {
+	if !strings.Contains(out, "all passing") && !strings.Contains(out, "to look at") &&
+		!strings.Contains(out, "could not be verified") {
 		t.Errorf("governor doctor did not report every check passing:\n%s", out)
 	}
 

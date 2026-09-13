@@ -19,6 +19,13 @@ method below and replace this file wholesale rather than editing conclusions int
 | Date captured | 2026-09-07 |
 | Story | GOV-01 |
 
+**Re-measured on 2.1.270 — see [section 18](#18-re-measured-on-21270--the-gov-01-facts-checked-again).** This
+provenance block covers sections 1 through 14 only. Section 15 was measured on 2.1.265,
+section 17 on 2.1.267, and GOV-30 re-ran GOV-01's own probe against 2.1.270 on 2026-09-13 and
+recorded the result in section 18. Read section 18 alongside any conclusion drawn from the
+sections below it: where the two disagree, section 18 is the later measurement and says so
+explicitly.
+
 ### Method
 
 Six probes. Each ran a **separate headless `claude -p`** in a throwaway scratch directory
@@ -73,7 +80,10 @@ the same run's `permission_denials` array (probe 6) reported the *same* tool as 
 ## 2. `PreToolUse` on a subagent spawn — nested (depth 1)
 
 From probe 5, where a subagent spawned a further subagent. Note the top-level `agent_id` /
-`agent_type`, and note that `subagent_type` is **absent** from `tool_input` here:
+`agent_type`, and note that `subagent_type` is **absent** from `tool_input` here — a
+version-specific observation, n=1, and **contradicted on 2.1.270 in section 18.5**, where a
+nested spawn carried it. Nothing depends on it either way: depth comes from the top-level
+`agent_id`, never from `tool_input`.
 
 ```json
 {"session_id":"1206ebc4-102c-4716-aa5f-4e7bc4371735","transcript_path":"/Users/peterho/.claude/projects/-private-tmp-claude-501--Users-peterho-Repos-claude-governor-223d86ac-b4c0-4829-854b-e917795e9601-scratchpad-probe5-nested-work/1206ebc4-102c-4716-aa5f-4e7bc4371735.jsonl","cwd":"/private/tmp/claude-501/-Users-peterho-Repos-claude-governor/223d86ac-b4c0-4829-854b-e917795e9601/scratchpad/probe5-nested/work","prompt_id":"b01c6d87-91b2-4b8d-9ac7-3f294188364e","permission_mode":"bypassPermissions","agent_id":"a0dca3e4fa79a2f6f","agent_type":"general-purpose","effort":{"level":"high"},"hook_event_name":"PreToolUse","tool_name":"Agent","tool_input":{"description":"Count lines in README.md","prompt":"In the working directory /private/tmp/.../probe5-nested/work there is a file named README.md. Count the exact number of lines in this file (e.g. using `wc -l` or by reading the file and counting). Report back only the exact line count number and the method you used.","run_in_background":false},"tool_use_id":"toolu_01FPehV8CCXrhtoDkPRpKfzn"}
@@ -1086,3 +1096,323 @@ wrong if this one were written down as filed.
 - Whether `disableAllHooks` or an unaccepted trust prompt leaves a session in the registry
   looking identical to a governed one. It would, on everything measured here, and doctor
   would then report it as ungoverned with the wrong fix.
+
+---
+
+## 18. Re-measured on 2.1.270 — the GOV-01 facts, checked again
+
+**Why this section exists.** Every fact in sections 1–10 was measured once, on 2.1.263, and
+four versions have shipped since. A changed `tool_name` is the exact failure this project
+exists to catch, so GOV-30 clause 3 re-ran the §0 method against the version now on this
+machine rather than assuming the surface held. It held. The two things that moved are called
+out in §18.5 and §18.7, and neither touches the gate.
+
+### 18.0 Provenance
+
+| | |
+|---|---|
+| `claude --version` | `2.1.270 (Claude Code)` |
+| Binary | `/Users/peterho/.local/bin/claude` → `/Users/peterho/.local/share/claude/versions/2.1.270` |
+| Host | macOS (Darwin 25.4.0, xnu-12377.101.15 RELEASE_ARM64_T8103), arm64 |
+| Date captured | 2026-09-13, 13:43–13:45 UTC |
+| Story | GOV-30 |
+| Cost | three headless `claude -p` runs, `--model sonnet`, `$0.3324` total |
+
+**`~/.claude/settings.json` was untouched, and this is evidence rather than an assertion.**
+SHA-256 taken before the first probe and again after the last:
+
+```
+before  6425790c4df381e0b152c4298b949361bce1d8322e67593d969cdd1eebf09b9e
+after   6425790c4df381e0b152c4298b949361bce1d8322e67593d969cdd1eebf09b9e
+```
+
+Identical, and its mtime was still `Sep 9 22:35` afterwards. Everything the probes wrote lived
+under a session scratchpad. The two things under `~/.claude` that did change are neither the
+probe's doing nor avoidable: the probe sessions' own transcripts land in
+`~/.claude/projects/`, and the already-installed governor daemon went on sampling the host
+throughout, because `--setting-sources ""` excludes the user's hooks from the *probe* without
+stopping anything else on the machine.
+
+### 18.1 Method
+
+The §0 method, three probes instead of six. The capture hook is the same `cat > file` body:
+
+```bash
+#!/bin/bash
+D="$(cd "$(dirname "$0")" && pwd)/out"
+LABEL="$1"
+TS=$(python3 -c 'import time;print("%.6f"%time.time())')
+F="$D/${TS}-${LABEL}-$$.json"
+cat > "$F"                 # stdin, verbatim, unmodified
+echo "$TS $LABEL pid=$$ file=$(basename "$F")" >> "$D/index.log"
+exit 0
+```
+
+| Probe | Question | Registrations |
+|---|---|---|
+| A | tool name, `tool_input`, `SubagentStart`/`Stop`, the `SendMessage` resume, and the matcher control | `PreToolUse` × {`*`, `Task`, `Agent`}, `PostToolUse` `*`, `SubagentStart`, `SubagentStop`, `SessionStart`, `SessionEnd` |
+| B | is a configured `timeout` still honoured | one `PreToolUse` on `Bash`, `"timeout": 5`, body sleeps 30 s ticking once a second |
+| C | depth — a subagent spawning a subagent | `PreToolUse` × {`*`, `Agent`}, `PostToolUse` `Agent`, `SubagentStart`, `SubagentStop` |
+
+```
+# Probe A — one spawn, then a SendMessage resume of the same agent, then a Bash in the main session
+cd <scratch>/A/work && claude -p "Do these three steps in order, no extra steps.
+STEP 1: Use the Agent tool to spawn ONE subagent of subagent_type general-purpose with the
+prompt: 'Run wc -l < README.md in the current working directory and report only the number.'
+Wait for its answer.
+STEP 2: Use the SendMessage tool to send that SAME agent a follow-up message asking it to
+report the FIRST line of README.md. Wait for its answer.
+STEP 3: Run the Bash command: echo control-bash-in-main-session
+Then reply with the line count and the first line." \
+  --settings <scratch>/A/settings.json \
+  --setting-sources "" \
+  --permission-mode bypassPermissions \
+  --model sonnet \
+  --output-format json
+
+# Probe B — timeout. settings.json is the whole of it:
+#   {"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[
+#     {"type":"command","command":"<scratch>/B/slow.sh t5","timeout":5}]}]}}
+cd <scratch>/B/work && claude -p "Run exactly one Bash command: echo hello-timeout-probe .
+Then reply with its output and nothing else." \
+  --settings <scratch>/B/settings.json --setting-sources "" \
+  --permission-mode bypassPermissions --model sonnet --output-format json
+
+# Probe C — nested spawn
+cd <scratch>/C/work && claude -p "Use the Agent tool to spawn ONE subagent of subagent_type
+general-purpose. Give that subagent this prompt verbatim: 'You must delegate. Immediately use
+your own Agent tool to spawn a nested general-purpose subagent with the prompt: run
+wc -l < README.md in the current working directory and report only the number. Do not run wc
+yourself; report what the nested subagent tells you.' Then report the number it returns." \
+  --settings <scratch>/C/settings.json --setting-sources "" \
+  --permission-mode bypassPermissions --model sonnet --output-format json
+```
+
+Each work directory held a three-line `README.md` so the subagent had something to count.
+
+`subagent_stats` from the runs, verbatim, as the independent check on what the hooks saw:
+
+```json
+A: {"spawned":1,"requested":{"background":0,"foreground":1,"unset":0},"started_in_background":0,"max_depth":1,"spawned_by_subagents":0,"completed":1,"failed":0,"killed":{"parent":0,"user":0,"system":0},"refused":{"depth_limit":0,"concurrency_limit":0,"budget":0},"by_type":{"general-purpose":1}}
+C: {"spawned":2,"requested":{"background":0,"foreground":2,"unset":0},"started_in_background":0,"max_depth":2,"spawned_by_subagents":1,"completed":2,"failed":0,"killed":{"parent":0,"user":0,"system":0},"refused":{"depth_limit":0,"concurrency_limit":0,"budget":0},"by_type":{"general-purpose":2}}
+```
+
+**Trimming.** In the payloads below, `transcript_path` is abbreviated to `…` — it is the long
+absolute path into `~/.claude/projects/` and carries nothing this file needs. Nothing else is
+altered: every other byte is as the hook received it.
+
+### 18.2 The four GOV-01 facts, stated plainly
+
+| Fact, as sections 1–10 record it | 2.1.270 |
+|---|---|
+| §1 `tool_name` on an `Agent`-tool spawn is `Agent`, and a `matcher:"Task"` fires for it too | **CONFIRMS** |
+| §2 `tool_input` has no depth field; depth is carried as a top-level `agent_id`, absent at depth 0 and naming the *parent* at depth ≥ 1 | **CONFIRMS** |
+| §3 `SubagentStart` fires and carries **no** `tool_use_id` — it cannot be correlated to its `PreToolUse` except positionally | **CONFIRMS** |
+| §4 `SubagentStop` fires and carries `agent_id`, so release needs no correlation | **CONFIRMS** |
+| §10.1 a configured `timeout` is honoured, in seconds | **CONFIRMS** |
+| §8/§8.3 path 2 — a `SendMessage` resume raises `PreToolUse` with `tool_input.to` = the agent id, and a second `SubagentStart`, with no `PreToolUse(Agent)` anywhere | **CONFIRMS** |
+| §2's sentence that `subagent_type` is **absent** from a nested spawn's `tool_input` | **CONTRADICTS** — see §18.5 |
+
+### 18.3 `PreToolUse` on a subagent spawn — depth 0
+
+Probe A. Captured by all three registrations simultaneously and byte-identical in each; this
+is the `matcher:"Agent"` copy.
+
+```json
+{"session_id":"749698d7-325b-4454-9d09-e0b4d32e404b","transcript_path":"…","cwd":"/private/tmp/claude-501/-Users-peterho-Repos-claude-governor/8a1d8b20-3634-4420-8c91-f08a631bde9b/scratchpad/surface-2.1.270/A/work","prompt_id":"92c8316d-a1ca-4208-84b5-eb71cadf92e8","permission_mode":"bypassPermissions","effort":{"level":"high"},"hook_event_name":"PreToolUse","tool_name":"Agent","tool_input":{"description":"Count README.md lines","prompt":"Run wc -l < README.md in the current working directory and report only the number.","subagent_type":"general-purpose","run_in_background":false},"tool_use_id":"toolu_017q5Pt13qKFFGqPLe3pQgEf"}
+```
+
+`tool_name` is still `Agent`, `tool_input` still has exactly `description`, `prompt`,
+`subagent_type`, `run_in_background`, there is still no depth field, and `agent_id` is still
+absent at the top level.
+
+**The control that makes this trustworthy, re-run.** In the same session `Bash` (twice),
+`Read`, `ToolSearch`, `SendMessage` and `ScheduleWakeup` fired the catch-all and **neither**
+matched registration. Each matched registration fired exactly once, at the spawn. From
+`index.log`, t relative to `SessionStart`:
+
+```
+t=  0.000  sessstart        SessionStart
+t=  5.723  pre-AGENTMATCH   PreToolUse   Agent
+t=  5.723  pre-any          PreToolUse   Agent
+t=  5.723  pre-TASKMATCH    PreToolUse   Agent
+t=  5.767  substart         SubagentStart              agent a62fad8018117fb5d
+t=  8.392  pre-any          PreToolUse   Bash          agent a62fad8018117fb5d
+t=  8.492  post-any         PostToolUse  Bash          agent a62fad8018117fb5d
+t=  9.711  substop          SubagentStop               agent a62fad8018117fb5d
+t=  9.753  post-any         PostToolUse  Agent
+t= 12.264  pre-any          PreToolUse   ToolSearch
+t= 14.887  pre-any          PreToolUse   SendMessage   to=a62fad8018117fb5d
+t= 14.938  post-any         PostToolUse  SendMessage   resumedAgentId=a62fad8018117fb5d
+t= 14.939  substart         SubagentStart              agent a62fad8018117fb5d   ← the resume
+t= 18.045  pre-any          PreToolUse   Read          agent a62fad8018117fb5d
+t= 19.877  substop          SubagentStop               agent a62fad8018117fb5d
+t= 21.424  pre-any          PreToolUse   ScheduleWakeup
+t= 23.860  pre-any          PreToolUse   ScheduleWakeup
+t= 24.026  pre-any          PreToolUse   Bash                                    ← the control
+t= 25.643  sessend          SessionEnd
+```
+
+Matchers are therefore still genuinely applied on 2.1.270, and `Task` is still carried as an
+alias for the same tool.
+
+### 18.4 `PreToolUse` on a subagent spawn — nested (depth 1)
+
+Probe C. `subagent_stats` reported `max_depth: 2`, `spawned_by_subagents: 1`,
+`refused.depth_limit: 0`, so §9 also still holds: the harness does not refuse a nested spawn.
+
+```json
+{"session_id":"2a845b48-efec-4a2d-bdd8-6f8842d59af7","transcript_path":"…","cwd":"/private/tmp/claude-501/-Users-peterho-Repos-claude-governor/8a1d8b20-3634-4420-8c91-f08a631bde9b/scratchpad/surface-2.1.270/C/work","prompt_id":"6353352e-35e0-4d7e-a8ec-aab082979832","permission_mode":"bypassPermissions","agent_id":"a2d87c696ee916652","agent_type":"general-purpose","effort":{"level":"high"},"hook_event_name":"PreToolUse","tool_name":"Agent","tool_input":{"description":"Count lines in README.md","prompt":"Run the following shell command in the current working directory: wc -l < README.md\n\nReport back only the resulting number (the line count).","subagent_type":"general-purpose","run_in_background":false},"tool_use_id":"toolu_01MWf5bfYPVWQmcZQpGnsm7H"}
+```
+
+The `agent_id` here, `a2d87c696ee916652`, is the agent from probe C's **first**
+`SubagentStart`; the agent this call creates is `a75fb1c1107d80b68`. So §2's rule is intact
+verbatim: **`agent_id` absent ⇒ the caller is the main session; `agent_id` present ⇒ the caller
+is itself a subagent, and the value names the parent.** There is still no `depth` field.
+
+An ordinary tool inside a subagent carries the same marker — here the `Bash` at t=8.392 in
+probe A:
+
+```json
+{"session_id":"749698d7-325b-4454-9d09-e0b4d32e404b","transcript_path":"…","cwd":"…/A/work","prompt_id":"92c8316d-a1ca-4208-84b5-eb71cadf92e8","permission_mode":"bypassPermissions","agent_id":"a62fad8018117fb5d","agent_type":"general-purpose","effort":{"level":"high"},"hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":"wc -l < README.md","description":"Count lines in README.md"},"tool_use_id":"toolu_01NLa3C52U42tbYCS9sJHjHq"}
+```
+
+### 18.5 CONTRADICTION — `subagent_type` is present on a nested spawn
+
+Section 2 says, of the nested `PreToolUse`, "note that `subagent_type` is **absent** from
+`tool_input` here". On 2.1.270 it is **present**: `"subagent_type":"general-purpose"`, in the
+payload above.
+
+Both observations are **n = 1** — one nested spawn on 2.1.263, one on 2.1.270 — and the field
+is written by the model, not the harness, so this may be prompt variation rather than a
+version change. The honest reading is that a nested spawn's `tool_input` **may or may not**
+carry `subagent_type`, and that neither run establishes which.
+
+**It is not load-bearing.** Depth comes from the top-level `agent_id`, which §18.4 re-confirms,
+and nothing in the gate reads `subagent_type` to decide depth. The reason to record it is that
+§2's sentence as written is false for this sample, and a future reader must not build on it.
+
+### 18.6 `SubagentStart` and `SubagentStop`
+
+`SubagentStart`, probe A, the spawn:
+
+```json
+{"session_id":"749698d7-325b-4454-9d09-e0b4d32e404b","transcript_path":"…","cwd":"…/A/work","prompt_id":"92c8316d-a1ca-4208-84b5-eb71cadf92e8","agent_id":"a62fad8018117fb5d","agent_type":"general-purpose","hook_event_name":"SubagentStart"}
+```
+
+The same fields as §3, no more and no fewer, and **still no `tool_use_id`** — there remains
+nothing on the wire that binds a `SubagentStart` to the `PreToolUse` that caused it, only
+`session_id` and `prompt_id`, which every spawn in the turn shares. Still no `permission_mode`
+and no `effort`, per §11.
+
+The `SubagentStart` raised by the resume at t=14.939 was identical in shape and carried the
+same `agent_id`, so §8 holds on 2.1.270: **`SubagentStart` is a start-or-resume signal and
+confirm must stay idempotent per `agent_id`.**
+
+`SubagentStop`, probe A, the first one:
+
+```json
+{"session_id":"749698d7-325b-4454-9d09-e0b4d32e404b","transcript_path":"…","cwd":"…/A/work","prompt_id":"92c8316d-a1ca-4208-84b5-eb71cadf92e8","permission_mode":"bypassPermissions","agent_id":"a62fad8018117fb5d","agent_type":"general-purpose","effort":{"level":"high"},"hook_event_name":"SubagentStop","stop_hook_active":false,"agent_transcript_path":"/Users/peterho/.claude/projects/…/subagents/agent-a62fad8018117fb5d.jsonl","last_assistant_message":"3","background_tasks":[],"session_crons":[]}
+```
+
+The second one, after the resume, again reported the agent as still running in its own
+payload, exactly as §8 recorded:
+
+```json
+"background_tasks":[{"id":"a62fad8018117fb5d","type":"subagent","status":"running","description":"Count README.md lines","agent_type":"general-purpose"}]
+```
+
+`agent_type` was populated on every `SubagentStop` here. The empty-value third state of §4's
+GOV-02 addendum and §8.2 did not arise, because no away-summary context fired in these runs —
+that is absence of the occasion, not evidence against it.
+
+### 18.7 The `SendMessage` resume — `to` is unchanged, `tool_input` has grown
+
+```json
+{"session_id":"749698d7-325b-4454-9d09-e0b4d32e404b","transcript_path":"…","cwd":"…/A/work","prompt_id":"92c8316d-a1ca-4208-84b5-eb71cadf92e8","permission_mode":"bypassPermissions","effort":{"level":"high"},"hook_event_name":"PreToolUse","tool_name":"SendMessage","tool_input":{"to":"a62fad8018117fb5d","summary":"Ask for first line of README.md","message":"Please report the FIRST line of README.md in the current working directory.","type":"message","recipient":"a62fad8018117fb5d","content":"Please report the FIRST line of README.md in the …"},"tool_use_id":"toolu_01TzKBtScduZAudoa7rBKvP1"}
+```
+
+`to` is `a62fad8018117fb5d` — seventeen characters, all lowercase hex, the shape §8.3 makes
+the gate's discriminator. **Unchanged.** The resume is real: `PostToolUse` reported
+`resumedAgentId`, a `SubagentStart` followed 1 ms later, and the resumed agent then ran a
+`Read` under its own `agent_id`.
+
+**Two additions, and one of them is a trap.** Relative to §8.3's payload, `tool_input` has
+gained:
+
+| Key | Value here | Note |
+|---|---|---|
+| `type` | `"message"` | new |
+| `content` | `"Please report the FIRST line of README.md in the …"` | new, and **truncated** — a clipped copy of `message` ending in a literal `…` |
+
+The `…` above is not this file abbreviating. It is in the bytes the hook received.
+`recipient` still duplicates `to`, as in §8.3.
+
+**The gate must keep reading `to`, and must never read `content`.** `content` is lossy by
+construction, so anything parsed out of it is parsed out of a string the harness has already
+cut. Nothing in the governor reads it today; this is written down so nothing starts to.
+
+`PostToolUse` on `SendMessage` has likewise gained a `pin` object:
+
+```json
+"tool_response":{"success":true,"message":"Resuming agent a62fad8","resumedAgentId":"a62fad8018117fb5d","pin":{"id":"a62fad8018117fb5d","name":"a62fad8018117fb5d","ref":"8b5d23"}}
+```
+
+`resumedAgentId` — the field §8 and §8.3 use as ground truth — is unchanged.
+
+### 18.8 Timeout — a configured value is still honoured, in seconds
+
+Probe B. One `PreToolUse` hook on `Bash` with `"timeout": 5`, ticking a log once a second and
+sleeping 30 s:
+
+```
+t5 hook-start 1789307093.343032
+t5 tick 1 1789307094.395980
+t5 tick 2 1789307095.440873
+t5 tick 3 1789307096.510382
+t5 tick 4 1789307097.554150        ← last tick; tick 5 would have been ~1789307098.6
+```
+
+Killed between 4.2 s and 5.2 s after start. The unit is seconds and the configured value is
+enforced to about a second, as §10.1 found for `timeout: 120`. The tool then proceeded
+normally — the run returned `hello-timeout-probe` with `duration_ms: 7238` — so a hook killed
+at its timeout **fails open**.
+
+The unset-`timeout` ceiling was deliberately not re-derived; §10.1's 150 s finding stands
+untested on 2.1.270.
+
+### 18.9 `ScheduleWakeup` — a tool name this file has not recorded
+
+Observation only. Probe A's main session called a tool named `ScheduleWakeup` twice:
+
+```json
+{"session_id":"749698d7-325b-4454-9d09-e0b4d32e404b","transcript_path":"…","cwd":"…/A/work","prompt_id":"92c8316d-a1ca-4208-84b5-eb71cadf92e8","permission_mode":"bypassPermissions","effort":{"level":"high"},"hook_event_name":"PreToolUse","tool_name":"ScheduleWakeup","tool_input":{"delaySeconds":60,"reason":"Waiting for subagent's reply about README.md first line before proceeding to step 3","prompt":"Check if the subagent has replied with the first line of README.md; if so proceed to step 3 (run echo control-bash-in-main-session) and reply with both results.","noop":true},"tool_use_id":"toolu_01FunwXBzRcSPnnKaCxWMv4E"}
+```
+
+It matched the catch-all and matched neither `Agent` nor `Task`, it carried no `agent_id`, and
+`subagent_stats.spawned` stayed at 1 across the whole run. **It spawns nothing and it is not a
+gate concern.** It is recorded because a catch-all registration will now see it, and because
+§8.3's table enumerates spawn paths by what raises a `PreToolUse` — this raises one and belongs
+to none of them.
+
+### 18.10 Still unmeasured
+
+Named rather than inferred, because a gap filled by inference is how §8.1 and §8.2 went wrong:
+
+- The **unset-`timeout` ceiling**. §10.1 probed 150 s on 2.1.263 and found no cut; nothing was
+  probed here.
+- **§10.2 — a decision emitted after a long wait**, and the `permissionDecision: "deny"`
+  output contract with it. No deny was emitted in any probe.
+- **FIFO correlation under fan-out** (§7). Every spawn here was singular; `PreToolUse` and
+  `SubagentStart` interleaved at +44 ms and +45 ms, which is consistent with §7 but is not a
+  burst.
+- **Background spawns.** Every spawn measured was foreground (`requested.background: 0`), so
+  the `async_launched` shape of §6 and §17.4 was not re-observed.
+- **The `Skill` path** (§8.3 path 3).
+- **The away-summary path** (§8.3 path 4) and the empty-`agent_type` discriminator of §8.2.
+- **Whether `permission_denials` still spells the tool `Task`** (§1's second payload). No probe
+  produced a denial.
+- **Interactive, non-headless sessions.** All three probes were `claude -p`.
+- **End to end against a running daemon** (§8.4). These probes captured payloads; no lease was
+  taken.
+- **Linux.** Every measurement in this section is macOS.

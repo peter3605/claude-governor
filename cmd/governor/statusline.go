@@ -110,6 +110,11 @@ type statusResponse struct {
 	HooksInstalled string        `json:"hooks_installed"`
 	SessionsKnown  bool          `json:"sessions_known"`
 	Sessions       []sessionStat `json:"sessions"`
+	// SpawnSurface is GOV-30's ledger of spawn tool names the matcher has actually been seen
+	// to catch, per Claude Code version. Only doctor reads it; the status line does not
+	// render it. Absent from an older daemon, which reads as "nothing confirmed".
+	SpawnSurface      []spawnSighting `json:"spawn_surface,omitempty"`
+	SpawnSurfaceKnown bool            `json:"spawn_surface_known"`
 }
 
 // cachedStatus is one status reply plus when it was taken.

@@ -61,7 +61,23 @@ func ids(live []signals.LiveSession) []string {
 
 // machineWith starts a daemon that sees exactly the given sessions, and points doctor at it
 // over a real socket. registered names the sessions whose SessionStart hook reached it.
+// machineWith is a machine that has been spawning subagents normally: every Claude Code
+// version running on it has been seen to send a spawn tool name the matcher caught. That is
+// what makes the spawn check pass, so a test using this helper is about whatever it changed,
+// not about GOV-30's ledger. Use machineWithSurface to control the ledger directly.
 func machineWith(t *testing.T, live []signals.LiveSession, hooksAt, daemonAt time.Time, registered []string) string {
+	t.Helper()
+	seen := map[string][]string{}
+	for _, s := range live {
+		seen[s.Version] = []string{"Agent"}
+	}
+	return machineWithSurface(t, live, hooksAt, daemonAt, registered, seen)
+}
+
+// machineWithSurface is machineWith with the spawn-surface ledger stated outright: seen maps
+// a Claude Code version to the spawn tool names the gate has been observed to catch on it.
+// An empty map is a daemon that has never seen a spawn.
+func machineWithSurface(t *testing.T, live []signals.LiveSession, hooksAt, daemonAt time.Time, registered []string, seen map[string][]string) string {
 	t.Helper()
 	endpoint, d := startTestDaemonConfigured(t, 4, lease.Options{}, func(d *daemon) {
 		sessions := live
@@ -69,6 +85,11 @@ func machineWith(t *testing.T, live []signals.LiveSession, hooksAt, daemonAt tim
 		d.hooksInstalledAt = func() time.Time { return hooksAt }
 		if !daemonAt.IsZero() {
 			d.started = daemonAt
+		}
+		for version, tools := range seen {
+			for _, tool := range tools {
+				d.surface.note(version, tool)
+			}
 		}
 	})
 	for _, id := range registered {
@@ -197,7 +218,10 @@ func TestDoctorSaysSoWhenItCannotSeeTheSessions(t *testing.T) {
 	t.Setenv(transport.EndpointEnv, endpoint)
 
 	code, found, out := doctor(t)
-	f := want(t, found, "sessions", "ok", out)
+	// GOV-30: unknown, not ok. It used to be a pass whose detail led with "not verified",
+	// and the summary underneath counted it toward "N checks, all passing" — the state column
+	// is the word a hurried reader takes away, so that is where it has to be said.
+	f := want(t, found, "sessions", "unknown", out)
 	// It must not be a skip: this command reserves that for a check downstream of one that
 	// already failed, and nothing here failed. It must also not read as a verification.
 	if !strings.Contains(f.detail, "not verified") {
@@ -213,8 +237,9 @@ func TestDoctorSaysSoWhenItCannotSeeTheSessions(t *testing.T) {
 	if !strings.Contains(f.detail, "older") {
 		t.Errorf("detail blames the registry without allowing for an older daemon: %q", f.detail)
 	}
-	if code != 0 {
-		t.Fatalf("a check that could not run failed the command: exit %d\n%s", code, out)
+	if code != doctorExitUnverified {
+		t.Fatalf("exit %d, want %d — a check that could not run must not read as broken, "+
+			"nor as success\n%s", code, doctorExitUnverified, out)
 	}
 }
 
@@ -388,64 +413,11 @@ func TestInstallNamesTheSessionsThatStayUngoverned(t *testing.T) {
 // the spawn tool names, and the claim that expires
 // ---------------------------------------------------------------------------
 
-// The matcher check reads a matcher off disk and tests it against spawnToolNames, so it
-// catches a hand-edited one. It cannot catch spawnToolNames itself going stale, because
-// install writes the matcher from that same list — the two agree by construction. This check
-// carries the fact from outside the binary: the version actually running here.
-func TestDoctorDatesTheSpawnToolNamesAgainstTheRunningVersion(t *testing.T) {
-	sessionOn := func(version string) []signals.LiveSession {
-		s := measuredGoverned[0]
-		s.Version = version
-		return []signals.LiveSession{s}
-	}
-
-	t.Run("the measured version is stated, not merely assumed", func(t *testing.T) {
-		stageWorkingInstall(t)
-		t.Setenv(transport.EndpointEnv, machineWith(t, sessionOn(spawnToolNamesConfirmedAgainst),
-			measuredHooksInstalled, measuredDaemonStarted, ids(measuredGoverned[:1])))
-
-		_, found, out := doctor(t)
-		f := want(t, found, "spawn", "ok", out)
-		if !strings.Contains(f.detail, spawnToolNamesConfirmedAgainst) {
-			t.Errorf("detail does not say what it was measured against: %q", f.detail)
-		}
-		for _, name := range spawnToolNames {
-			if !strings.Contains(f.detail, name) {
-				t.Errorf("detail does not name the tool %q: %q", name, f.detail)
-			}
-		}
-	})
-
-	t.Run("a newer Claude Code is called out as unchecked", func(t *testing.T) {
-		stageWorkingInstall(t)
-		t.Setenv(transport.EndpointEnv, machineWith(t, sessionOn("2.4.0"),
-			measuredHooksInstalled, measuredDaemonStarted, ids(measuredGoverned[:1])))
-
-		code, found, out := doctor(t)
-		f := want(t, found, "spawn", "ok", out)
-		if !strings.Contains(f.detail, "2.4.0") || !strings.Contains(f.detail, "NOT re-checked") {
-			t.Errorf("detail does not flag the unchecked version: %q", f.detail)
-		}
-		// Not a failure. A newer Claude Code is routine and, for anyone not maintaining this
-		// program, not fixable — a red line after every upgrade teaches people that a red
-		// line means nothing.
-		if code != 0 {
-			t.Fatalf("exit %d merely because a newer Claude Code is running, want 0:\n%s", code, out)
-		}
-	})
-
-	t.Run("an older Claude Code is not flagged", func(t *testing.T) {
-		stageWorkingInstall(t)
-		t.Setenv(transport.EndpointEnv, machineWith(t, sessionOn("2.1.263"),
-			measuredHooksInstalled, measuredDaemonStarted, ids(measuredGoverned[:1])))
-
-		_, found, out := doctor(t)
-		if f := want(t, found, "spawn", "ok", out); strings.Contains(f.detail, "NOT re-checked") {
-			t.Errorf("an older version was reported as unchecked: %q", f.detail)
-		}
-	})
-}
-
+// TestCompareVersions covers the version ordering that the sessions check still uses to
+// decide whether a session predates the install. GOV-30 removed the spawn check's use of it:
+// comparing a measured-against constant to the running version could only ever say that a
+// measurement was old, never that the matcher had stopped firing, and those are the two cases
+// that had to be told apart. See surface_test.go for what replaced it.
 func TestCompareVersions(t *testing.T) {
 	for _, tc := range []struct {
 		a, b string
