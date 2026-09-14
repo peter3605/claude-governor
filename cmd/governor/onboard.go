@@ -94,11 +94,15 @@ func claimFirstRun(diag io.Writer) bool {
 // work for attention, and a notice nobody finishes reading has told them nothing.
 const onboardingNotice = `claude-governor is installed. Turn it off with: governor uninstall
 
-It caps how many subagents run at once across every session on this machine, from live CPU
-and thermal load. A spawn is delayed or refused, never altered.
+It caps how much building and testing runs at once across every session on this machine,
+from live CPU load. Builds are what saturate a laptop — subagents barely register — so a
+` + "`go test`" + ` or a ` + "`cargo build`" + ` may be delayed or refused while an idle command never is. A
+subagent spawn counts too, at about a twelfth of a build. Nothing is ever altered, only
+delayed or refused.
 
-Status line: ` + "`3/5 slots`" + ` is agents running out of the current budget, ` + "`(1 yours)`" + ` how many
-are this session's, and ` + "`cpu 61%`" + ` / ` + "`thermal ok`" + ` the readings the budget moves on.
+Status line: ` + "`3/5 slots`" + ` is how much of the budget is in use, where one slot is about one
+ordinary build, ` + "`(1 yours)`" + ` how many of those are this session's, and ` + "`cpu 61%`" + ` /
+` + "`thermal ok`" + ` the readings the budget moves on.
 ` + "`governor: daemon not running - spawns ungoverned`" + ` means nothing is being capped, and
 ` + "`governor: ungoverned - restart to enable`" + ` means this session started before the governor
 did — hooks are bound when a session opens, so only restarting it will govern this one.`

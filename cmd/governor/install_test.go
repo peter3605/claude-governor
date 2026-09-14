@@ -447,11 +447,14 @@ func TestInstallRegistersEveryHook(t *testing.T) {
 		if h.Command != want {
 			t.Errorf("%s: command is %q, want %q", w.event, h.Command, want)
 		}
-		if w.matched && entries[0].Matcher == "" {
+		if w.matched() && entries[0].Matcher == "" {
 			t.Errorf("%s: no matcher, so the gate would fire on every tool call", w.event)
 		}
-		if !w.matched && entries[0].Matcher != "" {
-			t.Errorf("%s: has matcher %q; only the gate takes one", w.event, entries[0].Matcher)
+		if !w.matched() && entries[0].Matcher != "" {
+			t.Errorf("%s: has matcher %q; only a matched hook takes one", w.event, entries[0].Matcher)
+		}
+		if w.matched() && entries[0].Matcher != strings.Join(w.covers, "|") {
+			t.Errorf("%s: matcher is %q, want %q", w.event, entries[0].Matcher, strings.Join(w.covers, "|"))
 		}
 	}
 
@@ -473,24 +476,50 @@ func TestInstalledMatcherCoversEverySpawnPath(t *testing.T) {
 	p := stagedHome(t)
 	installOK(t)
 
+	// Every matched hook is checked against ITS OWN covers, not against one shared list.
+	// Since GOV-15 there are two matchers and they are deliberately different expressions:
+	// the gate covers every spawn name plus Bash, while the PostToolUse finish hook covers
+	// Bash alone. Asserting one list against both would demand that finish match `Agent`,
+	// and an install that satisfied it would run a hook on every spawn for nothing.
 	hooks := readHooks(t, p.hooks)
-	var matcher string
+	checked := 0
 	for _, w := range wantedHooks {
-		if w.matched {
-			matcher = hooks[w.event][0].Matcher
+		if !w.matched() {
+			continue
+		}
+		checked++
+		matcher := hooks[w.event][0].Matcher
+		if matcher == "" {
+			t.Errorf("no matcher on the %s hook", w.event)
+			continue
+		}
+		re, err := regexp.Compile(matcher)
+		if err != nil {
+			t.Errorf("%s matcher %q does not compile as a regexp: %v", w.event, matcher, err)
+			continue
+		}
+		for _, name := range w.covers {
+			if !re.MatchString(name) {
+				t.Errorf("%s matcher %q does not match %q, so that path is ungoverned",
+					w.event, matcher, name)
+			}
 		}
 	}
-	if matcher == "" {
-		t.Fatal("no matcher on the gate hook")
+	if checked == 0 {
+		t.Fatal("no matched hook was checked; this test has stopped testing anything")
 	}
-	re, err := regexp.Compile(matcher)
-	if err != nil {
-		t.Fatalf("matcher %q does not compile as a regexp: %v", matcher, err)
-	}
+
+	// And the gate's own matcher must cover every spawn path, which is the claim GOV-01 and
+	// GOV-28 were spent establishing. Stated separately because the loop above would still
+	// pass if `covers` itself lost a spawn name.
+	gate := regexp.MustCompile(hooks["PreToolUse"][0].Matcher)
 	for _, name := range spawnToolNames {
-		if !re.MatchString(name) {
-			t.Errorf("matcher %q does not match %q, so that spawn path is ungoverned", matcher, name)
+		if !gate.MatchString(name) {
+			t.Errorf("the gate matcher does not match %q, so that spawn path is ungoverned", name)
 		}
+	}
+	if !gate.MatchString(buildToolName) {
+		t.Errorf("the gate matcher does not match %q, so no build is ever governed", buildToolName)
 	}
 }
 
@@ -502,14 +531,12 @@ func TestGateHookSetsAnExplicitTimeout(t *testing.T) {
 	p := stagedHome(t)
 	installOK(t)
 
+	// Only the gate. It is the hook that can WAIT (design.md section 4.2), so it is the only
+	// one whose timeout has to bound a wait; PostToolUse never parks and a 30 s ceiling there
+	// would be describing a case it does not have.
 	hooks := readHooks(t, p.hooks)
-	for _, w := range wantedHooks {
-		if !w.matched {
-			continue
-		}
-		if got := hooks[w.event][0].Hooks[0].Timeout; got != gateHookTimeout {
-			t.Errorf("gate hook timeout is %d, want %d", got, gateHookTimeout)
-		}
+	if got := hooks["PreToolUse"][0].Hooks[0].Timeout; got != gateHookTimeout {
+		t.Errorf("gate hook timeout is %d, want %d", got, gateHookTimeout)
 	}
 }
 

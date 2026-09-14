@@ -74,7 +74,7 @@ func TestTheLogRecordsARefusalWithWhatItCost(t *testing.T) {
 	}
 
 	got := strings.Join(logLines(&buf), "\n")
-	if !strings.Contains(got, "deny session=second reason=capacity in_use=1/1 denials=1") {
+	if !strings.Contains(got, "deny session=second reason=capacity slots=1.00/1 denials=1") {
 		t.Errorf("log = %q, want a capacity deny naming the session, the count and the pressure", got)
 	}
 }
@@ -113,7 +113,7 @@ func TestTheLogRecordsAWaitSeparatelyFromARefusal(t *testing.T) {
 	}
 
 	got := strings.Join(logLines(&buf), "\n")
-	if !strings.Contains(got, "park session=second in_use=1/1 wait=5s") {
+	if !strings.Contains(got, "park session=second slots=1.00/1 wait=5s") {
 		t.Errorf("log = %q, want a park line naming the wait it committed to", got)
 	}
 	if strings.Contains(got, "deny") {

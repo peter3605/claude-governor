@@ -141,21 +141,20 @@ func TestAParkedSpawnProceedsWhenASlotFrees(t *testing.T) {
 	shortWait(t, 5*time.Second)
 	endpoint, _ := startTestDaemon(t, 1)
 
-	if !askGate(t, endpoint, "s1", "toolu_01") {
-		t.Fatal("the first spawn was refused")
+	if !askGateBuild(t, endpoint, "s1", "toolu_01") {
+		t.Fatal("the first build was refused")
 	}
-	runHookCmd(t, endpoint, subagentStartPayload("s1", "agent_a"), buildConfirm)
 
 	const holdFor = 150 * time.Millisecond
 	go func() {
 		time.Sleep(holdFor)
 		var stderr strings.Builder
-		lifecycleHook(strings.NewReader(subagentStopPayload("s1", "agent_a")),
-			&stderr, transport.Dial{}, hookBudget, buildRelease)
+		lifecycleHook(strings.NewReader(postToolUsePayload("s1", "toolu_01")),
+			&stderr, transport.Dial{}, hookBudget, buildFinish)
 	}()
 
 	start := time.Now()
-	allowed := askGate(t, endpoint, "s1", "toolu_02")
+	allowed := askGateBuild(t, endpoint, "s1", "toolu_02")
 	elapsed := time.Since(start)
 
 	if !allowed {
@@ -180,7 +179,7 @@ func TestAParkedSpawnProceedsWhenASlotFrees(t *testing.T) {
 // regression a wall-clock end-to-end test reports as a pass.
 func TestReleaseWakesTheLongestWaiter(t *testing.T) {
 	d := newDaemon(1, io.Discard)
-	if _, ok := d.table.Acquire("s0", 0, 1); !ok {
+	if _, ok := d.table.Acquire(lease.Request{Session: "s0", Depth: 0}, 1); !ok {
 		t.Fatal("could not fill the budget")
 	}
 	if _, ok := d.table.Confirm("s0", "", "agent_a", 0, time.Time{}); !ok {
@@ -210,7 +209,7 @@ func TestReleaseWakesTheLongestWaiter(t *testing.T) {
 // SessionEnd frees every lease a session held, and those slots belong to the queue too.
 func TestSessionEndWakesTheLongestWaiter(t *testing.T) {
 	d := newDaemon(1, io.Discard)
-	if _, ok := d.table.Acquire("s0", 0, 1); !ok {
+	if _, ok := d.table.Acquire(lease.Request{Session: "s0", Depth: 0}, 1); !ok {
 		t.Fatal("could not fill the budget")
 	}
 
@@ -254,7 +253,7 @@ func TestASlotReclaimedByTheReaperWakesAWaiter(t *testing.T) {
 
 	// A tentative lease nobody will ever confirm: the spawn PreToolUse announced never
 	// happened, which is the case the tentative TTL exists for.
-	if _, ok := d.table.Acquire("s0", 0, 1); !ok {
+	if _, ok := d.table.Acquire(lease.Request{Session: "s0", Depth: 0}, 1); !ok {
 		t.Fatal("could not fill the budget")
 	}
 
@@ -286,12 +285,12 @@ func TestAParkedSpawnIsRefusedAtItsDeadline(t *testing.T) {
 	shortWait(t, 200*time.Millisecond)
 	endpoint, d := startTestDaemon(t, 1)
 
-	if !askGate(t, endpoint, "s1", "toolu_01") {
+	if !askGateBuild(t, endpoint, "s1", "toolu_01") {
 		t.Fatal("the first spawn was refused")
 	}
 
 	start := time.Now()
-	allowed := askGate(t, endpoint, "s1", "toolu_02")
+	allowed := askGateBuild(t, endpoint, "s1", "toolu_02")
 	elapsed := time.Since(start)
 
 	if allowed {
@@ -314,7 +313,7 @@ func TestAParkedSpawnIsRefusedAtItsDeadline(t *testing.T) {
 func TestTheWaitQueueIsStrictlyFIFOAcrossSessions(t *testing.T) {
 	d := newDaemon(1, io.Discard)
 
-	held, ok := d.table.Acquire("s0", 0, 1)
+	held, ok := d.table.Acquire(lease.Request{Session: "s0", Depth: 0}, 1)
 	if !ok {
 		t.Fatal("could not fill the budget")
 	}
@@ -385,7 +384,7 @@ func TestALeaseGrantedAsAWaiterGivesUpIsNotLost(t *testing.T) {
 func TestACancelledParkHandsTheSlotBack(t *testing.T) {
 	d := newDaemon(1, io.Discard)
 
-	held, _ := d.table.Acquire("s0", 0, 1)
+	held, _ := d.table.Acquire(lease.Request{Session: "s0", Depth: 0}, 1)
 	reply := d.acquire(request{V: protocolVersion, Op: "acquire", Session: "s1", WaitMS: 5000})
 	p, ok := reply.(*parkedAcquire)
 	if !ok {
@@ -461,15 +460,15 @@ func TestASessionRefusedInsideTheCooloffIsNotParkedAgain(t *testing.T) {
 	shortWait(t, 500*time.Millisecond)
 	endpoint, _ := startTestDaemon(t, 1)
 
-	if !askGate(t, endpoint, "s1", "toolu_01") {
+	if !askGateBuild(t, endpoint, "s1", "toolu_01") {
 		t.Fatal("the first spawn was refused")
 	}
-	if askGate(t, endpoint, "s1", "toolu_02") {
+	if askGateBuild(t, endpoint, "s1", "toolu_02") {
 		t.Fatal("the second spawn was allowed against a budget of 1")
 	}
 
 	var allowed bool
-	took := timed(func() { allowed = askGate(t, endpoint, "s1", "toolu_03") })
+	took := timed(func() { allowed = askGateBuild(t, endpoint, "s1", "toolu_03") })
 	if allowed {
 		t.Fatal("the third spawn was allowed against a budget of 1")
 	}
@@ -484,7 +483,7 @@ func TestASessionRefusedInsideTheCooloffIsNotParkedAgain(t *testing.T) {
 func TestAGrantAfterWaitingIsNotCountedAsADenial(t *testing.T) {
 	d := newDaemon(1, io.Discard)
 
-	held, _ := d.table.Acquire("s0", 0, 1)
+	held, _ := d.table.Acquire(lease.Request{Session: "s0", Depth: 0}, 1)
 	reply := d.acquire(request{V: protocolVersion, Session: "s1", WaitMS: 5000})
 	p := reply.(*parkedAcquire)
 
@@ -505,7 +504,7 @@ func TestRepeatDenialsEscalate(t *testing.T) {
 	// A budget of 1, filled, rather than a budget of 0: budget.Floor is 1 and invariant 4
 	// says it never reaches zero, so asking for 0 gets 1 and every acquire would be granted.
 	d := newDaemon(1, io.Discard)
-	if _, ok := d.table.Acquire("s0", 0, 1); !ok {
+	if _, ok := d.table.Acquire(lease.Request{Session: "s0", Depth: 0}, 1); !ok {
 		t.Fatal("could not fill the budget")
 	}
 
@@ -520,7 +519,7 @@ func TestRepeatDenialsEscalate(t *testing.T) {
 		}
 		texts = append(texts, denyReason(acquireResponse{
 			Reason: r.Reason, Budget: r.Budget, InUse: r.InUse, Denials: r.Denials,
-		}))
+		}, intent{kind: "agent"}))
 	}
 
 	for i, text := range texts {
@@ -536,6 +535,47 @@ func TestRepeatDenialsEscalate(t *testing.T) {
 	}
 	if !strings.Contains(texts[3], "4 times") {
 		t.Errorf("the fourth refusal does not name how many times: %q", texts[3])
+	}
+}
+
+// TestABuildIsRefusedInItsOwnTerms: a refused spawn and a refused build are not the same event
+// and must not be told the same thing.
+//
+// Refusing a spawn means "do not delegate, do the work here" — the work still happens. Refusing
+// a Bash means the user's command DID NOT RUN, and there is no inline alternative: nothing else
+// on the machine can compile that package. Telling a model that tried `cargo build` to "run
+// this task inline yourself rather than delegating it" sends it looking for another way to
+// build, which is worse than waiting.
+func TestABuildIsRefusedInItsOwnTerms(t *testing.T) {
+	resp := acquireResponse{Reason: "capacity", Budget: 4, InUse: 4, Denials: 1}
+
+	build := denyReason(resp, intent{kind: "build"})
+	spawn := denyReason(resp, intent{kind: "agent"})
+
+	if build == spawn {
+		t.Fatalf("a refused build is told exactly what a refused spawn is told: %q", build)
+	}
+	if !strings.Contains(build, "was not run") {
+		t.Errorf("the build refusal does not say the command did not run: %q", build)
+	}
+	if !strings.Contains(build, "same command again") {
+		t.Errorf("the build refusal does not say to retry the same command: %q", build)
+	}
+	for _, wrong := range []string{"Agent", "inline", "delegat"} {
+		if strings.Contains(build, wrong) {
+			t.Errorf("the build refusal contains %q, which is spawn advice a build cannot act on: %q",
+				wrong, build)
+		}
+	}
+	// And the escalation must not tell it to stop retrying at step two, the way the spawn
+	// text does: retrying IS the correct response to a full build queue.
+	second := denyReason(acquireResponse{Reason: "capacity", Budget: 4, InUse: 4, Denials: 2},
+		intent{kind: "build"})
+	if second == build {
+		t.Errorf("the second build refusal repeats the first verbatim: %q", build)
+	}
+	if !strings.Contains(second, "retrying") && !strings.Contains(second, "Wait longer") {
+		t.Errorf("the second build refusal does not say what to do differently: %q", second)
 	}
 }
 
@@ -651,7 +691,7 @@ func TestStatusReportsParkedAcquires(t *testing.T) {
 // The daemon caps what a client may ask to be held for, whatever it sends.
 func TestAnAbsurdWaitIsCapped(t *testing.T) {
 	d := newDaemon(1, io.Discard)
-	if _, ok := d.table.Acquire("s0", 0, 1); !ok {
+	if _, ok := d.table.Acquire(lease.Request{Session: "s0", Depth: 0}, 1); !ok {
 		t.Fatal("could not fill the budget")
 	}
 

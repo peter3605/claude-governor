@@ -9,11 +9,12 @@ package budget
 
 import "context"
 
-// Quota is one source's answer: how many concurrent agents it will allow right now.
+// Quota is one source's answer: how much concurrency it will allow right now, in slots.
 type Quota struct {
 	// Name identifies the source in status output and in the "source" wire field.
 	Name string
-	// Budget is the number of concurrent agents this source permits.
+	// Budget is how many slots of concurrency this source permits. One slot is one Medium
+	// build; a subagent weighs about a twelfth of one (see weight.go).
 	Budget int
 	// InUse is how many of them this source believes are held.
 	InUse int

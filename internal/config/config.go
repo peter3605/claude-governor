@@ -27,7 +27,7 @@ type Config struct {
 	Endpoint string
 	// Setpoint is the target CPU utilisation the AIMD loop steers to (section 5.2).
 	Setpoint float64
-	// BMax is the ceiling on concurrent agents for this host.
+	// BMax is the ceiling on concurrency for this host, in slots.
 	BMax int
 	// WaitMax is how long the gate will wait for a slot before refusing.
 	WaitMaxMS int

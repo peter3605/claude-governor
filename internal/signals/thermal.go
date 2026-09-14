@@ -31,6 +31,31 @@ func (t Thermal) Elevated() bool {
 	}
 }
 
+// Severe reports whether the thermal state is one that has actually been observed to mean
+// trouble, which is a NARROWER question than Elevated asks.
+//
+// THE TWO EXIST BECAUSE THE MEASUREMENT SPLIT THEM (GOV-15 clause 3). Elevated is the
+// design's original rule — any non-nominal state is a cut trigger — and it is still the right
+// reading of "non-nominal". But over 312,515 samples of this machine, `fair` occurred 2.85%
+// of the time and `serious` or `critical` never occurred at all, and GOV-13 separately drove
+// ten minutes of saturating 8-core load without the state leaving `nominal`, corroborated by
+// `pmset -g therm` reporting no warning level. `fair` on Apple silicon is not a distress
+// signal, and flooring the budget on it would throttle the machine for nearly three hours in
+// every 101 for no measured benefit.
+//
+// So the control loop cuts on Severe and the door is left open for anything that wants the
+// broader reading. Unknown is not severe, for the same reason it is not elevated: a host that
+// cannot measure its own temperature is not a hot host, and treating it as one pins every
+// Linux budget at the floor forever.
+func (t Thermal) Severe() bool {
+	switch t {
+	case Serious, Critical:
+		return true
+	default:
+		return false
+	}
+}
+
 // thermalFromRaw maps a raw NSProcessInfoThermalState to a Thermal.
 //
 // It is deliberately separate from the cgo read and lives in the platform-neutral file so

@@ -12,6 +12,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/peter3605/claude-governor/internal/budget"
+	"github.com/peter3605/claude-governor/internal/classify"
 	"github.com/peter3605/claude-governor/internal/signals"
 	"github.com/peter3605/claude-governor/internal/transport"
 )
@@ -117,6 +119,22 @@ type acquireRequest struct {
 	// matters; the ledger merely stays empty and doctor reports the surface as unconfirmed,
 	// which is true. A bump would instead make every un-upgraded gate fail open.
 	Tool string `json:"tool,omitempty"`
+	// Kind, Class and Weight say what is being asked for and how big it is: "agent" or
+	// "build", the cost class for a build, and the weight in slots.
+	//
+	// Additive for the same reason Tool is, and with the same consequence for a mixed-version
+	// machine: an older daemon ignores them and treats every acquire as a whole-slot agent
+	// lease, which over-counts a `Bash` call rather than under-counting it. That is the safe
+	// direction — the machine is governed more tightly than intended for the length of an
+	// upgrade, not less — and it is why this does not bump the protocol version, which would
+	// instead make every un-upgraded gate fail open and govern nothing at all.
+	// The wire key is "slots", not "weight": `weight` is already taken on this connection
+	// by the session operation's fair-share weight (design.md section 6.1), and one struct
+	// decodes every operation. Two meanings on one key is how a float quietly fails to
+	// parse into an int and every build silently weighs nothing.
+	Kind  string  `json:"kind,omitempty"`
+	Class string  `json:"class,omitempty"`
+	Slots float64 `json:"slots,omitempty"`
 }
 
 // acquireResponse is the granted and refused replies of design.md section 7, decoded into
@@ -128,6 +146,10 @@ type acquireResponse struct {
 	Reason string `json:"reason"`
 	Budget int    `json:"budget"`
 	InUse  int    `json:"in_use"`
+	// Slots is how much of the budget is held. It is what the refusal text names, because
+	// InUse counts leases and the budget counts slots, and four agents reading "4/6 slots"
+	// on a machine that is 5% full is a number that invites exactly the wrong response.
+	Slots float64 `json:"slots"`
 	// CPU is a pointer because the daemon has no sampler until GOV-12 and sends null
 	// rather than a fabricated 0.0, which would read as an idle machine. A deny must not
 	// claim a CPU figure it was not given.
@@ -153,12 +175,14 @@ type hookPayload struct {
 	// It is the only depth signal the surface carries — there is no depth field
 	// (docs/hook-surface.md section 2).
 	AgentID string `json:"agent_id"`
-	// ToolInput is decoded for one field only. `to` is what separates a SendMessage that
+	// ToolInput is decoded for two fields only. `to` is what separates a SendMessage that
 	// resumes a subagent from one that messages a teammate or another session
-	// (docs/hook-surface.md section 8.3). Nothing else here is read: tool_input also
-	// carries the prompt and the message body, and this process has no business with either.
+	// (docs/hook-surface.md section 8.3). `command` is the Bash command text, which is the
+	// sole input to the classifier. Nothing else here is read: tool_input also carries the
+	// prompt and the message body, and this process has no business with either.
 	ToolInput struct {
-		To string `json:"to"`
+		To      string `json:"to"`
+		Command string `json:"command"`
 	} `json:"tool_input"`
 }
 
@@ -184,6 +208,22 @@ var agentIDShape = regexp.MustCompile(`^[0-9a-f]{17}$`)
 // binds the two together, so a name added to one and not the other is a red test rather than
 // a matcher that silently stops covering a spawn path.
 var spawnToolNames = []string{"Agent", "Task", "SendMessage"}
+
+// buildToolName is the tool that runs build-shaped work, and the second thing the gate
+// governs (GOV-15, design.md section 5.5).
+//
+// It is gated by COMMAND rather than by name: `Bash` fires 184-2,221 times a day against the
+// spawn path's 0-37, so leasing every call would be absurd and the predicate is the whole
+// design. internal/classify decides, gate-side, before any I/O.
+const buildToolName = "Bash"
+
+// gatedToolNames is what the PreToolUse matcher has to cover: every spawn name, plus Bash.
+//
+// It is a superset of spawnToolNames rather than a replacement, because the two lists answer
+// different questions. This one is "what must reach this binary at all"; spawnToolNames is
+// "which of those, once here, is a subagent spawn". A name that reaches the gate and turns
+// out to be neither is simply dropped.
+var gatedToolNames = append(append([]string{}, spawnToolNames...), buildToolName)
 
 // spawnConfirmingTools are the names whose arrival PROVES the spawn path is still matched.
 //
@@ -272,6 +312,51 @@ func governsSpawn(p hookPayload) (bool, string) {
 	}
 }
 
+// intent is what the gate has decided to ask the daemon for, or that it will ask for nothing.
+type intent struct {
+	// take reports whether to contact the daemon at all. When false, why says what was
+	// decided and the gate returns having performed NO I/O.
+	take bool
+	why  string
+	kind string
+	// weight is how much of the budget to ask for, in slots (internal/budget).
+	weight float64
+	// class is the cost class of a build, for the daemon's log. Empty for a spawn.
+	class string
+}
+
+// decide works out what this payload is worth, WITHOUT touching the network.
+//
+// THE ORDERING IS THE POINT AND IT IS CLAUSE 1 OF GOV-15. `Bash` fires 184-2,221 times a day
+// and 81.6% of those calls are not build-shaped, so the cheap answer has to be reached
+// before a socket is opened. The obvious implementation — send everything to the daemon and
+// let it answer "not gated" — is a unix round trip on `cat`, and at this call rate it spends
+// the entire latency budget of design.md section 4.4 arriving at "no". internal/classify is
+// a pure function costing ~5 us with no I/O and no locks precisely so that this function can
+// be the whole of the decision for four calls in five.
+func decide(p hookPayload) intent {
+	if p.ToolName == buildToolName {
+		r := classify.Classify(p.ToolInput.Command)
+		if !r.Gated {
+			return intent{why: "not build-shaped"}
+		}
+		return intent{
+			take:   true,
+			kind:   "build",
+			class:  r.Class.String(),
+			weight: budget.SlotsFor(r.Class.ExpectedPeakCores()),
+		}
+	}
+	if ok, why := governsSpawn(p); !ok {
+		return intent{why: why}
+	}
+	// An agent spawn takes a lease WEIGHTED at its measured cost rather than a whole slot.
+	// See internal/budget/weight.go for why this was decided rather than dropping agent
+	// leases outright: the short version is that +0.098 cores is small but real, and a
+	// budget that can express both sizes governs both.
+	return intent{take: true, kind: "agent", weight: budget.AgentWeight}
+}
+
 // denyOutput is the PreToolUse decision Claude Code reads from stdout, measured verbatim in
 // GOV-01 (docs/hook-surface.md section 10.2).
 //
@@ -331,13 +416,18 @@ func gateOnce(stdin io.Reader, stdout, diag io.Writer, dialer transport.Dialer, 
 	}
 
 	// The hook matcher is configuration and configuration drifts, so the payload is checked
-	// here too and a lease is taken for nothing the binary does not recognise as a spawn.
-	if ok, why := governsSpawn(p); !ok {
-		fmt.Fprintf(diag, "governor gate: %s\n", why)
+	// here too and a lease is taken for nothing the binary does not recognise as worth one.
+	//
+	// Nothing above this line has touched the network, and for a cheap `Bash` command
+	// nothing below it will either — the function returns here having opened no socket and
+	// resolved no endpoint.
+	in := decide(p)
+	if !in.take {
+		fmt.Fprintf(diag, "governor gate: %s\n", in.why)
 		return
 	}
 
-	conn, replies, err := dialAndSend(dialer, clock.Deadline(), acquireRequestFor(p, speaks))
+	conn, replies, err := dialAndSend(dialer, clock.Deadline(), acquireRequestFor(p, in, speaks))
 	if err != nil {
 		fmt.Fprintf(diag, "governor gate: %v\n", err)
 		if errors.Is(err, errNoDaemon) {
@@ -390,7 +480,7 @@ func gateOnce(stdin io.Reader, stdout, diag io.Writer, dialer transport.Dialer, 
 	out, err := json.Marshal(denyOutput{denyBody{
 		HookEventName:            "PreToolUse",
 		PermissionDecision:       "deny",
-		PermissionDecisionReason: denyReason(resp),
+		PermissionDecisionReason: denyReason(resp, in),
 	}})
 	if err != nil {
 		// Failing to encode a refusal means the spawn proceeds. That is the correct way
@@ -463,7 +553,7 @@ func awaitParked(diag io.Writer, conn net.Conn, replies *bufio.Reader, clock *bu
 // Every clause after the slot count is conditional, because a clause that states a fact the
 // daemon did not send is a fabrication. CPU is null until GOV-12 lands the sampler, and
 // thermal is "unknown" on Linux by design.
-func denyReason(resp acquireResponse) string {
+func denyReason(resp acquireResponse, in intent) string {
 	if resp.Reason == "depth" {
 		// Nothing conditional to say: this refusal does not depend on load, and naming a
 		// slot count would invite a retry once the count moved. It never will for this
@@ -474,7 +564,10 @@ func denyReason(resp acquireResponse) string {
 	}
 
 	var b strings.Builder
-	fmt.Fprintf(&b, "Fleet at capacity (%d/%d slots", resp.InUse, resp.Budget)
+	// formatSlots rather than %.1f so a machine holding four whole builds says "4/6" and not
+	// "4.0/6": the decimal is there to stop a machine holding only agents rounding to a
+	// reassuring zero, not to decorate the common case.
+	fmt.Fprintf(&b, "Machine at capacity (%s/%d build slots", formatSlots(resp.Slots), resp.Budget)
 	if resp.CPU != nil {
 		fmt.Fprintf(&b, ", CPU %.0f%%", *resp.CPU*100)
 	}
@@ -482,8 +575,44 @@ func denyReason(resp acquireResponse) string {
 		fmt.Fprintf(&b, ", thermal: %s", resp.Thermal)
 	}
 	b.WriteString("). ")
-	b.WriteString(escalation(resp.Denials))
+	if in.kind == "build" {
+		b.WriteString(buildEscalation(resp.Denials))
+	} else {
+		b.WriteString(escalation(resp.Denials))
+	}
 	return b.String()
+}
+
+// buildEscalation is the instruction half of a capacity deny for a BUILD, and it has to say
+// something completely different from the spawn text below.
+//
+// THE TWO REFUSALS ARE NOT THE SAME EVENT. Refusing a spawn means "do not delegate, do the
+// work here" — the work still happens, inline, and the instruction is to stop asking. Refusing
+// a `Bash` means the user's command DID NOT RUN. There is no inline alternative: nothing else
+// on the machine can compile that package. So the only correct instruction is to run it again
+// shortly, and telling a model to "do this task inline yourself rather than delegating it"
+// when it tried to run `cargo build` is advice it cannot act on — it would go looking for
+// another way to build, which is worse than waiting.
+//
+// It also does not escalate into "stop retrying", which the spawn text does. A retry is the
+// CORRECT response here and the queue is what makes it cheap: the gate parks a build for up to
+// wait_max before ever refusing it, so a refusal already means the machine stayed full for
+// twenty seconds. What escalation adds is honesty about how long that has been going on.
+func buildEscalation(denials int) string {
+	switch {
+	case denials <= 1:
+		return "This command was not run. Other builds on this machine are using every " +
+			"slot. Wait a few seconds and run exactly the same command again; do not look " +
+			"for a different way to build, and do not treat this as a build failure."
+	case denials == 2:
+		return "This command was not run, for the 2nd time. The machine has been saturated " +
+			"for a while. Wait longer before retrying the same command, and do not start " +
+			"any further builds or test runs in the meantime."
+	default:
+		return fmt.Sprintf("This command was not run, for the %dth time. Something on this "+
+			"machine is holding every build slot. Stop starting builds, tell the user the "+
+			"machine is saturated, and let them decide — do not keep retrying.", denials)
+	}
 }
 
 // escalation is the instruction half of a capacity deny, firmer each time the same session
@@ -510,8 +639,8 @@ func escalation(denials int) string {
 	}
 }
 
-// acquireRequestFor builds the wire request from the hook payload.
-func acquireRequestFor(p hookPayload, speaks int) acquireRequest {
+// acquireRequestFor builds the wire request from the hook payload and the gate's decision.
+func acquireRequestFor(p hookPayload, in intent, speaks int) acquireRequest {
 	depth := 0
 	if p.AgentID != "" {
 		depth = 1
@@ -523,6 +652,9 @@ func acquireRequestFor(p hookPayload, speaks int) acquireRequest {
 		Session:   p.SessionID,
 		ToolUseID: p.ToolUseID,
 		Tool:      p.ToolName,
+		Kind:      in.kind,
+		Class:     in.class,
+		Slots:     in.weight,
 		Depth:     depth,
 		// What the gate is willing to be held for. The daemon parks the request for at most
 		// this long and answers either way; a gate that cannot perform a wait sends zero,

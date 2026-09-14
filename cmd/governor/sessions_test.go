@@ -533,7 +533,7 @@ func TestClassifyNeverTurnsAnUnreadableFactIntoAFault(t *testing.T) {
 		r.DaemonStarted = started.Add(-time.Hour).UTC().Format(time.RFC3339)
 		s := live
 		s.Confirmed = 1
-		if g := classify(r, s); g.ungoverned() {
+		if g := classifyGovernance(r, s); g.ungoverned() {
 			t.Errorf("a session holding a confirmed lease was classified %v", g)
 		}
 	})
@@ -542,7 +542,7 @@ func TestClassifyNeverTurnsAnUnreadableFactIntoAFault(t *testing.T) {
 		r := base
 		// RFC3339 without a zone: what another build, or a future one, might send.
 		r.DaemonStarted = "2026-09-09T23:09:01"
-		if g := classify(r, live); g.ungoverned() {
+		if g := classifyGovernance(r, live); g.ungoverned() {
 			t.Errorf("an unparseable daemon_started produced %v; an unreadable input must reach unknown", g)
 		}
 	})
@@ -552,7 +552,7 @@ func TestClassifyNeverTurnsAnUnreadableFactIntoAFault(t *testing.T) {
 		r.DaemonStarted = time.Now().Add(-time.Hour).UTC().Format(time.RFC3339)
 		s := live
 		s.Started = time.Now().Add(-time.Second).UTC().Format(time.RFC3339)
-		if g := classify(r, s); g.ungoverned() {
+		if g := classifyGovernance(r, s); g.ungoverned() {
 			t.Errorf("a one-second-old session was classified %v; its SessionStart may still be in flight", g)
 		}
 	})
@@ -565,7 +565,7 @@ func TestClassifyNeverTurnsAnUnreadableFactIntoAFault(t *testing.T) {
 		r.DaemonStarted = measuredHooksInstalled.Add(30 * time.Minute).UTC().Format(time.RFC3339)
 		s := live
 		s.Started = measuredHooksInstalled.Add(time.Hour).UTC().Format(time.RFC3339)
-		if g := classify(r, s); !g.ungoverned() {
+		if g := classifyGovernance(r, s); !g.ungoverned() {
 			t.Errorf("classify = %v, want an ungoverned verdict", g)
 		}
 	})

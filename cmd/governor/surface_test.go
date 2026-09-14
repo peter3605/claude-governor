@@ -300,7 +300,8 @@ func TestTheDaemonRecordsTheToolNameTheGateReports(t *testing.T) {
 // which looks like a harness change rather than a governor bug.
 func TestTheGateSendsTheToolNameItMatched(t *testing.T) {
 	for _, name := range spawnToolNames {
-		req := acquireRequestFor(hookPayload{SessionID: "s", ToolName: name}, protocolVersion)
+		p := hookPayload{SessionID: "s", ToolName: name}
+		req := acquireRequestFor(p, decide(p), protocolVersion)
 		if req.Tool != name {
 			t.Errorf("gate sent tool %q for a %q payload", req.Tool, name)
 		}

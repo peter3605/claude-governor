@@ -6,6 +6,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"math"
 	"net"
 	"os"
 	"path/filepath"
@@ -13,6 +15,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/peter3605/claude-governor/internal/budget"
 	"github.com/peter3605/claude-governor/internal/transport"
 )
 
@@ -259,19 +262,149 @@ func TestGateFailsOpen(t *testing.T) {
 		},
 	}
 
+	// Every failure shape is run for BOTH gated tools, because GOV-15 made the gate a hot
+	// path on a second one and a suite that only covered spawns would be asserting the
+	// invariant at 0-37 calls a day while it actually runs at 184-2,221 (design.md section
+	// 4.4). A build-shaped Bash reaches exactly the same socket code, so any of these that
+	// could hang would hang on every fifth shell command the user typed rather than on the
+	// occasional delegation — the same bug, two orders of magnitude more often.
+	tools := []struct {
+		name    string
+		payload string
+	}{
+		{"spawn", samplePayload},
+		{"build", `{"session_id":"s","hook_event_name":"PreToolUse","tool_name":"Bash",` +
+			`"tool_input":{"command":"go build ./..."},"tool_use_id":"toolu_failopen"}`},
+	}
+
 	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			payload := tt.payload
-			if payload == "" {
-				payload = samplePayload
+		for _, tool := range tools {
+			t.Run(tt.name+"/"+tool.name, func(t *testing.T) {
+				payload := tt.payload
+				if payload == "" {
+					payload = tool.payload
+				} else if tool.name != "spawn" {
+					// The malformed-payload case has nothing tool-specific to say, and
+					// running it twice would assert the same thing twice.
+					t.Skip("payload is fixed by the case")
+				}
+				var d transport.Dialer = transport.Dial{}
+				if tt.dialer != nil {
+					d = tt.dialer
+				}
+				diag := runGateFor(t, tt.endpoint(t), payload, d)
+				if !strings.Contains(diag, tt.wantDiag) {
+					t.Errorf("stderr = %q, want it to mention %q", diag, tt.wantDiag)
+				}
+			})
+		}
+	}
+}
+
+// TestTheFinishHookFailsOpenToo holds the sixth hook to the same contract as the other five.
+//
+// It runs on every `Bash` call, which is the highest-frequency hook the governor installs, so
+// a hang here is a hang on every shell command in every session. What it must NOT do is hold
+// the session up when the daemon is missing or wedged: a build lease that is not returned
+// costs a slot for DefaultBuildTTL, and that is a throughput problem that fixes itself, while
+// a hook that blocks is a terminal that has stopped.
+func TestTheFinishHookFailsOpenToo(t *testing.T) {
+	cases := []struct {
+		name     string
+		endpoint func(t *testing.T) string
+	}{
+		{"no socket at all", func(t *testing.T) string {
+			return "unix://" + filepath.Join(sockDir(t), "absent")
+		}},
+		{"accepts and never replies", func(t *testing.T) string {
+			return listenerFunc(t, func(c net.Conn, _ []byte) { select {} })
+		}},
+		{"answers with rubbish", func(t *testing.T) string {
+			return listenerFunc(t, func(c net.Conn, _ []byte) {
+				c.Write([]byte("not json at all\n"))
+			})
+		}},
+	}
+
+	payload := `{"session_id":"s","hook_event_name":"PostToolUse","tool_name":"Bash",` +
+		`"tool_use_id":"toolu_x","tool_response":{"stdout":"","stderr":""}}`
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv(transport.EndpointEnv, tc.endpoint(t))
+
+			var stderr strings.Builder
+			var code int
+			took := timed(func() {
+				code = lifecycleHook(strings.NewReader(payload), &stderr,
+					transport.Dial{}, hookBudget, buildFinish)
+			})
+			if code != 0 {
+				t.Errorf("exit code = %d, want 0", code)
 			}
-			var d transport.Dialer = transport.Dial{}
-			if tt.dialer != nil {
-				d = tt.dialer
+			if took.exceeds(failOpenCeiling) {
+				t.Errorf("took %v, want under %v: this hook runs on every Bash call",
+					took, failOpenCeiling)
 			}
-			diag := runGateFor(t, tt.endpoint(t), payload, d)
-			if !strings.Contains(diag, tt.wantDiag) {
-				t.Errorf("stderr = %q, want it to mention %q", diag, tt.wantDiag)
+		})
+	}
+}
+
+// A PostToolUse for a tool that is not Bash must not cost a socket.
+//
+// The matcher should keep them out, but a matcher is configuration and configuration drifts.
+// Without this the cost of a stray registration is a daemon round trip on every Read, Edit
+// and Grep in every session on the machine.
+func TestTheFinishHookIgnoresOtherTools(t *testing.T) {
+	dialed := make(chan struct{}, 1)
+	endpoint := listenerFunc(t, func(c net.Conn, _ []byte) {
+		dialed <- struct{}{}
+		c.Write([]byte(`{"v":1,"ok":true}` + "\n"))
+	})
+	t.Setenv(transport.EndpointEnv, endpoint)
+
+	payload := `{"session_id":"s","hook_event_name":"PostToolUse","tool_name":"Read",` +
+		`"tool_use_id":"toolu_r","tool_response":{"stdout":""}}`
+	var stderr strings.Builder
+	lifecycleHook(strings.NewReader(payload), &stderr, transport.Dial{}, hookBudget, buildFinish)
+
+	select {
+	case <-dialed:
+		t.Error("the finish hook contacted the daemon for a Read; only Bash takes a build lease")
+	case <-time.After(50 * time.Millisecond):
+	}
+}
+
+// A command that is still running must keep its lease, which is the measured trap of
+// docs/hook-surface.md section 19: PostToolUse arrives ~50 ms into a backgrounded command and
+// again at a timeout, in both cases while the work carries on burning CPU.
+func TestAStillRunningCommandKeepsItsLease(t *testing.T) {
+	cases := []struct{ name, response string }{
+		{"backgrounded at launch", `{"stdout":"","stderr":"","backgroundTaskId":"b1giufa5c"}`},
+		{"timed out and backgrounded", `{"stdout":"","backgroundTaskId":"bh2slj2d5","timedOutAfterMs":5000}`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dialed := make(chan struct{}, 1)
+			endpoint := listenerFunc(t, func(c net.Conn, _ []byte) {
+				dialed <- struct{}{}
+				c.Write([]byte(`{"v":1,"ok":true}` + "\n"))
+			})
+			t.Setenv(transport.EndpointEnv, endpoint)
+
+			payload := `{"session_id":"s","hook_event_name":"PostToolUse","tool_name":"Bash",` +
+				`"tool_use_id":"toolu_bg","tool_response":` + tc.response + `}`
+			var stderr strings.Builder
+			lifecycleHook(strings.NewReader(payload), &stderr, transport.Dial{}, hookBudget, buildFinish)
+
+			select {
+			case <-dialed:
+				t.Error("the lease was returned while the command was still running; " +
+					"a backgroundTaskId means the work carries on after PostToolUse")
+			case <-time.After(50 * time.Millisecond):
+			}
+			if !strings.Contains(stderr.String(), "still running") {
+				t.Errorf("stderr = %q, want it to say the lease was held", stderr.String())
 			}
 		})
 	}
@@ -327,7 +460,7 @@ func TestGateIsSilentOnAGrant(t *testing.T) {
 // It goes through runGateDeny rather than runGateFor because the two assert opposite things
 // about stdout, which is the entire difference GOV-07 introduced.
 func TestGateDeniesWhenTheDaemonRefuses(t *testing.T) {
-	reply := `{"v":1,"ok":false,"reason":"capacity","budget":6,"in_use":6,` +
+	reply := `{"v":1,"ok":false,"reason":"capacity","budget":6,"in_use":6,"slots":6,` +
 		`"cpu":0.94,"thermal":"fair","source":"local"}`
 	endpoint := listenerFunc(t, func(c net.Conn, _ []byte) { c.Write([]byte(reply + "\n")) })
 
@@ -356,7 +489,7 @@ func TestGateDeniesWhenTheDaemonRefuses(t *testing.T) {
 // — and a reason that says "CPU 0%" on a machine nobody has measured is a fabrication that
 // a person reading the refusal has no way to catch.
 func TestGateDenyClaimsOnlyWhatTheDaemonSent(t *testing.T) {
-	reply := `{"v":1,"ok":false,"reason":"capacity","budget":4,"in_use":4,` +
+	reply := `{"v":1,"ok":false,"reason":"capacity","budget":4,"in_use":4,"slots":4,` +
 		`"cpu":null,"thermal":"unknown","source":"local"}`
 	endpoint := listenerFunc(t, func(c net.Conn, _ []byte) { c.Write([]byte(reply + "\n")) })
 
@@ -506,15 +639,15 @@ func TestGateSendsTheAcquireRequest(t *testing.T) {
 }
 
 // TestGateTakesNoLeaseForOtherTools guards the case where the hook matcher is wider than it
-// should be. A lease taken for a Bash call is a slot never returned.
+// should be. A lease taken for a tool that never returns one is a slot never returned.
 func TestGateTakesNoLeaseForOtherTools(t *testing.T) {
 	dialed := make(chan struct{}, 1)
 	endpoint := listenerFunc(t, func(c net.Conn, _ []byte) {
 		dialed <- struct{}{}
 		c.Write([]byte(`{"v":1,"ok":true}` + "\n"))
 	})
-	payload := `{"session_id":"s","hook_event_name":"PreToolUse","tool_name":"Bash",` +
-		`"tool_input":{"command":"wc -l README.md"},"tool_use_id":"toolu_bash"}`
+	payload := `{"session_id":"s","hook_event_name":"PreToolUse","tool_name":"Read",` +
+		`"tool_input":{"file_path":"/etc/hosts"},"tool_use_id":"toolu_read"}`
 
 	diag := runGateFor(t, endpoint, payload, transport.Dial{})
 	if !strings.Contains(diag, "not a subagent spawn") {
@@ -522,8 +655,145 @@ func TestGateTakesNoLeaseForOtherTools(t *testing.T) {
 	}
 	select {
 	case <-dialed:
-		t.Error("the gate contacted the daemon for a Bash call; only Agent and Task take a lease")
+		t.Error("the gate contacted the daemon for a Read; only a spawn or a build takes a lease")
 	case <-time.After(50 * time.Millisecond):
+	}
+}
+
+// TestACheapCommandNeverContactsTheDaemon is GOV-15 clause 1, and it asserts the ABSENCE of
+// I/O rather than the speed of it.
+//
+// This is the whole reason internal/classify is a pure function called gate-side. `Bash`
+// fires 184-2,221 times a day against the spawn path's 0-37, and 81.6% of those calls are not
+// build-shaped. The obvious implementation — send every command to the daemon and let the
+// daemon answer "not gated" — is a unix round trip on `cat`, and at that call rate it spends
+// the whole of design.md section 4.4's latency budget arriving at "no".
+//
+// A test that only measured latency would pass on that implementation on an idle laptop. So
+// this one fails the moment a connection is made at all: the listener reports every dial, and
+// any dial is the regression.
+func TestACheapCommandNeverContactsTheDaemon(t *testing.T) {
+	// Drawn from the shapes that actually dominate the corpus (docs/bash-corpus.md), not
+	// from a hand-written list of things that look cheap.
+	cheap := []string{
+		"cat README.md",
+		"git status",
+		"git status --short",
+		"ls -la",
+		"grep -rn TODO .",
+		"wc -l < README.md",
+		"echo hello",
+		"go version",
+		"go env GOPATH",
+		"npm ls",
+		"docker ps",
+		"pip list",
+		"jq '.name' package.json",
+		"sed -n '1,20p' main.go",
+		"rg --files",
+	}
+
+	for _, cmd := range cheap {
+		t.Run(cmd, func(t *testing.T) {
+			dialed := make(chan struct{}, 1)
+			endpoint := listenerFunc(t, func(c net.Conn, _ []byte) {
+				dialed <- struct{}{}
+				c.Write([]byte(`{"v":1,"ok":true}` + "\n"))
+			})
+			payload := fmt.Sprintf(
+				`{"session_id":"s","hook_event_name":"PreToolUse","tool_name":"Bash",`+
+					`"tool_input":{"command":%q},"tool_use_id":"toolu_cheap"}`, cmd)
+
+			runGateFor(t, endpoint, payload, transport.Dial{})
+			select {
+			case <-dialed:
+				t.Errorf("the gate opened a socket for %q; a cheap command must be answered "+
+					"gate-side, before any I/O", cmd)
+			case <-time.After(50 * time.Millisecond):
+			}
+		})
+	}
+}
+
+// And the other direction, so the test above cannot pass by the gate having stopped working.
+// A build-shaped command must reach the daemon, carrying its kind and its weight.
+func TestABuildShapedCommandDoesContactTheDaemon(t *testing.T) {
+	cases := []struct {
+		cmd   string
+		class string
+		slots float64
+	}{
+		{"go build ./...", "medium", 1},
+		{"go test -race ./...", "medium", 1},
+		{"cargo build --release", "heavy", 4.5 / budget.SlotCores},
+		{"xcodebuild -scheme App test", "heavy", 4.5 / budget.SlotCores},
+		{"uv run pytest -q", "medium", 1},
+		{".venv/bin/python -m pytest", "medium", 1},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.cmd, func(t *testing.T) {
+			got := make(chan acquireRequest, 1)
+			endpoint := listenerFunc(t, func(c net.Conn, raw []byte) {
+				var req acquireRequest
+				json.Unmarshal(raw, &req)
+				got <- req
+				c.Write([]byte(`{"v":1,"ok":true}` + "\n"))
+			})
+			payload := fmt.Sprintf(
+				`{"session_id":"s","hook_event_name":"PreToolUse","tool_name":"Bash",`+
+					`"tool_input":{"command":%q},"tool_use_id":"toolu_build"}`, tc.cmd)
+
+			runGateFor(t, endpoint, payload, transport.Dial{})
+			select {
+			case req := <-got:
+				if req.Kind != "build" {
+					t.Errorf("kind = %q, want \"build\"", req.Kind)
+				}
+				if req.Class != tc.class {
+					t.Errorf("class = %q, want %q", req.Class, tc.class)
+				}
+				if math.Abs(req.Slots-tc.slots) > 1e-9 {
+					t.Errorf("slots = %v, want %v", req.Slots, tc.slots)
+				}
+				if req.ToolUseID != "toolu_build" {
+					t.Errorf("tool_use_id = %q; a build lease is released by this key and "+
+						"nothing else can return it", req.ToolUseID)
+				}
+			case <-time.After(time.Second):
+				t.Errorf("the gate never contacted the daemon for %q, so it is ungoverned", tc.cmd)
+			}
+		})
+	}
+}
+
+// A spawn asks for its measured weight rather than a whole slot — the other half of clause 1's
+// decision, asserted on the wire so it cannot drift back to 1 unnoticed.
+func TestASpawnAsksForItsMeasuredWeight(t *testing.T) {
+	got := make(chan acquireRequest, 1)
+	endpoint := listenerFunc(t, func(c net.Conn, raw []byte) {
+		var req acquireRequest
+		json.Unmarshal(raw, &req)
+		got <- req
+		c.Write([]byte(`{"v":1,"ok":true}` + "\n"))
+	})
+
+	runGateFor(t, endpoint, samplePayload, transport.Dial{})
+	select {
+	case req := <-got:
+		if req.Kind != "agent" {
+			t.Errorf("kind = %q, want \"agent\"", req.Kind)
+		}
+		if req.Slots >= 1 {
+			t.Errorf("a spawn asked for %v slots; Phase 0 measured its marginal cost at "+
+				"+0.098 cores against a build's 1.2, and charging it a whole slot is the "+
+				"error this project pivoted away from", req.Slots)
+		}
+		if req.Slots <= 0 {
+			t.Errorf("a spawn asked for %v slots, which is not governance", req.Slots)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("the gate never contacted the daemon for a spawn")
 	}
 }
 

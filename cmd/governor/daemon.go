@@ -41,7 +41,7 @@ import (
 // at once (GOV-14 lands AIMD). Max-min fair share (section 6.1) is also still absent: the
 // wait queue below decides *order* and does not yet decide who may join it.
 
-// defaultBudget is how many concurrent agents the daemon allows until the control loop
+// defaultBudget is how many slots the daemon allows until the control loop
 // exists.
 //
 // This number is arbitrary and provisional. It is NOT a measured default and must not be
@@ -99,6 +99,12 @@ type request struct {
 	// Tool is the tool_name off the PreToolUse payload the gate matched (GOV-30). Recorded,
 	// never acted on: nothing in the daemon's decisions may depend on it.
 	Tool string `json:"tool"`
+	// Kind, Class and Slots are what the gate decided this acquire is worth (GOV-15). An
+	// older gate sends none of them, and the zero values are read as a whole-slot agent
+	// lease — the safe direction, since it over-counts rather than under-counts.
+	Kind  string  `json:"kind"`
+	Class string  `json:"class"`
+	Slots float64 `json:"slots"`
 
 	// confirm / release
 	Lease        string `json:"lease"`
@@ -142,11 +148,16 @@ type grantReply struct {
 // refuseReply answers a refused acquire. It carries what the deny reason in GOV-08 will
 // need to name a cause rather than just a number.
 type refuseReply struct {
-	V       int             `json:"v"`
-	OK      bool            `json:"ok"`
-	Reason  string          `json:"reason"`
-	Budget  int             `json:"budget"`
-	InUse   int             `json:"in_use"`
+	V      int    `json:"v"`
+	OK     bool   `json:"ok"`
+	Reason string `json:"reason"`
+	Budget int    `json:"budget"`
+	InUse  int    `json:"in_use"`
+	// Slots is how much of the budget is held, which since GOV-15 is NOT the same number as
+	// InUse: a subagent weighs about 0.08 slots and a Heavy build 3.75, so a count of leases
+	// and a quantity of budget are different things and only one of them belongs beside
+	// Budget. Additive, so an older statusline simply renders the count as it always did.
+	Slots   float64         `json:"slots"`
 	CPU     *float64        `json:"cpu"`
 	Thermal signals.Thermal `json:"thermal"`
 	Source  string          `json:"source"`
@@ -205,10 +216,14 @@ type ackReply struct {
 // the machine fail open the moment the daemon restarted — trading a display defect for an
 // ungoverned machine, which is the wrong way round.
 type statusReply struct {
-	V       int `json:"v"`
-	Budget  int `json:"budget"`
-	InUse   int `json:"in_use"`
-	Waiting int `json:"waiting"`
+	V      int `json:"v"`
+	Budget int `json:"budget"`
+	InUse  int `json:"in_use"`
+	// Slots is how much of the budget those leases weigh. See refuseReply.Slots: since
+	// GOV-15 a count of leases and a quantity of budget are different numbers, and only this
+	// one is comparable with Budget.
+	Slots   float64 `json:"slots"`
+	Waiting int     `json:"waiting"`
 	// CPU is the 5 s EWMA of host utilisation in [0,1] (design.md section 5.1), or null when
 	// nothing has sampled yet. It is the smoothed figure rather than the instantaneous one
 	// because a raw read swings hard enough to make anything reading it oscillate — the
@@ -377,6 +392,13 @@ type daemon struct {
 	machineSeen []signals.LiveSession
 	machineErr  error
 	machineHook time.Time
+
+	// loop is the AIMD controller (design.md section 5.2). It is stepped only by sample(),
+	// and its budget is read through LocalSource.Live, so nothing else touches it.
+	//
+	// Nil until a sampler is wired: a daemon that cannot read the host must not be inventing
+	// a moving budget from nothing, and LocalSource falls back to its fixed N.
+	loop *budget.Controller
 
 	// sampler reads this host's load. It is nil unless something wired one in, and a nil
 	// sampler means the daemon reports every signal as null rather than as zero.
@@ -697,6 +719,26 @@ func (d *daemon) observeThisMachine() {
 	d.liveSessions = func() ([]signals.LiveSession, error) { return signals.LiveSessions("") }
 	d.hooksInstalledAt = gateHooksInstalledAt
 	d.sampler = signals.NewSamplerEvery(treeInterval)
+
+	// The loop is wired here and nowhere else, beside the sampler that feeds it. A daemon
+	// built by a test has neither, and so keeps the fixed budget it was constructed with —
+	// which is what lets a lease test assert against a number it chose.
+	d.loop = &budget.Controller{}
+	d.sources = []budget.Source{budget.LocalSource{
+		Live:  d.liveBudget,
+		InUse: d.table.InUse,
+	}}
+}
+
+// liveBudget is the controller's current answer, read under the daemon's signals lock
+// because the loop is stepped from the sampling goroutine and read from every acquire.
+func (d *daemon) liveBudget() int {
+	d.signalsMu.Lock()
+	defer d.signalsMu.Unlock()
+	if d.loop == nil {
+		return budget.Floor
+	}
+	return d.loop.Budget()
 }
 
 // serve accepts connections until ctx is cancelled, reaping leases on a ticker throughout.
@@ -761,13 +803,16 @@ const (
 	treeInterval   = 5 * time.Second
 )
 
-// sample reads the host until ctx is cancelled, and does nothing else with what it reads.
+// sample reads the host until ctx is cancelled and steps the control loop with what it reads.
 //
-// Nothing acts on these numbers. That is GOV-12's first trap and it is load-bearing: the
-// budget is a fixed semaphore for as long as the dogfooding week is measuring it, and a
-// sampler that quietly fed the allocator would change the artefact under observation. This
-// goroutine writes to d.latest and d.cpuAvg and touches nothing else — no lease, no source,
-// no budget. GOV-14 is where that changes, and GOV-14 is blocked until the week closes.
+// GOV-12 deliberately made this goroutine inert — it wrote d.latest and d.cpuAvg and touched
+// no lease, no source and no budget — because the dogfooding week was measuring a fixed
+// semaphore and a sampler that quietly fed the allocator would have changed the artefact
+// under observation. That week is closed and GOV-15 connects the two: the budget is now an
+// OUTPUT of this loop (design.md section 5.2).
+//
+// It remains the ONLY writer of the controller. Nothing on the request path steps it, so an
+// acquire cannot move the budget it is being judged against.
 func (d *daemon) sample(ctx context.Context) {
 	if d.sampler == nil {
 		return
@@ -788,6 +833,10 @@ func (d *daemon) sample(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-t.C:
+			// Read demand BEFORE the signals lock, not inside it: the wait queue has a lock
+			// of its own and every acquire holds it, so nesting the two would put the
+			// sampling goroutine in a lock order no other path uses.
+			demand := d.waits.len() > 0
 			s, err := d.sampler.Sample(ctx)
 			if err != nil {
 				// A failed reading is not a reason to stop sampling, and not a reason to
@@ -802,6 +851,18 @@ func (d *daemon) sample(ctx context.Context) {
 				d.cpuAvg = signals.NewEWMA(signals.DefaultCPUWindow)
 			}
 			d.cpuAvg.Update(s.CPU, time.Now())
+			if avg, ok := d.cpuAvg.Value(); ok && d.loop != nil {
+				// The ceiling comes from the machine on every tick rather than once at
+				// start-up, because CPUCapacity is the cgroup quota where there is one and a
+				// quota can be changed under a running daemon.
+				d.loop.Max = budget.MaxSlots(s.CPUCapacity)
+				d.loop.Step(budget.Reading{
+					CPU:           avg,
+					RunQueue:      s.RunQueue,
+					ThermalSevere: s.Thermal.Severe(),
+					DemandWaiting: demand,
+				})
+			}
 			d.signalsMu.Unlock()
 		}
 	}
@@ -914,6 +975,8 @@ func (d *daemon) dispatch(req request) any {
 		return d.confirm(req)
 	case "release":
 		return d.release(req)
+	case "finish":
+		return d.finish(req)
 	case "session":
 		return d.session(req)
 	case "status":
@@ -931,6 +994,24 @@ type parkedAcquire struct {
 	wait    time.Duration
 	resolve func() any
 	cancel  func()
+}
+
+// leaseRequestFor turns a wire acquire into what the lease table needs.
+//
+// It is where an older gate is normalised: one that sends no kind and no slots asks, in
+// effect, for a whole-slot agent lease, which is exactly what every gate before GOV-15 was
+// asking for. Reading the absence as "build, weight 0" would be the unsafe direction — it
+// would admit an unbounded number of builds during an upgrade.
+func leaseRequestFor(req request) lease.Request {
+	r := lease.Request{Session: req.Session, Depth: req.Depth, Weight: req.Slots}
+	if req.Kind == "build" {
+		r.Kind = lease.Build
+		// Only a build is keyed by tool_use_id. An agent lease carries one too on the wire,
+		// but its release comes from SubagentStop with no tool_use_id at all, so indexing it
+		// here would build an index nothing can ever look up.
+		r.ToolUseID = req.ToolUseID
+	}
+	return r
 }
 
 // acquire takes a tentative lease if the budget has room, and decides what to do when it
@@ -951,12 +1032,12 @@ func (d *daemon) acquire(req request) any {
 		d.event("deny session=%s reason=depth", req.Session)
 		return refuseReply{
 			V: d.speaks, Reason: "depth",
-			Budget: limit, InUse: d.table.InUse(), Source: src,
+			Budget: limit, InUse: d.table.InUse(), Slots: d.table.Slots(), Source: src,
 			CPU: nil, Thermal: d.thermal(),
 		}
 	}
 
-	if l, ok := d.table.Acquire(req.Session, req.Depth, limit); ok {
+	if l, ok := d.table.Acquire(leaseRequestFor(req), limit); ok {
 		return d.granted(l, limit, src)
 	}
 
@@ -972,10 +1053,10 @@ func (d *daemon) acquire(req request) any {
 		return d.refuseForCapacity(req.Session, limit, src)
 	}
 
-	d.event("park session=%s in_use=%d/%d wait=%v", req.Session, d.table.InUse(), limit, wait)
+	d.event("park session=%s slots=%.2f/%d wait=%v", req.Session, d.table.Slots(), limit, wait)
 	parked := time.Now()
 
-	w := &waiter{session: req.Session, depth: req.Depth, granted: make(chan lease.Lease, 1)}
+	w := &waiter{session: req.Session, depth: req.Depth, req: leaseRequestFor(req), granted: make(chan lease.Lease, 1)}
 	d.waits.enqueue(w)
 	// A slot may have freed between the failed Acquire above and the enqueue. Pumping here
 	// closes that window without anything having to poll for it.
@@ -1051,14 +1132,14 @@ func (d *daemon) granted(l lease.Lease, limit int, src string) grantReply {
 func (d *daemon) refuseForCapacity(session string, limit int, src string) refuseReply {
 	r := refuseReply{
 		V: d.speaks, Reason: "capacity",
-		Budget: limit, InUse: d.table.InUse(), Source: src,
+		Budget: limit, InUse: d.table.InUse(), Slots: d.table.Slots(), Source: src,
 		CPU: nil, Thermal: d.thermal(),
 		Denials: d.denials.record(session),
 	}
 	// Logged here rather than at each call site so that a refusal added later cannot be one
 	// the log does not know about. This is the event that costs the model something, and it
 	// is the one a week of dogfooding is read for.
-	d.event("deny session=%s reason=capacity in_use=%d/%d denials=%d", session, r.InUse, r.Budget, r.Denials)
+	d.event("deny session=%s reason=capacity slots=%.2f/%d denials=%d", session, r.Slots, r.Budget, r.Denials)
 	return r
 }
 
@@ -1078,7 +1159,7 @@ func (d *daemon) pump() {
 	for len(d.waits.q) > 0 {
 		w := d.waits.q[0]
 		limit, _ := budget.Min(context.Background(), d.sources)
-		l, ok := d.table.Acquire(w.session, w.depth, limit)
+		l, ok := d.table.Acquire(w.req, limit)
 		if !ok {
 			return
 		}
@@ -1111,6 +1192,28 @@ func (d *daemon) release(req request) any {
 	ok := d.table.Release(req.Session, req.AgentID)
 	if ok {
 		// The slot that just came free belongs to whoever has waited longest for it.
+		d.pump()
+	}
+	r := ackReply{V: d.speaks, OK: ok, InUse: d.table.InUse()}
+	if !ok {
+		r.Reason = "no_lease"
+	}
+	return r
+}
+
+// finish returns a Build lease at PostToolUse (GOV-15, hook-surface.md section 19).
+//
+// It is a separate operation from release rather than a flag on it, because the two key off
+// different things and neither key exists on the other's event: release takes an agent_id
+// from SubagentStop, and this takes the tool_use_id that PreToolUse and PostToolUse share.
+//
+// "Held nothing" is the ordinary answer, not a failure, and for a reason peculiar to this
+// path. The gate leases only build-shaped commands, so every `cat` and `git status` in every
+// session reaches this hook with no lease to return. It must be as quiet about that as
+// release is about a repeated SubagentStop.
+func (d *daemon) finish(req request) any {
+	ok := d.table.ReleaseBuild(req.Session, req.ToolUseID)
+	if ok {
 		d.pump()
 	}
 	r := ackReply{V: d.speaks, OK: ok, InUse: d.table.InUse()}
@@ -1216,7 +1319,7 @@ func (d *daemon) status() statusReply {
 		hooks = hookAt.UTC().Format(time.RFC3339)
 	}
 	out := statusReply{
-		V: d.speaks, Budget: limit, InUse: snap.InUse,
+		V: d.speaks, Budget: limit, InUse: snap.InUse, Slots: snap.Slots,
 		// Parked acquires, from the FIFO of design.md section 6.2.
 		Waiting:           d.waits.len(),
 		BinaryVersion:     binaryVersion,

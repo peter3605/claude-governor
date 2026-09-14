@@ -68,15 +68,22 @@ func newWorld(t *testing.T) *world {
 // hookSpec is one hook registration to stage.
 type hookSpec struct{ event, matcher, args string }
 
-// goodHooks are the five registrations of design.md section 4.1, correctly wired.
+// goodHooks are the six registrations of design.md section 4.1, correctly wired.
+//
+// It is built FROM wantedHooks rather than written out, for the reason pluginHooks is: a
+// fixture carrying its own private copy of the right answer is a fixture that keeps passing
+// after the right answer changes. GOV-15 added a sixth hook and this list did not notice,
+// which is how that was discovered.
 func goodHooks() []hookSpec {
-	return []hookSpec{
-		{event: "PreToolUse", matcher: "Agent|Task|SendMessage", args: "gate"},
-		{event: "SubagentStart", args: "confirm"},
-		{event: "SubagentStop", args: "release"},
-		{event: "SessionStart", args: "session start"},
-		{event: "SessionEnd", args: "session end"},
+	var out []hookSpec
+	for _, w := range wantedHooks {
+		out = append(out, hookSpec{
+			event:   w.event,
+			matcher: strings.Join(w.covers, "|"),
+			args:    w.args,
+		})
 	}
+	return out
 }
 
 // writeHooks stages hook registrations into path, as either a settings.json or a plugin
@@ -395,13 +402,15 @@ func TestDoctorCatchesAMatcherThatDoesNotCoverTheRealToolNames(t *testing.T) {
 		state   string
 		says    []string
 	}{
-		{name: "the wiring from section 4.1", matcher: "Agent|Task|SendMessage", state: "ok"},
+		{name: "the wiring from section 4.1", matcher: "Agent|Task|SendMessage|Bash", state: "ok"},
+		{name: "the wiring before Bash was gated", matcher: "Agent|Task|SendMessage", state: "FAIL",
+			says: []string{"Bash"}},
 		{name: "a superset still matches", matcher: ".*", state: "ok"},
 		{name: "Task alone, which fires only by luck", matcher: "Task", state: "FAIL",
 			says: []string{"Agent", "SendMessage"}},
 		{name: "the old wiring, before SendMessage", matcher: "Agent|Task", state: "FAIL",
 			says: []string{"SendMessage"}},
-		{name: "a tool that does not spawn", matcher: "Bash", state: "FAIL",
+		{name: "Bash alone, which governs no spawn", matcher: "Bash", state: "FAIL",
 			says: []string{"Agent", "Task", "SendMessage"}},
 		{name: "no matcher at all", matcher: "", state: "FAIL",
 			says: []string{"every tool call"}},
@@ -423,7 +432,7 @@ func TestDoctorCatchesAMatcherThatDoesNotCoverTheRealToolNames(t *testing.T) {
 					t.Errorf("matcher finding %q does not name %q\n%s", got.detail, s, out)
 				}
 			}
-			if tc.state == "FAIL" && !strings.Contains(got.fix, strings.Join(spawnToolNames, "|")) {
+			if tc.state == "FAIL" && !strings.Contains(got.fix, strings.Join(gatedToolNames, "|")) {
 				t.Errorf("the fix does not name the matcher to set: %q", got.fix)
 			}
 		})
@@ -453,16 +462,19 @@ func TestEverySpawnToolNameIsCoveredByTheShippedMatcher(t *testing.T) {
 
 func TestDoctorNamesTheHooksThatAreNotRegistered(t *testing.T) {
 	w := newWorld(t)
-	w.writeHooks(w.settings, selfBinary(t), goodHooks()[:3])
+	// Everything but the last two, whatever those happen to be, so this keeps naming a real
+	// registered hook as the negative control after the list grows again.
+	staged := goodHooks()[:len(wantedHooks)-2]
+	w.writeHooks(w.settings, selfBinary(t), staged)
 
 	_, found, out := doctor(t)
 	got := want(t, found, "hooks", "FAIL", out)
-	for _, missing := range []string{"SessionStart", "SessionEnd"} {
-		if !strings.Contains(got.detail, missing) {
-			t.Errorf("the finding does not name the missing %s hook: %q", missing, got.detail)
+	for _, missing := range wantedHooks[len(wantedHooks)-2:] {
+		if !strings.Contains(got.detail, missing.event) {
+			t.Errorf("the finding does not name the missing %s hook: %q", missing.event, got.detail)
 		}
 	}
-	if strings.Contains(got.detail, "SubagentStop") {
+	if registered := staged[len(staged)-1].event; strings.Contains(got.detail, registered) {
 		t.Errorf("the finding names a hook that IS registered: %q", got.detail)
 	}
 }
@@ -476,7 +488,11 @@ func TestDoctorNamesTheHooksThatAreNotRegistered(t *testing.T) {
 func TestDoctorNamesAHookWiredToTheWrongSubcommand(t *testing.T) {
 	w := newWorld(t)
 	specs := goodHooks()
-	specs[1].args = "release" // SubagentStart running the SubagentStop command
+	for i := range specs {
+		if specs[i].event == "SubagentStart" {
+			specs[i].args = "release" // SubagentStart running the SubagentStop command
+		}
+	}
 	w.writeHooks(w.settings, selfBinary(t), specs)
 
 	_, found, out := doctor(t)
@@ -537,7 +553,7 @@ func TestDoctorIgnoresThePhase0TraceHooks(t *testing.T) {
 
 	_, found, out := doctor(t)
 	got := want(t, found, "hooks", "FAIL", out)
-	if !strings.Contains(got.detail, "5 of 5 not registered") {
+	if !strings.Contains(got.detail, fmt.Sprintf("%d of %d not registered", len(wantedHooks), len(wantedHooks))) {
 		t.Errorf("trace hooks were counted as governor hooks: %q\n%s", got.detail, out)
 	}
 	if strings.Contains(got.detail, "instead of") {

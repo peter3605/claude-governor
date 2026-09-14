@@ -41,7 +41,7 @@ func (liveLiveness) Alive(Lease) bool { return true }
 func TestLifecycleTentativeConfirmedReleased(t *testing.T) {
 	tbl := NewTable(Options{})
 
-	l, ok := tbl.Acquire("s1", 0, 4)
+	l, ok := tbl.Acquire(Request{Session: "s1", Depth: 0}, 4)
 	if !ok {
 		t.Fatal("acquire refused with an empty table")
 	}
@@ -76,11 +76,11 @@ func TestLifecycleTentativeConfirmedReleased(t *testing.T) {
 func TestAcquireStopsAtTheLimit(t *testing.T) {
 	tbl := NewTable(Options{})
 	for i := range 3 {
-		if _, ok := tbl.Acquire("s1", 0, 3); !ok {
+		if _, ok := tbl.Acquire(Request{Session: "s1", Depth: 0}, 3); !ok {
 			t.Fatalf("acquire %d of 3 refused", i+1)
 		}
 	}
-	if _, ok := tbl.Acquire("s1", 0, 3); ok {
+	if _, ok := tbl.Acquire(Request{Session: "s1", Depth: 0}, 3); ok {
 		t.Fatal("acquire granted a fourth lease against a budget of 3")
 	}
 	if tbl.InUse() != 3 {
@@ -93,8 +93,8 @@ func TestAcquireStopsAtTheLimit(t *testing.T) {
 // silently bind some other pending spawn's lease to this agent.
 func TestConfirmIsIdempotentPerAgent(t *testing.T) {
 	tbl := NewTable(Options{})
-	a, _ := tbl.Acquire("s1", 0, 4)
-	b, _ := tbl.Acquire("s1", 0, 4)
+	a, _ := tbl.Acquire(Request{Session: "s1", Depth: 0}, 4)
+	b, _ := tbl.Acquire(Request{Session: "s1", Depth: 0}, 4)
 
 	first, ok := tbl.Confirm("s1", "", "ag_1", 1, time.Time{})
 	if !ok || first.ID != a.ID {
@@ -136,9 +136,9 @@ func TestConfirmWithNoPendingLeaseIsDroppedQuietly(t *testing.T) {
 // not borrow from each other.
 func TestConfirmIsPerSessionFIFO(t *testing.T) {
 	tbl := NewTable(Options{})
-	a1, _ := tbl.Acquire("s1", 0, 8)
-	b1, _ := tbl.Acquire("s2", 0, 8)
-	a2, _ := tbl.Acquire("s1", 0, 8)
+	a1, _ := tbl.Acquire(Request{Session: "s1", Depth: 0}, 8)
+	b1, _ := tbl.Acquire(Request{Session: "s2", Depth: 0}, 8)
+	a2, _ := tbl.Acquire(Request{Session: "s1", Depth: 0}, 8)
 
 	got, _ := tbl.Confirm("s1", "", "ag_a", 1, time.Time{})
 	if got.ID != a1.ID {
@@ -157,7 +157,7 @@ func TestConfirmIsPerSessionFIFO(t *testing.T) {
 // SubagentStop fires more than once for the same agent.
 func TestReleaseToleratesRepeats(t *testing.T) {
 	tbl := NewTable(Options{})
-	l, _ := tbl.Acquire("s1", 0, 4)
+	l, _ := tbl.Acquire(Request{Session: "s1", Depth: 0}, 4)
 	tbl.Confirm("s1", l.ID, "ag_1", 1, time.Time{})
 
 	if !tbl.Release("s1", "ag_1") {
@@ -176,7 +176,7 @@ func TestReleaseToleratesRepeats(t *testing.T) {
 // lease that no later release could ever reach.
 func TestReleaseFromTheWrongSessionChangesNothing(t *testing.T) {
 	tbl := NewTable(Options{})
-	l, _ := tbl.Acquire("s1", 0, 4)
+	l, _ := tbl.Acquire(Request{Session: "s1", Depth: 0}, 4)
 	tbl.Confirm("s1", l.ID, "ag_1", 1, time.Time{})
 
 	if tbl.Release("s2", "ag_1") {
@@ -200,7 +200,7 @@ func TestReleaseFromTheWrongSessionChangesNothing(t *testing.T) {
 func TestConfirmWithNoAgentIDStillHoldsItsSlot(t *testing.T) {
 	c := newClock()
 	tbl := NewTable(Options{ConfirmedTTL: time.Minute, Now: c.now})
-	l, _ := tbl.Acquire("s1", 0, 4)
+	l, _ := tbl.Acquire(Request{Session: "s1", Depth: 0}, 4)
 
 	got, ok := tbl.Confirm("s1", l.ID, "", 1, time.Time{})
 	if !ok {
@@ -221,9 +221,9 @@ func TestConfirmWithNoAgentIDStillHoldsItsSlot(t *testing.T) {
 func TestReleaseSessionDropsEverythingItHeld(t *testing.T) {
 	tbl := NewTable(Options{})
 	tbl.StartSession(Session{ID: "s1", PID: 10})
-	a, _ := tbl.Acquire("s1", 0, 8)
-	tbl.Acquire("s1", 0, 8)
-	tbl.Acquire("s2", 0, 8)
+	a, _ := tbl.Acquire(Request{Session: "s1", Depth: 0}, 8)
+	tbl.Acquire(Request{Session: "s1", Depth: 0}, 8)
+	tbl.Acquire(Request{Session: "s2", Depth: 0}, 8)
 	tbl.Confirm("s1", a.ID, "ag_1", 1, time.Time{})
 
 	if n := tbl.ReleaseSession("s1"); n != 2 {
@@ -244,7 +244,7 @@ func TestReaperCollectsExpiredTentativeLeases(t *testing.T) {
 	c := newClock()
 	tbl := NewTable(Options{TentativeTTL: 30 * time.Second, Now: c.now})
 
-	tbl.Acquire("s1", 0, 4)
+	tbl.Acquire(Request{Session: "s1", Depth: 0}, 4)
 	c.advance(29 * time.Second)
 	if n := tbl.Reap(); n != 0 {
 		t.Fatalf("reaped %d leases inside the TTL, want 0", n)
@@ -267,7 +267,7 @@ func TestReaperCollectsConfirmedLeasesWhoseOwnerIsGone(t *testing.T) {
 	c := newClock()
 	tbl := NewTable(Options{Now: c.now, Liveness: deadLiveness{}})
 
-	l, _ := tbl.Acquire("s1", 0, 4)
+	l, _ := tbl.Acquire(Request{Session: "s1", Depth: 0}, 4)
 	tbl.Confirm("s1", l.ID, "ag_1", 4242, c.now())
 
 	if n := tbl.Reap(); n != 1 {
@@ -284,7 +284,7 @@ func TestReaperSparesConfirmedLeasesWhoseOwnerIsAlive(t *testing.T) {
 	c := newClock()
 	tbl := NewTable(Options{ConfirmedTTL: time.Hour, Now: c.now, Liveness: liveLiveness{}})
 
-	l, _ := tbl.Acquire("s1", 0, 4)
+	l, _ := tbl.Acquire(Request{Session: "s1", Depth: 0}, 4)
 	tbl.Confirm("s1", l.ID, "ag_1", 4242, c.now())
 
 	c.advance(59 * time.Minute)
@@ -305,14 +305,14 @@ func TestReapedTentativeSlotBecomesAvailableAgain(t *testing.T) {
 	tbl := NewTable(Options{TentativeTTL: 30 * time.Second, Now: c.now})
 
 	for range 2 {
-		tbl.Acquire("s1", 0, 2)
+		tbl.Acquire(Request{Session: "s1", Depth: 0}, 2)
 	}
-	if _, ok := tbl.Acquire("s1", 0, 2); ok {
+	if _, ok := tbl.Acquire(Request{Session: "s1", Depth: 0}, 2); ok {
 		t.Fatal("acquire exceeded the budget")
 	}
 	c.advance(31 * time.Second)
 	tbl.Reap()
-	if _, ok := tbl.Acquire("s1", 0, 2); !ok {
+	if _, ok := tbl.Acquire(Request{Session: "s1", Depth: 0}, 2); !ok {
 		t.Fatal("the slot an abandoned spawn held was never returned")
 	}
 }
@@ -322,9 +322,9 @@ func TestSnapshotCountsAgreeWithTheirTotal(t *testing.T) {
 	tbl.StartSession(Session{ID: "s1", PID: 10})
 	tbl.StartSession(Session{ID: "s2", PID: 20, Weight: 3})
 
-	a, _ := tbl.Acquire("s1", 0, 8)
-	tbl.Acquire("s1", 0, 8)
-	tbl.Acquire("s2", 0, 8)
+	a, _ := tbl.Acquire(Request{Session: "s1", Depth: 0}, 8)
+	tbl.Acquire(Request{Session: "s1", Depth: 0}, 8)
+	tbl.Acquire(Request{Session: "s2", Depth: 0}, 8)
 	tbl.Confirm("s1", a.ID, "ag_1", 1, time.Time{})
 
 	s := tbl.Snapshot()
@@ -388,7 +388,7 @@ func TestLeaseCountNeverExceedsBudgetUnderConcurrency(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			session := fmt.Sprintf("s%d", i%4)
-			l, ok := tbl.Acquire(session, 0, limit)
+			l, ok := tbl.Acquire(Request{Session: session, Depth: 0}, limit)
 			if !ok {
 				return
 			}

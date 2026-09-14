@@ -32,6 +32,27 @@ func preToolUsePayload(session, toolUseID string) string {
 		`"tool_use_id":%q}`, session, toolUseID)
 }
 
+// preToolUseBashPayload is the PreToolUse payload for a Bash call, from docs/hook-surface.md
+// sections 1 and 19.
+//
+// `go build ./...` is the command the capacity tests use, and the choice is arithmetic rather
+// than aesthetic: internal/classify rates it Medium, and one slot IS one Medium build
+// (internal/budget.SlotCores), so it weighs exactly 1.0. A test that wants "three things fill
+// a budget of three" needs a shape whose weight is exactly one, and this is it.
+func preToolUseBashPayload(session, toolUseID, cmd string) string {
+	return fmt.Sprintf(`{"session_id":%q,"hook_event_name":"PreToolUse","tool_name":"Bash",`+
+		`"tool_input":{"command":%q},"tool_use_id":%q}`, session, cmd, toolUseID)
+}
+
+// postToolUsePayload is the PostToolUse payload that returns a build lease
+// (docs/hook-surface.md section 19). A completion carries no backgroundTaskId; that is the
+// whole discriminator.
+func postToolUsePayload(session, toolUseID string) string {
+	return fmt.Sprintf(`{"session_id":%q,"hook_event_name":"PostToolUse","tool_name":"Bash",`+
+		`"tool_use_id":%q,"tool_response":{"stdout":"","stderr":"","interrupted":false}}`,
+		session, toolUseID)
+}
+
 // subagentStartPayload is from docs/hook-surface.md section 3. Note what it does NOT carry:
 // no tool_use_id, which is why correlation is per-session FIFO rather than by ID.
 func subagentStartPayload(session, agentID string) string {
@@ -63,6 +84,14 @@ func runHookCmd(t *testing.T, endpoint, payload string, build builder) string {
 	return stderr.String()
 }
 
+// askGateBuild runs the gate for one build-shaped Bash call and reports whether it was
+// allowed. It is askGate for the other gated tool; see preToolUseBashPayload for why the
+// capacity tests are denominated in builds rather than in spawns.
+func askGateBuild(t *testing.T, endpoint, session, toolUseID string) bool {
+	t.Helper()
+	return askGateWith(t, endpoint, preToolUseBashPayload(session, toolUseID, "go build ./..."))
+}
+
 // askGate runs the gate for one spawn and reports whether the spawn was allowed.
 //
 // Allowed means an empty stdout, which is what a grant is (design.md section 4.2). Refused
@@ -70,10 +99,16 @@ func runHookCmd(t *testing.T, endpoint, payload string, build builder) string {
 // on the grant path — fails here rather than being folded into a boolean.
 func askGate(t *testing.T, endpoint, session, toolUseID string) bool {
 	t.Helper()
+	return askGateWith(t, endpoint, preToolUsePayload(session, toolUseID))
+}
+
+// askGateWith is the body of askGate and askGateBuild, over an arbitrary payload.
+func askGateWith(t *testing.T, endpoint, payload string) bool {
+	t.Helper()
 	t.Setenv(transport.EndpointEnv, endpoint)
 
 	var stdout, stderr bytes.Buffer
-	code := gate(strings.NewReader(preToolUsePayload(session, toolUseID)),
+	code := gate(strings.NewReader(payload),
 		&stdout, &stderr, transport.Dial{}, gateBudget, protocolVersion)
 	if code != 0 {
 		t.Fatalf("gate exit code = %d, want 0 (stderr: %s)", code, stderr.String())
@@ -92,47 +127,99 @@ func askGate(t *testing.T, endpoint, session, toolUseID string) bool {
 	return false
 }
 
-// TestTheNPlusFirstSpawnIsRefused is this story's headline acceptance criterion.
-func TestTheNPlusFirstSpawnIsRefused(t *testing.T) {
+// TestTheNPlusFirstBuildIsRefused is GOV-07's headline acceptance criterion, re-denominated
+// by GOV-15 in the unit the budget is actually kept in.
+//
+// It used to count SPAWNS, and that is the one thing about it that had to change. A slot is
+// one Medium build, so three `go build`s fill a budget of three exactly as three spawns used
+// to — but three SPAWNS now weigh 0.25 slots between them, because Phase 0 measured a
+// subagent's marginal cost at +0.098 cores against a build's 1.2, and a budget that refused
+// the fourth agent would be making precisely the mistake this project pivoted away from.
+// What is asserted is unchanged: the budget refuses, and a refusal consumes nothing.
+func TestTheNPlusFirstBuildIsRefused(t *testing.T) {
 	// GOV-08 made the refusal arrive after a wait rather than immediately, so this sits
-	// through gateWaitMax unless it is shrunk. The wait itself is what wait_test.go is for;
-	// what this test asserts is unchanged — the N+1th spawn does not get a slot.
+	// through gateWaitMax unless it is shrunk. The wait itself is what wait_test.go is for.
 	shortWait(t, 200*time.Millisecond)
 
 	const budget = 3
 	endpoint, d := startTestDaemon(t, budget)
 
 	for i := 0; i < budget; i++ {
-		if !askGate(t, endpoint, "s1", fmt.Sprintf("toolu_%02d", i)) {
-			t.Fatalf("spawn %d of %d was refused; the first %d must proceed", i+1, budget, budget)
+		if !askGateBuild(t, endpoint, "s1", fmt.Sprintf("toolu_%02d", i)) {
+			t.Fatalf("build %d of %d was refused; the first %d must proceed", i+1, budget, budget)
 		}
 	}
-	if askGate(t, endpoint, "s1", "toolu_overflow") {
-		t.Fatal("the N+1th spawn was allowed; it must be refused")
+	if askGateBuild(t, endpoint, "s1", "toolu_overflow") {
+		t.Fatal("the N+1th build was allowed; it must be refused")
 	}
 	if got := d.table.InUse(); got != budget {
-		t.Errorf("in use = %d, want %d: a refused spawn must not consume a slot", got, budget)
+		t.Errorf("in use = %d, want %d: a refused build must not consume a slot", got, budget)
 	}
 }
 
-// A refusal must not be sticky. Once a lease comes back the next spawn proceeds — without
+// TestAgentsAreWeighedNotCounted is the other half of the same decision, and it is here so
+// that the change above cannot be mistaken for a regression.
+//
+// A budget of three slots is 3.6 cores of expected peak. At +0.098 cores an agent weighs
+// about 0.08 slots, so a dozen of them fit inside one build's room and the fourth spawn —
+// which the old fixed budget of four refused — now proceeds. That is the pivot working, not
+// the governor failing: a fixed agent budget capped the quantity that never spikes.
+func TestAgentsAreWeighedNotCounted(t *testing.T) {
+	shortWait(t, 200*time.Millisecond)
+	endpoint, d := startTestDaemon(t, 3)
+
+	for i := 0; i < 12; i++ {
+		if !askGate(t, endpoint, "s1", fmt.Sprintf("toolu_%02d", i)) {
+			t.Fatalf("spawn %d was refused against a budget of 3 slots; twelve agents weigh "+
+				"about one build and must fit", i+1)
+		}
+	}
+	if got := d.table.Slots(); got > 3 {
+		t.Errorf("twelve agents hold %.2f slots, which is over the budget of 3", got)
+	}
+	if got := d.table.InUse(); got != 12 {
+		t.Errorf("in use = %d, want 12 leases held", got)
+	}
+}
+
+// A refusal must not be sticky. Once a lease comes back the next build proceeds — without
 // this the first burst of the session would permanently poison the budget.
-func TestASpawnProceedsOnceASlotIsReturned(t *testing.T) {
+func TestABuildProceedsOnceASlotIsReturned(t *testing.T) {
 	shortWait(t, 200*time.Millisecond)
 	endpoint, _ := startTestDaemon(t, 1)
+
+	if !askGateBuild(t, endpoint, "s1", "toolu_01") {
+		t.Fatal("the first build was refused")
+	}
+	if askGateBuild(t, endpoint, "s1", "toolu_02") {
+		t.Fatal("a second build was allowed against a budget of 1")
+	}
+
+	runHookCmd(t, endpoint, postToolUsePayload("s1", "toolu_01"), buildFinish)
+
+	if !askGateBuild(t, endpoint, "s1", "toolu_03") {
+		t.Fatal("the build after a PostToolUse was refused; the slot was not returned")
+	}
+}
+
+// A spawn's slot still comes back at SubagentStop, which is a different key on a different
+// event from the build path above and has to keep working.
+func TestASpawnProceedsOnceASlotIsReturned(t *testing.T) {
+	shortWait(t, 200*time.Millisecond)
+	endpoint, d := startTestDaemon(t, 1)
 
 	if !askGate(t, endpoint, "s1", "toolu_01") {
 		t.Fatal("the first spawn was refused")
 	}
 	runHookCmd(t, endpoint, subagentStartPayload("s1", "agent_a"), buildConfirm)
-	if askGate(t, endpoint, "s1", "toolu_02") {
-		t.Fatal("a second spawn was allowed against a budget of 1")
+	if got := d.table.InUse(); got != 1 {
+		t.Fatalf("in use = %d, want 1 after one confirmed spawn", got)
 	}
 
 	runHookCmd(t, endpoint, subagentStopPayload("s1", "agent_a"), buildRelease)
 
-	if !askGate(t, endpoint, "s1", "toolu_03") {
-		t.Fatal("the spawn after a release was refused; the slot was not returned")
+	if got := d.table.InUse(); got != 0 {
+		t.Errorf("in use = %d after SubagentStop, want 0: the slot was not returned", got)
 	}
 }
 
