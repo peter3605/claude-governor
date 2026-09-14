@@ -148,11 +148,16 @@ type grantReply struct {
 // refuseReply answers a refused acquire. It carries what the deny reason in GOV-08 will
 // need to name a cause rather than just a number.
 type refuseReply struct {
-	V       int             `json:"v"`
-	OK      bool            `json:"ok"`
-	Reason  string          `json:"reason"`
-	Budget  int             `json:"budget"`
-	InUse   int             `json:"in_use"`
+	V      int    `json:"v"`
+	OK     bool   `json:"ok"`
+	Reason string `json:"reason"`
+	Budget int    `json:"budget"`
+	InUse  int    `json:"in_use"`
+	// Slots is how much of the budget is held, which since GOV-15 is NOT the same number as
+	// InUse: a subagent weighs about 0.08 slots and a Heavy build 3.75, so a count of leases
+	// and a quantity of budget are different things and only one of them belongs beside
+	// Budget. Additive, so an older statusline simply renders the count as it always did.
+	Slots   float64         `json:"slots"`
 	CPU     *float64        `json:"cpu"`
 	Thermal signals.Thermal `json:"thermal"`
 	Source  string          `json:"source"`
@@ -211,10 +216,14 @@ type ackReply struct {
 // the machine fail open the moment the daemon restarted — trading a display defect for an
 // ungoverned machine, which is the wrong way round.
 type statusReply struct {
-	V       int `json:"v"`
-	Budget  int `json:"budget"`
-	InUse   int `json:"in_use"`
-	Waiting int `json:"waiting"`
+	V      int `json:"v"`
+	Budget int `json:"budget"`
+	InUse  int `json:"in_use"`
+	// Slots is how much of the budget those leases weigh. See refuseReply.Slots: since
+	// GOV-15 a count of leases and a quantity of budget are different numbers, and only this
+	// one is comparable with Budget.
+	Slots   float64 `json:"slots"`
+	Waiting int     `json:"waiting"`
 	// CPU is the 5 s EWMA of host utilisation in [0,1] (design.md section 5.1), or null when
 	// nothing has sampled yet. It is the smoothed figure rather than the instantaneous one
 	// because a raw read swings hard enough to make anything reading it oscillate — the
@@ -1023,7 +1032,7 @@ func (d *daemon) acquire(req request) any {
 		d.event("deny session=%s reason=depth", req.Session)
 		return refuseReply{
 			V: d.speaks, Reason: "depth",
-			Budget: limit, InUse: d.table.InUse(), Source: src,
+			Budget: limit, InUse: d.table.InUse(), Slots: d.table.Slots(), Source: src,
 			CPU: nil, Thermal: d.thermal(),
 		}
 	}
@@ -1044,7 +1053,7 @@ func (d *daemon) acquire(req request) any {
 		return d.refuseForCapacity(req.Session, limit, src)
 	}
 
-	d.event("park session=%s in_use=%d/%d wait=%v", req.Session, d.table.InUse(), limit, wait)
+	d.event("park session=%s slots=%.2f/%d wait=%v", req.Session, d.table.Slots(), limit, wait)
 	parked := time.Now()
 
 	w := &waiter{session: req.Session, depth: req.Depth, req: leaseRequestFor(req), granted: make(chan lease.Lease, 1)}
@@ -1123,14 +1132,14 @@ func (d *daemon) granted(l lease.Lease, limit int, src string) grantReply {
 func (d *daemon) refuseForCapacity(session string, limit int, src string) refuseReply {
 	r := refuseReply{
 		V: d.speaks, Reason: "capacity",
-		Budget: limit, InUse: d.table.InUse(), Source: src,
+		Budget: limit, InUse: d.table.InUse(), Slots: d.table.Slots(), Source: src,
 		CPU: nil, Thermal: d.thermal(),
 		Denials: d.denials.record(session),
 	}
 	// Logged here rather than at each call site so that a refusal added later cannot be one
 	// the log does not know about. This is the event that costs the model something, and it
 	// is the one a week of dogfooding is read for.
-	d.event("deny session=%s reason=capacity in_use=%d/%d denials=%d", session, r.InUse, r.Budget, r.Denials)
+	d.event("deny session=%s reason=capacity slots=%.2f/%d denials=%d", session, r.Slots, r.Budget, r.Denials)
 	return r
 }
 
@@ -1310,7 +1319,7 @@ func (d *daemon) status() statusReply {
 		hooks = hookAt.UTC().Format(time.RFC3339)
 	}
 	out := statusReply{
-		V: d.speaks, Budget: limit, InUse: snap.InUse,
+		V: d.speaks, Budget: limit, InUse: snap.InUse, Slots: snap.Slots,
 		// Parked acquires, from the FIFO of design.md section 6.2.
 		Waiting:           d.waits.len(),
 		BinaryVersion:     binaryVersion,

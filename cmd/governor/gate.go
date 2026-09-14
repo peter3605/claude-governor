@@ -146,6 +146,10 @@ type acquireResponse struct {
 	Reason string `json:"reason"`
 	Budget int    `json:"budget"`
 	InUse  int    `json:"in_use"`
+	// Slots is how much of the budget is held. It is what the refusal text names, because
+	// InUse counts leases and the budget counts slots, and four agents reading "4/6 slots"
+	// on a machine that is 5% full is a number that invites exactly the wrong response.
+	Slots float64 `json:"slots"`
 	// CPU is a pointer because the daemon has no sampler until GOV-12 and sends null
 	// rather than a fabricated 0.0, which would read as an idle machine. A deny must not
 	// claim a CPU figure it was not given.
@@ -560,7 +564,10 @@ func denyReason(resp acquireResponse, in intent) string {
 	}
 
 	var b strings.Builder
-	fmt.Fprintf(&b, "Machine at capacity (%d/%d build slots", resp.InUse, resp.Budget)
+	// formatSlots rather than %.1f so a machine holding four whole builds says "4/6" and not
+	// "4.0/6": the decimal is there to stop a machine holding only agents rounding to a
+	// reassuring zero, not to decorate the common case.
+	fmt.Fprintf(&b, "Machine at capacity (%s/%d build slots", formatSlots(resp.Slots), resp.Budget)
 	if resp.CPU != nil {
 		fmt.Fprintf(&b, ", CPU %.0f%%", *resp.CPU*100)
 	}

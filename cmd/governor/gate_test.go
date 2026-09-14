@@ -460,7 +460,7 @@ func TestGateIsSilentOnAGrant(t *testing.T) {
 // It goes through runGateDeny rather than runGateFor because the two assert opposite things
 // about stdout, which is the entire difference GOV-07 introduced.
 func TestGateDeniesWhenTheDaemonRefuses(t *testing.T) {
-	reply := `{"v":1,"ok":false,"reason":"capacity","budget":6,"in_use":6,` +
+	reply := `{"v":1,"ok":false,"reason":"capacity","budget":6,"in_use":6,"slots":6,` +
 		`"cpu":0.94,"thermal":"fair","source":"local"}`
 	endpoint := listenerFunc(t, func(c net.Conn, _ []byte) { c.Write([]byte(reply + "\n")) })
 
@@ -489,7 +489,7 @@ func TestGateDeniesWhenTheDaemonRefuses(t *testing.T) {
 // — and a reason that says "CPU 0%" on a machine nobody has measured is a fabrication that
 // a person reading the refusal has no way to catch.
 func TestGateDenyClaimsOnlyWhatTheDaemonSent(t *testing.T) {
-	reply := `{"v":1,"ok":false,"reason":"capacity","budget":4,"in_use":4,` +
+	reply := `{"v":1,"ok":false,"reason":"capacity","budget":4,"in_use":4,"slots":4,` +
 		`"cpu":null,"thermal":"unknown","source":"local"}`
 	endpoint := listenerFunc(t, func(c net.Conn, _ []byte) { c.Write([]byte(reply + "\n")) })
 

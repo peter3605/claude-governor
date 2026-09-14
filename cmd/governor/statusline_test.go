@@ -133,7 +133,7 @@ func f64(v float64) *float64 { return &v }
 func TestStatuslineShape(t *testing.T) {
 	isolateState(t)
 	endpoint, _, _ := statusDaemon(t, statusReply{
-		V: protocolVersion, Budget: 5, InUse: 3, CPU: f64(0.61), Thermal: "nominal",
+		V: protocolVersion, Budget: 5, InUse: 3, Slots: 3, CPU: f64(0.61), Thermal: "nominal",
 	})
 
 	got := runStatuslineFor(t, endpoint, sampleStatusLinePayload, 0)
@@ -155,38 +155,38 @@ func TestStatuslineRendersWhatTheDaemonSent(t *testing.T) {
 			// The shipped state until GOV-12: the daemon has no sampler and sends null.
 			// "cpu 0%" here would tell a reader the machine is idle, which is a claim.
 			name:  "null cpu produces no cpu clause",
-			reply: statusReply{V: protocolVersion, Budget: 4, InUse: 2, CPU: nil, Thermal: "nominal"},
+			reply: statusReply{V: protocolVersion, Budget: 4, InUse: 2, Slots: 2, CPU: nil, Thermal: "nominal"},
 			want:  "2/4 slots - thermal ok",
 		},
 		{
 			// Every Linux host, forever. It is a statement about the measurement, not
 			// about the machine, so it gets no width on the line.
 			name:  "unknown thermal produces no thermal clause",
-			reply: statusReply{V: protocolVersion, Budget: 4, InUse: 0, CPU: f64(0.1), Thermal: "unknown"},
+			reply: statusReply{V: protocolVersion, Budget: 4, InUse: 0, Slots: 0, CPU: f64(0.1), Thermal: "unknown"},
 			want:  "0/4 slots - cpu 10%",
 		},
 		{
 			name:  "neither signal leaves the slot count alone",
-			reply: statusReply{V: protocolVersion, Budget: 4, InUse: 1, Thermal: "unknown"},
+			reply: statusReply{V: protocolVersion, Budget: 4, InUse: 1, Slots: 1, Thermal: "unknown"},
 			want:  "1/4 slots",
 		},
 		{
 			// Not softened to "ok" or anything else. This is the state the control loop
 			// cuts the budget on and it appears in the daemon's own word.
 			name:  "an elevated thermal state is reported verbatim",
-			reply: statusReply{V: protocolVersion, Budget: 4, InUse: 4, CPU: f64(0.97), Thermal: "serious"},
+			reply: statusReply{V: protocolVersion, Budget: 4, InUse: 4, Slots: 4, CPU: f64(0.97), Thermal: "serious"},
 			want:  "4/4 slots - cpu 97% - thermal serious",
 		},
 		{
 			// A full budget and a full budget with a queue behind it read identically
 			// without this, and they are not the same situation.
 			name:  "a wait queue is named when it is not empty",
-			reply: statusReply{V: protocolVersion, Budget: 4, InUse: 4, Waiting: 2, Thermal: "nominal"},
+			reply: statusReply{V: protocolVersion, Budget: 4, InUse: 4, Slots: 4, Waiting: 2, Thermal: "nominal"},
 			want:  "4/4 slots - 2 waiting - thermal ok",
 		},
 		{
 			name:  "an empty wait queue is not mentioned",
-			reply: statusReply{V: protocolVersion, Budget: 4, InUse: 4, Waiting: 0, Thermal: "nominal"},
+			reply: statusReply{V: protocolVersion, Budget: 4, InUse: 4, Slots: 4, Waiting: 0, Thermal: "nominal"},
 			want:  "4/4 slots - thermal ok",
 		},
 	}
@@ -209,7 +209,7 @@ func TestStatuslineRendersWhatTheDaemonSent(t *testing.T) {
 // right machine-wide numbers — which is exactly why this needs its own test.
 func TestStatuslineReadsTheSessionFromStdin(t *testing.T) {
 	reply := statusReply{
-		V: protocolVersion, Budget: 5, InUse: 3, Thermal: "nominal",
+		V: protocolVersion, Budget: 5, InUse: 3, Slots: 3, Thermal: "nominal",
 		Sessions: []sessionStat{
 			{Session: "someone-else", Confirmed: 1},
 			{Session: sampleSessionID, Tentative: 1, Confirmed: 1},
@@ -255,7 +255,7 @@ func TestStatuslineReadsTheSessionFromStdin(t *testing.T) {
 func TestStatuslineCacheIsNotSharedBetweenSessions(t *testing.T) {
 	isolateState(t)
 	endpoint, calls, _ := statusDaemon(t, statusReply{
-		V: protocolVersion, Budget: 5, InUse: 3, Thermal: "nominal",
+		V: protocolVersion, Budget: 5, InUse: 3, Slots: 3, Thermal: "nominal",
 		Sessions: []sessionStat{
 			{Session: sampleSessionID, Confirmed: 2},
 			{Session: "second-session", Confirmed: 1},
@@ -285,7 +285,7 @@ func TestStatuslineCacheIsNotSharedBetweenSessions(t *testing.T) {
 func TestStatuslineCaches(t *testing.T) {
 	t.Run("a second render inside the TTL does not ask the daemon", func(t *testing.T) {
 		isolateState(t)
-		endpoint, calls, _ := statusDaemon(t, statusReply{V: protocolVersion, Budget: 4, InUse: 1, Thermal: "nominal"})
+		endpoint, calls, _ := statusDaemon(t, statusReply{V: protocolVersion, Budget: 4, InUse: 1, Slots: 1, Thermal: "nominal"})
 
 		for i := 0; i < 5; i++ {
 			runStatuslineFor(t, endpoint, sampleStatusLinePayload, 0)
@@ -297,7 +297,7 @@ func TestStatuslineCaches(t *testing.T) {
 
 	t.Run("a stale cache is not used", func(t *testing.T) {
 		dir := isolateState(t)
-		endpoint, calls, _ := statusDaemon(t, statusReply{V: protocolVersion, Budget: 4, InUse: 1, Thermal: "nominal"})
+		endpoint, calls, _ := statusDaemon(t, statusReply{V: protocolVersion, Budget: 4, InUse: 1, Slots: 1, Thermal: "nominal"})
 
 		runStatuslineFor(t, endpoint, sampleStatusLinePayload, 0)
 		// Age the entry rather than sleeping out the TTL: the freshness rule is what is
@@ -312,7 +312,7 @@ func TestStatuslineCaches(t *testing.T) {
 
 	t.Run("a cache stamped in the future is not used", func(t *testing.T) {
 		dir := isolateState(t)
-		endpoint, calls, _ := statusDaemon(t, statusReply{V: protocolVersion, Budget: 4, InUse: 1, Thermal: "nominal"})
+		endpoint, calls, _ := statusDaemon(t, statusReply{V: protocolVersion, Budget: 4, InUse: 1, Slots: 1, Thermal: "nominal"})
 
 		runStatuslineFor(t, endpoint, sampleStatusLinePayload, 0)
 		// A clock that jumped backwards, or a cache copied from another machine. Treating
@@ -328,7 +328,7 @@ func TestStatuslineCaches(t *testing.T) {
 
 	t.Run("a corrupt cache is a miss, not a failure", func(t *testing.T) {
 		dir := isolateState(t)
-		endpoint, calls, _ := statusDaemon(t, statusReply{V: protocolVersion, Budget: 4, InUse: 1, Thermal: "nominal"})
+		endpoint, calls, _ := statusDaemon(t, statusReply{V: protocolVersion, Budget: 4, InUse: 1, Slots: 1, Thermal: "nominal"})
 
 		// Half a write, which is what a reader would see if the write were not atomic.
 		if err := os.WriteFile(filepath.Join(dir, statuslineCacheFile), []byte(`{"at":"2026-`), 0o644); err != nil {
@@ -457,7 +457,7 @@ func TestStatuslineWhenTheDaemonIsUnreachable(t *testing.T) {
 // command that never exits is a child process per assistant message that never exits.
 func TestStatuslineSurvivesAStdinThatNeverCloses(t *testing.T) {
 	isolateState(t)
-	endpoint, _, _ := statusDaemon(t, statusReply{V: protocolVersion, Budget: 4, InUse: 1, Thermal: "nominal"})
+	endpoint, _, _ := statusDaemon(t, statusReply{V: protocolVersion, Budget: 4, InUse: 1, Slots: 1, Thermal: "nominal"})
 	t.Setenv(transport.EndpointEnv, endpoint)
 
 	var stderr bytes.Buffer
@@ -517,7 +517,7 @@ func TestStatuslineRespectsColumns(t *testing.T) {
 		t.Run(fmt.Sprintf("width %d", tc.width), func(t *testing.T) {
 			isolateState(t)
 			endpoint, _, _ := statusDaemon(t, statusReply{
-				V: protocolVersion, Budget: 5, InUse: 3, CPU: f64(0.61), Thermal: "nominal",
+				V: protocolVersion, Budget: 5, InUse: 3, Slots: 3, CPU: f64(0.61), Thermal: "nominal",
 			})
 			got := runStatuslineFor(t, endpoint, sampleStatusLinePayload, tc.width)
 			if got != tc.want {
@@ -539,7 +539,7 @@ func TestStatuslineRespectsColumns(t *testing.T) {
 // dropped whole before any text is cut.
 func TestStatuslineDropsTheSessionSuffixBeforeCutting(t *testing.T) {
 	reply := statusReply{
-		V: protocolVersion, Budget: 5, InUse: 2, Thermal: "nominal",
+		V: protocolVersion, Budget: 5, InUse: 2, Slots: 2, Thermal: "nominal",
 		Sessions: []sessionStat{{Session: sampleSessionID, Confirmed: 1}},
 	}
 	tests := []struct {
@@ -698,7 +698,7 @@ func statusRequestLine(t *testing.T) string {
 func TestGovernorStatusDoesNotUseTheStatuslineCache(t *testing.T) {
 	dir := isolateState(t)
 	endpoint, calls, _ := statusDaemon(t, statusReply{
-		V: protocolVersion, Budget: 6, InUse: 2, Waiting: 1, CPU: f64(0.5), Thermal: "nominal",
+		V: protocolVersion, Budget: 6, InUse: 2, Slots: 2, Waiting: 1, CPU: f64(0.5), Thermal: "nominal",
 	})
 	t.Setenv(transport.EndpointEnv, endpoint)
 
@@ -770,16 +770,16 @@ func TestTheDocsIllustrateTheStatusLineThatActuallyRenders(t *testing.T) {
 	renders := map[string]string{} // line -> the view that produced it
 	for name, v := range map[string]statusView{
 		"section 9, a governed session with both load signals": {
-			OK: true, InUse: 3, Budget: 5, CPU: &cpu, Thermal: signals.Nominal,
+			OK: true, InUse: 3, Slots: 3, Budget: 5, CPU: &cpu, Thermal: signals.Nominal,
 		},
 		"section 9, the idle count GOV-29 found was being misread": {
-			OK: true, InUse: 0, Budget: 4,
+			OK: true, InUse: 0, Slots: 0, Budget: 4,
 		},
 		"section 9, a session whose hooks never loaded": {
 			OK: true, Ungoverned: true,
 		},
 		"section 13, a budget filled by leases that outlived their agents": {
-			OK: true, InUse: 4, Budget: 4,
+			OK: true, InUse: 4, Slots: 4, Budget: 4,
 		},
 	} {
 		renders[render(v, 0)] = name

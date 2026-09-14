@@ -126,7 +126,7 @@ func TestTheNoticeLeadsWithHowToTurnItOff(t *testing.T) {
 func TestTheNoticeDescribesTheStatusLineThatActuallyRenders(t *testing.T) {
 	cpu := 0.61
 	live := render(statusView{
-		OK: true, InUse: 3, Budget: 5, Mine: 1, CPU: &cpu, Thermal: signals.Nominal,
+		OK: true, InUse: 3, Slots: 3, Budget: 5, Mine: 1, CPU: &cpu, Thermal: signals.Nominal,
 	}, 0)
 
 	for _, quoted := range []string{"3/5 slots", "(1 yours)", "cpu 61%", "thermal ok"} {

@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -88,10 +89,11 @@ type statusRequest struct {
 // halves of a wire protocol that will at times be different binary versions (invariant 8),
 // and a shared struct hides the moment they diverge.
 type statusResponse struct {
-	V       int `json:"v"`
-	Budget  int `json:"budget"`
-	InUse   int `json:"in_use"`
-	Waiting int `json:"waiting"`
+	V       int     `json:"v"`
+	Budget  int     `json:"budget"`
+	InUse   int     `json:"in_use"`
+	Slots   float64 `json:"slots"`
+	Waiting int     `json:"waiting"`
 	// CPU is a pointer because the daemon sends null when it has not measured, rather than
 	// a fabricated 0.0. Null means "not measured"; rendering it as "cpu 0%" would tell the
 	// reader the machine is idle, which is a claim and not a reading.
@@ -185,9 +187,13 @@ func statusline(stdin io.Reader, stderr io.Writer, dialer transport.Dialer, budg
 // path in this file degrades to.
 type statusView struct {
 	// OK is whether the daemon answered at all. Everything below is meaningless without it.
-	OK      bool
-	Budget  int
+	OK     bool
+	Budget int
+	// InUse is the number of leases held; Slots is how much of the budget they weigh. Since
+	// GOV-15 those are different numbers — a subagent weighs about 0.08 slots and a Heavy
+	// build 3.75 — and only Slots is comparable with Budget.
 	InUse   int
+	Slots   float64
 	Waiting int
 	CPU     *float64
 	Thermal signals.Thermal
@@ -257,6 +263,7 @@ func view(c cachedStatus, session string) statusView {
 		OK:      true,
 		Budget:  c.Reply.Budget,
 		InUse:   c.Reply.InUse,
+		Slots:   c.Reply.Slots,
 		Waiting: c.Reply.Waiting,
 		CPU:     c.Reply.CPU,
 		Thermal: c.Reply.Thermal,
@@ -317,17 +324,37 @@ func render(v statusView, width int) string {
 	return line
 }
 
+// formatSlots renders held slots without a pointless decimal.
+//
+// Whole numbers print whole — "3/6 slots" — because that is the common case once builds are
+// what fill the budget, and a line that said "3.0/6" on every render would look like a
+// precision nobody asked for. A fraction prints to one place, so a machine holding only
+// agents reads "0.2/6 slots" and is visibly nearly empty rather than rounding to a
+// reassuring zero.
+func formatSlots(s float64) string {
+	if r := math.Round(s); math.Abs(s-r) < 0.05 {
+		return strconv.FormatFloat(r, 'f', 0, 64)
+	}
+	return strconv.FormatFloat(s, 'f', 1, 64)
+}
+
 // clauses builds the parts of the line, most important first, optionally including the
 // session-local slot count.
 func clauses(v statusView, mine bool) []string {
 	out := make([]string, 0, 4)
-	slots := fmt.Sprintf("%d/%d slots", v.InUse, v.Budget)
+	// SLOTS, NOT LEASES, and the two stopped being the same number in GOV-15. A subagent
+	// weighs about 0.08 slots against a Heavy build's 3.75, so rendering the lease COUNT
+	// beside the slot BUDGET would put two different units either side of the slash: four
+	// agents would read "4/6 slots" on a machine that is 5% full. Budget is a quantity of
+	// build capacity and this has to be the same quantity.
+	slots := fmt.Sprintf("%s/%d slots", formatSlots(v.Slots), v.Budget)
 	if mine {
-		// Whose slots. The machine-wide count alone does not answer the question a person
-		// in this session is actually asking, which is whether the agents filling the
-		// budget are theirs. Only when it is non-zero: a session holding nothing is the
-		// common case, and "(0 yours)" on every line would be noise on the surface this
-		// command has least room on.
+		// Whose slots. The machine-wide figure alone does not answer the question a person
+		// in this session is actually asking, which is whether what fills the budget is
+		// theirs. This one stays a COUNT of leases, and says so, because "0.16 yours" is
+		// not a thing anyone wants to read and the question behind it is "how many of those
+		// are mine". Only when non-zero: a session holding nothing is the common case, and
+		// "(0 yours)" on every line would be noise on the surface with least room for it.
 		slots += fmt.Sprintf(" (%d yours)", v.Mine)
 	}
 	out = append(out, slots)

@@ -712,6 +712,14 @@ setpoint crossings, run queue peaking at 49.6 per core — the budget took 6 dis
 reversed direction on 1.4% of ticks, and spent 76% of that saturated window at the floor
 without becoming stuck there (`internal/budget/aimd_replay_test.go`).
 
+**`in_use` and the budget stopped being the same unit, and the status line says so.** A lease
+count and a quantity of budget are different numbers once a subagent weighs 0.08 slots and a
+Heavy build 3.75, so the wire carries both — `in_use` is still the count, and an additive
+`slots` field is what the status line and the deny text render beside `budget`. Four agents
+reading "4/6 slots" on a machine that is 5% full is a number that invites exactly the wrong
+response. Whole values print whole; a fraction prints to one place, so a machine holding only
+agents reads "0.2/6 slots" rather than rounding to a reassuring zero.
+
 **Measured against a real fan-out, the loop controls and it over-controls.**
 [control-proof.md](control-proof.md) drove ten concurrent `go build -a` runs through a live
 daemon and the same load with no hooks at all. Governed, the machine admitted 1 build of 10,
