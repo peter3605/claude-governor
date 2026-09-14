@@ -643,10 +643,10 @@ func TestStatuslineAgainstTheRealDaemon(t *testing.T) {
 		// Taken through the table rather than over the wire because the point here is what
 		// the status reply says about leases, not how they were acquired.
 		limit := 4
-		if _, ok := d.table.Acquire(sampleSessionID, 0, limit); !ok {
+		if _, ok := d.table.Acquire(lease.Request{Session: sampleSessionID, Depth: 0}, limit); !ok {
 			t.Fatalf("acquire: no room in a budget of %d", limit)
 		}
-		if _, ok := d.table.Acquire("another-session", 0, limit); !ok {
+		if _, ok := d.table.Acquire(lease.Request{Session: "another-session", Depth: 0}, limit); !ok {
 			t.Fatalf("acquire: no room in a budget of %d", limit)
 		}
 		d.table.StartSession(lease.Session{ID: sampleSessionID, Weight: 1})

@@ -57,13 +57,13 @@ func (g governance) why() string {
 	}
 }
 
-// classify decides one live session's governance from a status reply.
+// classifyGovernance decides one live session's governance from a status reply.
 //
 // It is deliberately conservative in one direction: anything it cannot establish comes back
 // as unknown or benign rather than as a fault. A false "ungoverned" costs a person a
 // needless session restart and, worse, teaches them to disbelieve the one line that would
 // have told them the truth the day it mattered.
-func classify(reply statusResponse, s sessionStat) governance {
+func classifyGovernance(reply statusResponse, s sessionStat) governance {
 	if !reply.SessionsKnown {
 		return govUnknown
 	}

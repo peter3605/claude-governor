@@ -48,6 +48,37 @@ const (
 	DefaultConfirmedTTL = 30 * time.Minute
 )
 
+// DefaultBuildTTL is how long a Build lease lives without a PostToolUse to return it.
+//
+// IT IS NOT A BACKSTOP, AND THAT IS THE WHOLE POINT. For an agent the TTL catches a lost
+// SubagentStop, which is rare. For a build, hook-surface.md section 19 MEASURED three
+// ordinary outcomes that produce no usable release at all — the command errors (no
+// PostToolUse is emitted), it was backgrounded, or it exceeded its timeout and was
+// backgrounded rather than killed. A failing build is the normal state of a build under
+// development, so the reaper is this path's primary mechanism and this constant is a control
+// parameter rather than a safety margin.
+//
+// FIVE MINUTES, MEASURED. Over the 20,614 Bash calls tools/bashcorpus collects, the runtime
+// of gated FOREGROUND calls is p50 6.4 s, p90 57.5 s, p99 360.7 s (design.md section 5.6).
+// The share that outlives a candidate TTL:
+//
+//	30 s (DefaultTentativeTTL)  17.9%   <- one build in five reaped while still running
+//	60 s                         9.8%
+//	120 s                        5.6%
+//	300 s                        1.4%   <- chosen
+//	600 s                        0.5%
+//
+// The two errors are not the same size, which is what picks the number. Too SHORT reaps a
+// lease out from under a running build, so the budget over-grants against real load — silent,
+// and worst under exactly the fan-out this governor exists to control. Too LONG holds a slot
+// after a failed build, which costs throughput, decays on its own, and is visible in
+// `governor status`. 600 s buys 0.9 points of coverage for double the leak; 300 s covers
+// 98.6% and is the right side of the trade.
+//
+// Reusing DefaultTentativeTTL here would have been the easy wiring and is wrong by a factor
+// measured rather than guessed.
+const DefaultBuildTTL = 300 * time.Second
+
 // Session is a registered Claude Code session, from the `session` operation of design.md
 // section 7.
 type Session struct {
@@ -69,6 +100,9 @@ type Session struct {
 type Options struct {
 	TentativeTTL time.Duration
 	ConfirmedTTL time.Duration
+	// BuildTTL is how long a Build lease lives. See DefaultBuildTTL: on this path the TTL
+	// is the primary reclaim mechanism, not a backstop.
+	BuildTTL time.Duration
 	// Liveness answers whether a confirmed lease's owner is still running. Nil means
 	// nothing is ever reaped for liveness, only for TTL.
 	Liveness Liveness
@@ -86,10 +120,15 @@ type Table struct {
 	mu       sync.Mutex
 	byID     map[string]*Lease
 	byAgent  map[string]string   // agent_id -> lease ID, confirmed leases only
+	byTool   map[string]string   // tool_use_id -> lease ID, Build leases only
 	pending  map[string][]string // session -> FIFO of tentative lease IDs
 	sessions map[string]Session
 	seq      uint64
-	opt      Options
+	// weight is the sum of every held lease's Weight, maintained incrementally so that
+	// admission does not walk the table. It is the authority on what is held; len(byID) is
+	// only ever a count of entries.
+	weight float64
+	opt    Options
 }
 
 // NewTable builds an empty table.
@@ -100,12 +139,16 @@ func NewTable(opt Options) *Table {
 	if opt.ConfirmedTTL <= 0 {
 		opt.ConfirmedTTL = DefaultConfirmedTTL
 	}
+	if opt.BuildTTL <= 0 {
+		opt.BuildTTL = DefaultBuildTTL
+	}
 	if opt.Now == nil {
 		opt.Now = time.Now
 	}
 	return &Table{
 		byID:     map[string]*Lease{},
 		byAgent:  map[string]string{},
+		byTool:   map[string]string{},
 		pending:  map[string][]string{},
 		sessions: map[string]Session{},
 		opt:      opt,
@@ -124,26 +167,95 @@ func NewTable(opt Options) *Table {
 // before it ever reaches this function (design.md section 6.3), so a lease in this table is
 // always depth 0; the field is kept because a lease that cannot say what it was taken for is
 // harder to debug than one that can.
-func (t *Table) Acquire(session string, depth, limit int) (Lease, bool) {
+//
+// Request says what is being taken and how much of the budget it wants. The two kinds differ
+// in every part of their lifecycle, so they are one function only because the ADMISSION rule
+// is genuinely shared and must stay atomic — see the paragraph above.
+type Request struct {
+	Session string
+	Depth   int
+	Kind    Kind
+	// Weight is how much of the budget this lease holds, in slots. Zero takes the kind's
+	// default, which is one slot — an agent asking for nothing would be ungoverned.
+	Weight float64
+	// ToolUseID keys a Build lease for release. Ignored for an Agent lease.
+	ToolUseID string
+}
+
+// Acquire takes a lease if the budget has room for it.
+func (t *Table) Acquire(r Request, limit int) (Lease, bool) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
-	if len(t.byID) >= limit {
+	w := r.Weight
+	if w <= 0 {
+		w = 1
+	}
+
+	// THE ADMISSION RULE IS WORK-CONSERVING, and it has to be. The budget is an integer
+	// count of slots where one slot is one Medium build, so a Heavy build weighs 3.75 and a
+	// budget floored at 1 (invariant 4) could never admit one. Refusing it would not be
+	// conservative, it would be a deadlock: the machine would sit idle refusing the only
+	// work it had. So a request that does not fit an EMPTY table is admitted anyway and
+	// simply runs alone. That is what invariant 4 means by "still makes progress, one at a
+	// time" once slots stopped being interchangeable.
+	if len(t.byID) > 0 && t.weight+w > float64(limit) {
 		return Lease{}, false
 	}
+
 	now := t.opt.Now()
 	t.seq++
 	l := &Lease{
 		ID:        fmt.Sprintf("L-%04x", t.seq),
-		Session:   session,
-		State:     Tentative,
-		Depth:     depth,
+		Session:   r.Session,
+		Kind:      r.Kind,
+		Depth:     r.Depth,
+		Weight:    w,
+		ToolUseID: r.ToolUseID,
 		GrantedAt: now,
-		ExpiresAt: now.Add(t.opt.TentativeTTL),
+	}
+	if r.Kind == Build {
+		// Born confirmed: nothing announces that a command started, so there is no second
+		// event to confirm against and a tentative state would only ever expire
+		// (hook-surface.md section 19, design.md section 4.3).
+		l.State = Confirmed
+		l.ExpiresAt = now.Add(t.opt.BuildTTL)
+		if r.ToolUseID != "" {
+			t.byTool[r.ToolUseID] = l.ID
+		}
+	} else {
+		l.State = Tentative
+		l.ExpiresAt = now.Add(t.opt.TentativeTTL)
+		t.pending[r.Session] = append(t.pending[r.Session], l.ID)
 	}
 	t.byID[l.ID] = l
-	t.pending[session] = append(t.pending[session], l.ID)
+	t.weight += w
 	return *l, true
+}
+
+// ReleaseBuild returns a Build lease by the tool_use_id it was taken with.
+//
+// Unlike the agent path this needs no correlation at all: PostToolUse carries the SAME
+// tool_use_id as the PreToolUse that took the lease, measured in every pairing observed
+// (hook-surface.md section 19). The session is checked for the same reason Release checks it.
+func (t *Table) ReleaseBuild(session, toolUseID string) bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	id, ok := t.byTool[toolUseID]
+	if !ok {
+		return false
+	}
+	l, ok := t.byID[id]
+	if !ok {
+		delete(t.byTool, toolUseID)
+		return false
+	}
+	if session != "" && l.Session != session {
+		return false
+	}
+	t.dropLocked(l)
+	return true
 }
 
 // Confirm binds a tentative lease to a live agent at SubagentStart.
@@ -389,10 +501,25 @@ func (t *Table) deadSessionsLocked() map[string]bool {
 }
 
 // dropLocked removes one lease and every index pointing at it.
+//
+// It is the ONLY place a lease leaves the table, which is what lets the running weight be
+// maintained incrementally rather than recomputed: a second removal path would silently
+// leak budget that no test would see until the machine stopped granting.
 func (t *Table) dropLocked(l *Lease) {
+	if _, ok := t.byID[l.ID]; ok {
+		t.weight -= l.Weight
+		if t.weight < 0 {
+			// Defence against a double-drop rounding the sum negative, which would hand out
+			// budget that does not exist. The table is the authority on what is held.
+			t.weight = 0
+		}
+	}
 	delete(t.byID, l.ID)
 	if l.AgentID != "" && t.byAgent[l.AgentID] == l.ID {
 		delete(t.byAgent, l.AgentID)
+	}
+	if l.ToolUseID != "" && t.byTool[l.ToolUseID] == l.ID {
+		delete(t.byTool, l.ToolUseID)
 	}
 	if q, ok := t.pending[l.Session]; ok {
 		keep := q[:0]
@@ -427,15 +554,30 @@ func (t *Table) snapshotLeasesLocked() []*Lease {
 	return out
 }
 
-// InUse is how many slots are held: tentative and confirmed alike.
+// InUse is how many LEASES are held: tentative and confirmed, agents and builds alike.
 //
 // A tentative lease counts. It represents a spawn that is about to happen, and not counting
 // it would let a burst of simultaneous PreToolUse calls each see room that the others are
 // already taking.
+//
+// IT IS A COUNT, NOT THE BUDGET FIGURE, and since GOV-15 those are two different numbers.
+// Admission compares Slots, because a subagent and a `cargo build` are not the same size and
+// the whole pivot was noticing that. This stays a count because a count is what the status
+// line's per-session breakdown and the daemon's own logs are actually reporting — "this
+// session holds three things" — and because a reader who sees "in use" expects to be told how
+// many. Nothing decides anything on it.
 func (t *Table) InUse() int {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	return len(t.byID)
+}
+
+// Slots is the exact sum of held lease weights, in slots of budget. This is what admission
+// compares, and it is the authority on how full the machine is.
+func (t *Table) Slots() float64 {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.weight
 }
 
 // SessionStat is one session's line in a status snapshot.
@@ -449,6 +591,7 @@ type SessionStat struct {
 // under one lock, so status can never report a total that disagrees with its own parts.
 type Snapshot struct {
 	InUse     int
+	Slots     float64
 	Tentative int
 	Confirmed int
 	Sessions  []SessionStat
@@ -482,6 +625,7 @@ func (t *Table) Snapshot() Snapshot {
 		}
 	}
 	s.InUse = len(t.byID)
+	s.Slots = t.weight
 	for _, st := range per {
 		s.Sessions = append(s.Sessions, *st)
 	}

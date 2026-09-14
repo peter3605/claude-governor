@@ -272,7 +272,7 @@ func view(c cachedStatus, session string) statusView {
 		// Only this session's own verdict is rendered. The line has room for one machine and
 		// one session, and a person reading it is asking about the window in front of them.
 		// Whether some other session is ungoverned is doctor's question to answer.
-		v.Ungoverned = classify(c.Reply, s).ungoverned()
+		v.Ungoverned = classifyGovernance(c.Reply, s).ungoverned()
 		break
 	}
 	return v

@@ -50,6 +50,7 @@ var commands = []command{
 	{"gate", "PreToolUse hook: acquire a lease for one subagent spawn", runGate},
 	{"confirm", "SubagentStart hook: bind a granted lease to a live agent", runConfirm},
 	{"release", "SubagentStop hook: return a lease to the pool", runRelease},
+	{"finish", "PostToolUse hook: return a build lease when its command completes", runFinish},
 	{"session", "SessionStart/SessionEnd hook: register or drop a session", runSession},
 	{"status", "print the current budget and its holders", runStatus},
 	{"mcp", "serve the advisory MCP tool over stdio", stub("mcp")},

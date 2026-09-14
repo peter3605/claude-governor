@@ -193,7 +193,7 @@ func TestReaperCollectsARealDeadOwnerAndSparesALiveOne(t *testing.T) {
 		{"doomed", "a-dead", deadPID, deadStarted},
 		{"survivor", "a-live", livePID, liveStarted},
 	} {
-		if _, ok := tbl.Acquire(o.session, 0, 10); !ok {
+		if _, ok := tbl.Acquire(Request{Session: o.session, Depth: 0}, 10); !ok {
 			t.Fatalf("Acquire(%s): no room in a budget of 10", o.session)
 		}
 		if _, ok := tbl.Confirm(o.session, "", o.agent, o.pid, o.started); !ok {

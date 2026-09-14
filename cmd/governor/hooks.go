@@ -57,6 +57,9 @@ type hookRequest struct {
 	Principal principal `json:"principal"`
 	Session   string    `json:"session"`
 
+	// finish
+	ToolUseID string `json:"tool_use_id,omitempty"`
+
 	// confirm
 	Lease string `json:"lease,omitempty"`
 
@@ -89,6 +92,18 @@ type hookAck struct {
 // a thinner request, never to a failed hook.
 type lifecyclePayload struct {
 	SessionID string `json:"session_id"`
+	// ToolUseID keys a Build lease. PostToolUse carries the SAME one its PreToolUse did,
+	// measured in every pairing observed (docs/hook-surface.md section 19), so the release
+	// needs no correlation — unlike the agent path, where SubagentStart carries no key.
+	ToolUseID string `json:"tool_use_id"`
+	// ToolName is read so that a PostToolUse for some other tool costs nothing.
+	ToolName string `json:"tool_name"`
+	// ToolResponse is decoded for one field. BackgroundTaskID is what separates a command
+	// that FINISHED from one that is merely no longer being waited for, and it is the whole
+	// reason this hook cannot simply release on every PostToolUse — see buildFinish.
+	ToolResponse struct {
+		BackgroundTaskID string `json:"backgroundTaskId"`
+	} `json:"tool_response"`
 	// AgentID is the agent being started or stopped — on these events it names the new
 	// agent, not the caller as it does on PreToolUse (docs/hook-surface.md section 3).
 	AgentID string `json:"agent_id"`
@@ -103,6 +118,10 @@ func runConfirm(_ []string, _ io.Writer, stderr io.Writer) int {
 
 func runRelease(_ []string, _ io.Writer, stderr io.Writer) int {
 	return lifecycleHook(os.Stdin, stderr, transport.Dial{}, hookBudget, buildRelease)
+}
+
+func runFinish(_ []string, _ io.Writer, stderr io.Writer) int {
+	return lifecycleHook(os.Stdin, stderr, transport.Dial{}, hookBudget, buildFinish)
 }
 
 func runSession(args []string, stdout io.Writer, stderr io.Writer) int {
@@ -161,6 +180,49 @@ func buildRelease(p lifecyclePayload, _ io.Writer) (hookRequest, bool) {
 		Principal: localPrincipal(),
 		Session:   p.SessionID,
 		AgentID:   p.AgentID,
+	}, true
+}
+
+// buildFinish returns a Build lease at PostToolUse, IF the command has actually finished.
+//
+// THE backgroundTaskId GUARD IS THE WHOLE FUNCTION, and it is a measured fact rather than
+// caution. docs/hook-surface.md section 19 found PostToolUse on `Bash` wrong in both
+// directions:
+//
+//   - ABSENT when the command errors. A failing `go build` — the normal state of a build
+//     under development — emits no PostToolUse at all. Nothing can be done here about that;
+//     the reaper collects those at DefaultBuildTTL, which is why that TTL is a control
+//     constant and not a safety margin.
+//   - PRESENT WHILE THE COMMAND IS STILL RUNNING when it was backgrounded (a launch receipt
+//     ~50 ms in) or when it exceeded its timeout, after which the harness backgrounds it
+//     rather than killing it. Both carry a backgroundTaskId, and nothing whatsoever fires
+//     when the work behind one actually ends.
+//
+// So releasing on every PostToolUse would hand a slot back to a build that is still burning
+// CPU, which is precisely the failure this governor exists to prevent. A lease held too long
+// costs throughput and expires on its own; one released too early is the governor silently
+// not governing. Those are not the same size of mistake.
+func buildFinish(p lifecyclePayload, diag io.Writer) (hookRequest, bool) {
+	if p.ToolName != buildToolName {
+		// The matcher should have kept these out, but a matcher is configuration and
+		// configuration drifts. Answering here costs nothing and a stray registration on
+		// every tool call must not put a socket round trip on every Read and Edit.
+		return hookRequest{}, false
+	}
+	if p.ToolUseID == "" {
+		fmt.Fprintf(diag, "governor finish: PostToolUse carried no tool_use_id; the lease will rely on its TTL\n")
+		return hookRequest{}, false
+	}
+	if id := p.ToolResponse.BackgroundTaskID; id != "" {
+		fmt.Fprintf(diag, "governor finish: %s is still running as background task %s; holding the lease\n",
+			p.ToolUseID, id)
+		return hookRequest{}, false
+	}
+	return hookRequest{
+		V: protocolVersion, Op: "finish",
+		Principal: localPrincipal(),
+		Session:   p.SessionID,
+		ToolUseID: p.ToolUseID,
 	}, true
 }
 

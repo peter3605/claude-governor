@@ -1416,3 +1416,178 @@ Named rather than inferred, because a gap filled by inference is how §8.1 and �
 - **End to end against a running daemon** (§8.4). These probes captured payloads; no lease was
   taken.
 - **Linux.** Every measurement in this section is macOS.
+
+---
+
+## 19. `PostToolUse` on `Bash` — the release signal, and the three ways it lies
+
+GOV-15 points the gate at `Bash`, and a lease needs something to return it. `SubagentStop`
+does that job for an agent; for a `Bash` call the only candidate is `PostToolUse`, and §6
+recorded it **only for the `Agent` tool**. §8.2's event listing shows it firing for `Bash`,
+which is where the assumption that it is a usable release signal came from. It was never
+measured, and it does not survive being measured.
+
+**The headline: `PostToolUse` is wrong in both directions.** It is *absent* when a command
+fails, and it is *present while the command is still running* when a command is backgrounded
+or times out. A release path built on it alone both leaks leases and returns them early.
+
+### 19.0 Provenance
+
+| | |
+|---|---|
+| Claude Code | **2.1.270** — the same build §18 was measured against |
+| Host | macOS 25.4.0, darwin/arm64, 8 logical cores |
+| Date | 2026-09-14 |
+| Model | `sonnet`, `claude -p`, `--setting-sources ""`, `--permission-mode bypassPermissions` |
+
+### 19.1 Method
+
+The §0 capture hook, unchanged. Four probes, each a separate headless `claude -p` in a
+throwaway directory with its own `settings.json`, registering a catch-all `PreToolUse` and a
+catch-all `PostToolUse` (probe H registers all eight events).
+
+| Probe | Question | Shape |
+|---|---|---|
+| D | does `PostToolUse` correlate, and what does a background launch look like | foreground `echo`, a `run_in_background` command, a command exiting 7 |
+| E | does an error exit suppress `PostToolUse` | `exit 7`, `grep` with no match, two successful `echo`s — the model ran the whole sequence **twice**, so every row below is n=2 |
+| F | is a **failing build** the same shape as a failing `exit` | `go build ./...` against a module that genuinely does not compile, `exit 1`, a missing binary, a stderr-plus-exit-3 |
+| H | does a background task's **completion** raise anything | a `run_in_background` command that finishes 8 s in, while the session stays alive for 21 s |
+
+Probe F's module is three lines and does not compile:
+
+```go
+package main
+
+func main() {
+	var x int = "this does not compile"
+}
+```
+
+### 19.2 The five answers
+
+| Case | `PostToolUse`? | Fires at | Command still running when it fires? |
+|---|---|---|---|
+| success | **yes** | completion | no |
+| non-zero exit the harness *interprets* — `grep`, no match | **yes** | completion | no |
+| error exit — `exit 7`, `exit 1`, failed `go build`, missing binary | **NO** | — | no |
+| `run_in_background: true` | **yes** | **+46 ms / +111 ms** | **YES** |
+| `timeout` exceeded | **yes** | at the timeout | **YES** — backgrounded, not killed |
+| a background task **completing** | **no event of any kind** | — | — |
+
+Five consequences, in the order they bite.
+
+1. **`tool_use_id` matches, exactly.** Every `PostToolUse` observed carried the same
+   `tool_use_id` as its `PreToolUse`. A `Bash` lease therefore needs **no FIFO correlation** —
+   unlike a subagent lease, whose `SubagentStart` carries no `tool_use_id` at all (§3, §7).
+   This is the one part of the release story that is simpler than the agent case.
+
+2. **A failing command raises no `PostToolUse`.** Four failures in probe F, all four silent;
+   probe E's `exit 7` silent in both of its two rounds. This is not "non-zero exit" — probe E's
+   `grep` with no match exits 1 and *does* get a `PostToolUse`, carrying
+   `"returnCodeInterpretation": "No matches found"`. The harness distinguishes a result it can
+   interpret from a tool *error*, and only the former raises the event. **A build that fails to
+   compile takes the silent path**, which is the normal state of a build under development.
+
+3. **A backgrounded command's `PostToolUse` is a launch receipt, not a completion.** It arrives
+   in tens of milliseconds with empty `stdout` and a `backgroundTaskId`. This is the same
+   `async_launched` shape §6 records for a background `Agent` spawn. GOV-14 found the same fact
+   from the transcript side and `tools/bashcorpus` already refuses to cost-label these calls;
+   §19 confirms it from the hook side and supplies the discriminator.
+
+4. **A timed-out command is backgrounded, not killed** — and this is the finding that would
+   have been missed. The `tool_response` carries `timedOutAfterMs` *and* a `backgroundTaskId`.
+   The command keeps burning CPU after the harness has stopped waiting for it, so the event
+   that looks most like "this build is over" is emitted at precisely the moment the governor
+   most needs the lease held.
+
+5. **Nothing at all marks a background task finishing.** Probe H's background command started
+   at +3.876 s and ended near +11.9 s; the session ran to +21.1 s emitting six further hook
+   events, and none of them was about it. For a backgrounded or timed-out command there is
+   **no release event, ever**.
+
+### 19.3 The discriminator
+
+`tool_response.backgroundTaskId` is the field that separates a completion from a launch
+receipt, and it is present in both of the still-running cases and absent in both of the
+finished ones. That makes the release rule expressible without guessing:
+
+```
+release on PostToolUse  IFF  tool_response.backgroundTaskId is absent
+```
+
+`timedOutAfterMs` is additional evidence of the same condition and is not needed for the
+decision — a timed-out command always carries `backgroundTaskId` too.
+
+### 19.4 The payloads
+
+A background launch, `PreToolUse` then `PostToolUse` +111 ms apart, one `tool_use_id`:
+
+```json
+{"session_id":"82039273-34d1-44bd-8a1f-1e88998da05d","transcript_path":"…","cwd":"…/probeD/work","prompt_id":"e07fba48-e4f6-4c33-a648-e755a9fb53b2","permission_mode":"bypassPermissions","effort":{"level":"high"},"hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":"sleep 20; echo probe-background-done","description":"Sleep then print background probe message","run_in_background":true},"tool_use_id":"toolu_012UtCijDKpJyPwdzRsfEPkF"}
+{"session_id":"82039273-34d1-44bd-8a1f-1e88998da05d","transcript_path":"…","cwd":"…/probeD/work","prompt_id":"e07fba48-e4f6-4c33-a648-e755a9fb53b2","permission_mode":"bypassPermissions","effort":{"level":"high"},"hook_event_name":"PostToolUse","tool_name":"Bash","tool_input":{"command":"sleep 20; echo probe-background-done","description":"Sleep then print background probe message","run_in_background":true},"tool_response":{"stdout":"","stderr":"","interrupted":false,"isImage":false,"noOutputExpected":false,"backgroundTaskId":"b1giufa5c"},"tool_use_id":"toolu_012UtCijDKpJyPwdzRsfEPkF","duration_ms":3}
+```
+
+A timeout — note `timedOutAfterMs` beside `backgroundTaskId`, and `duration_ms` of 5050
+against a command that had 25 s left to run:
+
+```json
+{"session_id":"b55bcb86-77e3-48ee-9edb-5227cef7c389","transcript_path":"…","cwd":"…/probeG/work","prompt_id":"ae46f19d-0da1-48ac-8f17-b23b8cedeba3","permission_mode":"bypassPermissions","effort":{"level":"high"},"hook_event_name":"PostToolUse","tool_name":"Bash","tool_input":{"command":"python3 -c 'import time; time.sleep(30); print(\"never-reached\")'","timeout":5000,"description":"Sleep 30s to test timeout cutoff at 5s"},"tool_response":{"stdout":"","stderr":"","interrupted":false,"isImage":false,"noOutputExpected":false,"backgroundTaskId":"bh2slj2d5","timedOutAfterMs":5000},"tool_use_id":"toolu_01R3hnFMR3AvPy58WMnFvynT","duration_ms":5050}
+```
+
+The failing build — this `PreToolUse` has no `PostToolUse` anywhere in the probe's output:
+
+```json
+{"session_id":"2b81ae88-75bb-4908-bf7b-f79dc17931b8","transcript_path":"…","cwd":"…/probeF/work","prompt_id":"c11cb4bf-18f0-417e-9519-09874d3d5c97","permission_mode":"bypassPermissions","effort":{"level":"high"},"hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":"go build ./...","description":"Build all Go packages"},"tool_use_id":"toolu_01GFrkqdH5NobRoVctd7pThy"}
+```
+
+Probe F's event log in full, which is the clearest statement of finding 2 — five `PreToolUse`,
+one `PostToolUse`:
+
+```
++  0.000 pre  cmd='go build ./...'                      (module does not compile)
++  1.527 pre  cmd="sh -c 'exit 1'"
++  2.742 pre  cmd='nosuchcommand-xyz'
++  4.112 pre  cmd="sh -c 'echo to-stderr >&2; exit 3'"
++  5.345 pre  cmd='echo last-step'
++  5.395 POST cmd='echo last-step'
+```
+
+And probe H's, for finding 5 — the background task ends near +11.9 s and nothing says so:
+
+```
++  0.000 SessionStart
++  3.876 PreToolUse    bg=True   sleep 8
++  3.987 PostToolUse   bg=True   backgroundTaskId=br2vagw1q     <- launch receipt
++  5.405 PreToolUse    tick1                     ~+11.9  background task actually ends
++  9.509 PostToolUse   tick1                             (no event)
++ 10.676 PreToolUse    tick2
++ 14.762 PostToolUse   tick2
++ 16.301 PreToolUse    tick3
++ 20.384 PostToolUse   tick3
++ 21.073 Stop
++ 21.124 SessionEnd
+```
+
+### 19.5 Consequences folded into design.md
+
+- §4.3 gains a `Bash` lease lifecycle: `PreToolUse` acquires, `PostToolUse` **without** a
+  `backgroundTaskId` releases, and the reaper is the only other way a `Bash` lease ever comes
+  back. There is no confirm step, because there is no second event to confirm against.
+- Invariant 2 — "assume the stop hooks never fire; leaks are the default outcome" — stops being
+  a defensive posture and becomes a **measured fact** for this tool. The reaper is not a
+  backstop on the `Bash` path; for failed, backgrounded and timed-out commands it is the
+  primary mechanism.
+- The tentative TTL of 30 s is **too short by a factor that was measured, not guessed**: over
+  the corpus of 20,614 `Bash` calls, 17.9% of gated foreground commands run longer than 30 s.
+  See design.md §5.6.
+
+### 19.6 Still unmeasured
+
+- **A user denying the permission prompt.** Every probe ran `bypassPermissions`. A `PreToolUse`
+  that is followed by a denial presumably raises no `PostToolUse`, which is another leak path,
+  but it was not observed.
+- **An interrupted command** (`interrupted: true` appears in every `tool_response` as `false`;
+  no probe produced a true).
+- **Whether the `backgroundTaskId` discriminator holds for tools other than `Bash`.** Only
+  `Bash` was probed here.
+- **Interactive, non-headless sessions**, and **Linux** — as everywhere else in this file.

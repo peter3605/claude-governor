@@ -175,8 +175,12 @@ type diagnosis struct {
 	reply doctorStatus
 	// hooks are the governor hook registrations found across every file that can hold one.
 	hooks []hookRef
-	// gate is the PreToolUse gate registration, if there is one. The matcher check reads it.
+	// gate is the PreToolUse gate registration, if there is one. Several checks read it.
 	gate *hookRef
+	// matched holds every registration that requires a matcher, by event. checkMatcher walks
+	// it so that a second matched hook is checked by construction rather than by somebody
+	// remembering to add a case.
+	matched map[string]*hookRef
 	// strayMinAge overrides how old a foreign daemon must be before checkStrayDaemons reports
 	// it. Zero means strayMinimumAge, which is what every caller outside a test leaves it at.
 	strayMinAge time.Duration
@@ -547,7 +551,7 @@ func (d *diagnosis) checkSessions() {
 		}
 		v := sessionVerdict{stat: s}
 		live = append(live, v)
-		switch g := classify(d.reply.statusResponse, s); g {
+		switch g := classifyGovernance(d.reply.statusResponse, s); g {
 		case govRegistered:
 			registered++
 		case govPreviousDaemon:
@@ -932,7 +936,7 @@ func ownerUID(fi os.FileInfo) (int, bool) {
 // hooks
 // ---------------------------------------------------------------------------
 
-// wantedHook is one of the five registrations of design.md section 4.1.
+// wantedHook is one of the six registrations of design.md section 4.1.
 //
 // The key is (event, args): an entry on the right event running the wrong subcommand is not
 // the hook it looks like. A SubagentStart wired to `governor release` would return leases at
@@ -941,13 +945,24 @@ func ownerUID(fi os.FileInfo) (int, bool) {
 type wantedHook struct {
 	event string
 	args  string
-	// matched is whether a matcher is required on this event, which is true only of the
-	// gate. checkMatcher does the judging; this only says whose matcher to judge.
-	matched bool
+	// covers is the set of tool names this hook's matcher must match, or nil when the event
+	// takes no matcher at all. checkMatcher does the judging; this only says what to judge
+	// the matcher against.
+	//
+	// It replaced a bool when GOV-15 added a second matched hook. The two matchers are not
+	// the same expression and must not be checked against one list: the gate has to cover
+	// every spawn name AND Bash, while finish only ever wants Bash. A shared list would have
+	// had doctor demand that PostToolUse match `Agent`, and an install satisfying it would
+	// put a socket round trip on the end of every subagent spawn for nothing.
+	covers []string
 }
 
+// matched reports whether this hook requires a matcher.
+func (w wantedHook) matched() bool { return len(w.covers) > 0 }
+
 var wantedHooks = []wantedHook{
-	{event: "PreToolUse", args: "gate", matched: true},
+	{event: "PreToolUse", args: "gate", covers: gatedToolNames},
+	{event: "PostToolUse", args: "finish", covers: []string{buildToolName}},
 	{event: "SubagentStart", args: "confirm"},
 	{event: "SubagentStop", args: "release"},
 	{event: "SessionStart", args: "session start"},
@@ -1066,7 +1081,7 @@ func gateHooksInstalledAt() time.Time {
 	return newest
 }
 
-// checkHooks reports whether all five hooks are registered and point at a binary that runs.
+// checkHooks reports whether all six hooks are registered and point at a binary that runs.
 func (d *diagnosis) checkHooks() {
 	sources, err := hookSources()
 	if err != nil {
@@ -1104,7 +1119,13 @@ func (d *diagnosis) checkHooks() {
 			missing = append(missing, w.event+" → governor "+w.args)
 			continue
 		}
-		if w.matched {
+		if w.matched() {
+			if d.matched == nil {
+				d.matched = map[string]*hookRef{}
+			}
+			d.matched[w.event] = ref
+		}
+		if w.event == "PreToolUse" {
 			d.gate = ref
 		}
 		switch {
@@ -1325,42 +1346,60 @@ func executableExists(path string) bool {
 // version, and SendMessage is a second spawn path GOV-28 added. A matcher that misses any of
 // the three leaves that path ungoverned.
 func (d *diagnosis) checkMatcher() {
-	if d.gate == nil {
+	for _, w := range wantedHooks {
+		if w.matched() {
+			d.checkOneMatcher(w)
+		}
+	}
+}
+
+// checkOneMatcher judges a single matched hook's matcher against the tool names it must cover.
+func (d *diagnosis) checkOneMatcher(w wantedHook) {
+	name := "matcher"
+	if w.event != "PreToolUse" {
+		// Two matchers means two findings, and a finding nobody can attribute to a hook is a
+		// finding nobody can fix.
+		name = "matcher:" + w.event
+	}
+	ref := d.matched[w.event]
+	if ref == nil {
 		// The hooks check has already failed and named the fix. A second failure here
 		// would be a second fix for one cause.
-		d.add("matcher", skip, "no PreToolUse gate hook registered (see hooks above)", "")
+		d.add(name, skip, fmt.Sprintf("no %s governor hook registered (see hooks above)", w.event), "")
 		return
 	}
-	want := strings.Join(spawnToolNames, "|")
+	want := strings.Join(w.covers, "|")
 
-	if d.gate.matcher == "" {
-		// An absent matcher is not a missing hook — the harness runs an unmatched
-		// PreToolUse for EVERY tool call. The gate would still fire on a spawn, so this is
-		// not silent in the dangerous direction; it is this binary executed on every Bash,
-		// Read and Edit in every session on the machine. design.md section 13.3 records the
-		// same hazard for the Phase 0 PostToolUse hook, where the matcher is called
-		// load-bearing rather than tidy.
-		d.add("matcher", fail,
-			"the PreToolUse gate hook has no matcher: it runs governor on every tool call in every session",
-			fmt.Sprintf("set \"matcher\": %q on that hook, or re-run: governor install", want))
+	fix := fmt.Sprintf("set \"matcher\": %q on that hook, or re-run: governor install", want)
+
+	if ref.matcher == "" {
+		// An absent matcher is not a missing hook — the harness runs an unmatched hook for
+		// EVERY tool call. The gate would still fire on a spawn, so this is not silent in
+		// the dangerous direction; it is this binary executed on every Bash, Read and Edit
+		// in every session on the machine. design.md section 13.3 records the same hazard
+		// for the Phase 0 PostToolUse hook, where the matcher is called load-bearing rather
+		// than tidy.
+		d.add(name, fail,
+			fmt.Sprintf("the %s governor hook has no matcher: it runs governor on every tool call in every session", w.event),
+			fix)
 		return
 	}
 
-	re, err := regexp.Compile(d.gate.matcher)
+	re, err := regexp.Compile(ref.matcher)
 	if err != nil {
 		// An uncompilable matcher is the silent case in full: nothing to match against, so
 		// nothing ever fires.
-		d.add("matcher", fail,
-			fmt.Sprintf("the PreToolUse matcher %q is not a valid expression (%v), so the gate never fires",
-				d.gate.matcher, err),
-			fmt.Sprintf("set \"matcher\": %q on that hook, or re-run: governor install", want))
+		d.add(name, fail,
+			fmt.Sprintf("the %s matcher %q is not a valid expression (%v), so that hook never fires",
+				w.event, ref.matcher, err),
+			fix)
 		return
 	}
 
 	var missed []string
-	for _, name := range spawnToolNames {
-		if !re.MatchString(name) {
-			missed = append(missed, name)
+	for _, tool := range w.covers {
+		if !re.MatchString(tool) {
+			missed = append(missed, tool)
 		}
 	}
 	if len(missed) > 0 {
@@ -1370,14 +1409,14 @@ func (d *diagnosis) checkMatcher() {
 		// that registering only Task "would have worked by luck", and a diagnostic that
 		// passes something for working by luck is a diagnostic that will pass it on the
 		// version where the luck runs out.
-		d.add("matcher", fail,
-			fmt.Sprintf("the PreToolUse matcher %q does not match %s — those spawns are never governed",
-				d.gate.matcher, strings.Join(missed, ", ")),
-			fmt.Sprintf("set \"matcher\": %q on that hook, or re-run: governor install", want))
+		d.add(name, fail,
+			fmt.Sprintf("the %s matcher %q does not match %s — that path is never governed",
+				w.event, ref.matcher, strings.Join(missed, ", ")),
+			fix)
 		return
 	}
-	d.add("matcher", pass,
-		fmt.Sprintf("%q matches %s", d.gate.matcher, strings.Join(spawnToolNames, ", ")), "")
+	d.add(name, pass,
+		fmt.Sprintf("%q matches %s", ref.matcher, strings.Join(w.covers, ", ")), "")
 }
 
 // ---------------------------------------------------------------------------
@@ -1419,7 +1458,7 @@ func (d *diagnosis) checkProtocol() {
 // binary what it is, by running it — the one subprocess in this file, bounded, and only ever
 // a path that this file has already established is a governor binary.
 func (d *diagnosis) checkBinary() {
-	// Only the binaries behind the five hooks of section 4.1. A governor command wired to
+	// Only the binaries behind the six hooks of section 4.1. A governor command wired to
 	// some other event by hand is the user's business and not evidence about the gate's
 	// build; counting it would report "the hooks point at 2 different binaries" for a
 	// perfectly good install with one extra hook in it.

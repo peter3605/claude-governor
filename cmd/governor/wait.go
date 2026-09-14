@@ -34,6 +34,10 @@ const denyCooloff = 5 * time.Second
 type waiter struct {
 	session string
 	depth   int
+	// req is the acquire this waiter is still asking for, carried whole so that the pump
+	// re-offers the SAME request — same kind, same weight — rather than a default one. A
+	// pump that rebuilt the request would hand a Heavy build an agent-sized lease.
+	req lease.Request
 	// granted has room for one lease and is written exactly once, by the pump, for a waiter
 	// it has just removed from the queue. Buffering it is what lets the pump hand over a
 	// lease without ever blocking on a waiter that has stopped listening.

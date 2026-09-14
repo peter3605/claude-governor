@@ -116,10 +116,13 @@ a test.
 // hooks/hooks.json
 {
   "hooks": {
-    "PreToolUse":    [{ "matcher": "Agent|Task|SendMessage",
+    "PreToolUse":    [{ "matcher": "Agent|Task|SendMessage|Bash",
                         "hooks": [{ "type": "command",
                                     "command": "${CLAUDE_PLUGIN_ROOT}/bin/governor gate",
                                     "timeout": 30 }] }],
+    "PostToolUse":   [{ "matcher": "Bash",
+                        "hooks": [{ "type": "command",
+                                    "command": "${CLAUDE_PLUGIN_ROOT}/bin/governor finish" }] }],
     "SubagentStart": [{ "hooks": [{ "type": "command",
                                     "command": "${CLAUDE_PLUGIN_ROOT}/bin/governor confirm" }] }],
     "SubagentStop":  [{ "hooks": [{ "type": "command",
@@ -145,6 +148,21 @@ tool addresses teammates and other sessions by name, so the gate leases only whe
 `tool_input.to` has the shape of an agent id — seventeen lowercase hex characters — and
 treats every other recipient as an ordinary message. A resume addressed by *name* is
 therefore not governed; that is a stated limit, and it fails open.
+
+`Bash` was added by GOV-15 and is the **second gated tool**, not a third spawn path. It is
+matched by name and then gated by *command*: `Bash` fires 184-2,221 times a day against the
+spawn path's 0-37, so `internal/classify` decides gate-side, before any I/O, whether the
+command is build-shaped (§5.5). Four calls in five are answered and dropped without a socket
+ever being opened — which is why the predicate has to be a pure function and not a question
+for the daemon.
+
+**`PostToolUse` is the sixth hook, and it exists only to return build leases.** Its matcher is
+`Bash` alone, deliberately: giving it the gate's matcher would run a hook on every subagent
+spawn to discover there was nothing to return. It takes **no** `timeout`, because it is the
+gate that can wait and this one never parks. What it can and cannot be trusted to do is
+measured in [hook-surface.md](hook-surface.md) §19 and folded into §4.3 and §5.6 — the short
+version is that it is absent when a command fails and arrives early when a command is
+backgrounded, so the reaper does more of this job than it does anywhere else.
 
 `timeout` is set explicitly rather than inherited: the default was measured at over 150 s with
 no established ceiling (§10.1), which is not a number to build a wait window on. 30 s gives the
@@ -220,6 +238,10 @@ patiently must not be shouted at on its next refusal.
 
 ### 4.3 Lease lifecycle
 
+There are two, because the two gated tools give the governor completely different evidence.
+
+**A subagent lease** — three events, and the middle one is a correlation problem:
+
 ```
 PreToolUse    → acquire TENTATIVE lease   ttl 30s, keyed by session_id
 SubagentStart → CONFIRM lease             bind agent_id + owning pid
@@ -227,6 +249,30 @@ SubagentStop  → release
 SessionEnd    → release all for session
 reaper (2s)   → drop leases past ttl, whose SESSION is gone, or whose owning pid is gone
 ```
+
+**A `Bash` lease** — two events, no correlation problem, and a release signal that cannot be
+trusted (§5.6, `hook-surface.md` §19):
+
+```
+PreToolUse    → acquire CONFIRMED lease   keyed by tool_use_id, ttl 300s
+PostToolUse   → release, IFF tool_response.backgroundTaskId is ABSENT
+SessionEnd    → release all for session
+reaper (2s)   → drop leases past ttl, or whose SESSION is gone
+```
+
+Three differences from the agent path, all of them measured rather than chosen:
+
+- **There is no tentative state, because there is nothing to confirm against.** No second
+  event announces that the command started. The lease is born confirmed.
+- **There is no FIFO correlation.** `PostToolUse` carries the *same* `tool_use_id` as its
+  `PreToolUse` — measured in every pairing observed — so the release is keyed exactly. This is
+  the one respect in which `Bash` is easier than `Agent`, whose `SubagentStart` carries no
+  `tool_use_id` at all.
+- **The `backgroundTaskId` guard is not defensive coding.** A `run_in_background` command and
+  a command that exceeded its `timeout` both raise `PostToolUse` *while still running* — the
+  first within ~50 ms of launch, the second at the timeout, after which the command is
+  backgrounded rather than killed. Releasing on those would hand back a slot to a build that
+  is still burning CPU, which is the precise failure this governor exists to prevent.
 
 > **This lifecycle was briefly believed to be broken in interactive use, and is not.** GOV-09
 > read a trace showing 62 `SubagentStop` records against zero `SubagentStart` across 25
@@ -295,6 +341,63 @@ dead agent's lease alive for as long as some unrelated process held its number.
 - Grant round-trip: **p99 < 15 ms**.
 - No config file parsing, no JSON schema validation, no DNS on the hot path. Read stdin,
   open the socket, write one line, read one line, exit.
+
+**Re-derived for `Bash`, GOV-15, and the rate that matters is not the one the story asked
+for.** GOV-15 clause 4 said to re-derive against a gate firing ~220× more often. GOV-14
+corrected that to ~11×, because the classifier removes 81.6% of `Bash` calls before any I/O.
+Both numbers are about **daemon round trips**, and re-deriving against either alone would have
+missed the thing that actually changed. There are now two rates, not one:
+
+| | per day, this machine | what it costs |
+|---|---|---|
+| gate **process** runs | 184–2,221 (every `Bash`) + 0–37 spawns | ~6 ms of process start, unavoidable |
+| `finish` **process** runs | 184–2,221 (every `Bash`) | ~5 ms of process start, unavoidable |
+| **daemon round trips** | 34–409 (the 18.4% that are build-shaped) | ~0.6 ms on top |
+
+The matcher fires on the tool name, so a process starts for *every* `Bash` call whatever the
+classifier then decides. Only the socket is filtered. That is the 11× figure's blind spot and
+it is the dominant cost by two orders of magnitude.
+
+**Measured on the real binary, macOS/arm64, 2026-09-14**, warm (§4.4's first-exec cost paid),
+`GOVERNOR_ENDPOINT` pointed at a live daemon and at an absent one:
+
+| Case | n | p50 | p95 | p99 |
+|---|---|---|---|---|
+| `gate`, cheap `Bash`, **no daemon contact** | 80 | 5.96 ms | 6.97 ms | 7.30 ms |
+| `gate`, build-shaped `Bash`, live daemon | 80 | 6.57 ms | 9.37 ms | 10.92 ms |
+| `finish`, live daemon | 80 | 6.72 ms | 8.46 ms | 9.78 ms |
+| `gate`, no daemon at all (fails open) | 60 | 5.74 ms | 6.94 ms | 7.20 ms |
+
+Four conclusions, and only one of them is comfortable.
+
+1. **The round trip is not the cost. Starting a process is.** A cheap command, where the
+   governor parses one JSON payload and runs a ~5 µs classifier, costs 5.96 ms — within noise
+   of doing nothing at all. Contacting the daemon adds ~0.6 ms on top. Every latency argument
+   about this hook is really an argument about `fork`+`exec`.
+2. **The p99 < 15 ms grant round-trip bound still holds, comfortably**, and is unchanged.
+   GOV-07 measured the in-process round trip at 130–170 µs p99 and nothing here moves it: the
+   daemon does the same work for a build lease as for a spawn.
+3. **The 100 ms connect deadline is not the continuous tax the traps field feared**, because
+   the commands that pay it are the 18.4% that are about to run a compiler. A `cat` never
+   opens a socket, so it cannot wait on one. `TestACheapCommandNeverContactsTheDaemon`
+   asserts exactly that, by failing on any dial rather than on any duration — a latency
+   assertion would pass on an implementation that asked the daemon about everything and was
+   merely fast about it.
+4. **The honest cost is ~11 ms of added latency on every `Bash` call**, gate plus finish, of
+   which the governor's own work is a rounding error. Over 2,221 calls that is ~24 s of CPU a
+   day, which is nothing in aggregate and perceptible on a single fast command. It is the
+   price of governing `Bash` at all with a hook-per-call harness, and it cannot be optimised
+   away from inside this binary — only by not registering the hook.
+
+**A refused build is a different event from a refused spawn**, and GOV-15 gave it its own
+text. Refusing a spawn means "do not delegate, do the work here": the work still happens.
+Refusing a `Bash` means the user's command **did not run**, and there is no inline alternative
+— nothing else on the machine can compile that package. So the build refusal says the command
+did not run, tells the model to run the *same* command again shortly, and explicitly does not
+tell it to find another way. Nor does it escalate into "stop retrying" the way the spawn text
+does: a retry is the correct response to a full build queue, and the gate parks a build for up
+to `wait_max` before it ever refuses one, so a refusal already means the machine stayed full
+for twenty seconds.
 
 The 100 ms is spent as **two nested deadlines**, settled in GOV-05:
 
@@ -527,24 +630,107 @@ Borrowed from TCP congestion control, and the right shape for the same reason: r
 headroom cautiously, give it back immediately.
 
 ```
-# every 2s, after sampling
-headroom = setpoint - util_ewma            # setpoint default 0.75
-queue_ok = loadavg1 / ncpu < 1.2
+# every tick, after sampling
+headroom = setpoint - util_ewma            # setpoint 0.75
+queue_ok = loadavg1 / usable_cores < 1.2
 
-if thermal != nominal:                B = B_min                # hard floor
+if thermal is serious or critical:    B = B_min                # hard floor
 elif util_ewma > setpoint + 0.05 or not queue_ok:
                                       B = max(B_min, B // 2)   # multiplicative decrease
 elif headroom > 0.10 and queue_ok and demand_waiting:
                                       B = min(B_max, B + 1)    # additive increase
 
 B_min = 1
-B_max = min(2 * performance_cores, 12)
+B_max = floor(usable_cores / 1.2)          # slots, one slot = one Medium build
 ```
 
 `demand_waiting` gates the increase: do not climb the budget when nobody is asking for a
 slot, or the first fan-out after an idle period arrives with an unearned budget.
 
-Tune `setpoint` against the Phase 0 traces, not by feel.
+**Built and tuned in GOV-15** (`internal/budget/aimd.go`). Every constant is derived from the
+312,515-sample Phase 0 trace and the reasoning is written at the constant, not here. Four
+things changed against the text above, and each is a finding rather than a preference.
+
+**The setpoint is 0.75 and the measurement's contribution was to show it barely matters.**
+The instruction was to tune it against the traces, which assumed the choice was sensitive. It
+is not, because host CPU on this machine is **bimodal**: p50 0.185, p90 0.425, then p95 0.728
+and p99 1.000. The machine is quiet or pegged, with little in between, so the share of time
+above a candidate setpoint moves by 1.5 points across the whole plausible range —
+5.93% at 0.60, 4.89% at 0.75, 4.46% at 0.85. The design's 0.75 is therefore **kept**, and
+kept for a reason. Retuning it to 0.71 would have been inventing a precision the distribution
+does not carry.
+
+**The run queue is doing more of the work than the setpoint, which is the opposite of what
+this section implied.** Over the same trace it is p50 0.351, p90 0.820, p95 2.946, p99
+**27.103**, max **49.620**. The 1.2 threshold sits just above the 90th percentile and fires on
+7.68% of samples against the setpoint's 4.89%. More importantly, CPU% saturates at 1.0 and
+stops carrying information, while a run queue of 27 per core does not — at the top of the
+range the run queue is the **only** signal still moving, which is exactly the state the loop
+exists for. 1.2 is the design's number and the measurement endorses it.
+
+**`B_max` could not be carried over, because it counted agents.** `min(2 × performance_cores,
+12)` was a statement about how many mostly-idle, I/O-bound things fit beside each other. A
+build is neither. The ceiling is now however many Medium builds fit in the cores this process
+may actually use — `floor(CPUCapacity / 1.2)`, which is 6 on this 8-core machine and 1 in a
+`--cpus=2` container. The old expression would have given 8 slots here, which is 9.6 cores of
+expected peak on a machine that has 8. `CPUCapacity` rather than the core count is
+load-bearing: a container limited to two cores on a 64-core host would otherwise be handed 53.
+
+**Thermal cuts at `serious` and above, not at any non-nominal state.** §5.3 demoted thermal to
+a backstop; GOV-15 was required to decide explicitly rather than inherit, and the decision is
+to narrow the trigger. Over 312,515 samples the state read `nominal` 97.15% of the time and
+`fair` 2.85%, and `serious` or `critical` **never** — not once in 101 hours including the
+busiest seconds on the machine. GOV-13 separately drove ten minutes of saturating 8-core load
+with loadavg peaking at 66 without the state leaving `nominal`, corroborated by `pmset -g
+therm` reporting no warning level. Flooring the budget on `fair` would throttle this machine
+to one slot for nearly three hours in every 101, on a reading that came with no corroborating
+evidence of throttling at all — and it would fire hardest during long builds, when it is most
+expensive. `signals.Thermal.Severe()` is the narrowed predicate; `Elevated()` is unchanged and
+still means what it always did. **It is honest to say this branch is, on this hardware, dead
+code carried for a different chassis.** A fanless Air is not a Mac Pro under sustained load,
+and a governor that deleted the check would have nothing to say on hardware that does throttle.
+
+**The loop steps at the sample rate — 1 Hz — not the 2 s this section used to say.** The
+sampler already ticks every second (§5.1) and a second cadence would be another timer for no
+benefit. The practical difference is climb speed: one slot per second, so floor to ceiling
+takes six seconds on this machine. Reactivity to noise is set by the EWMA window rather than
+by the tick rate.
+
+**The EWMA window stays at 5 s, and the trace says why.** Excursions above the setpoint are
+p50 **1 s**, p75 3 s, p90 8 s — but p99 87 s and max 7,709 s. A loop reacting to a raw sample
+would cut on the one-second transients, which are not a load problem and which make up most
+of the excursions by count; a 5 s window damps those while still reaching a long burst inside
+two ticks. The distribution is exactly the shape that justifies smoothing at all.
+
+**The budget starts at `B_max`, not at `B_min`.** The daemon is started lazily *by a gate*, so
+the moment it comes up is the moment somebody is trying to do something, and climbing one slot
+per tick from the floor would throttle an idle machine for several seconds for nothing.
+Starting high and cutting fast is the same asymmetry AIMD is built on.
+
+Replayed against 3,000 contiguous real samples — the window of the trace with the most
+setpoint crossings, run queue peaking at 49.6 per core — the budget took 6 distinct values,
+reversed direction on 1.4% of ticks, and spent 76% of that saturated window at the floor
+without becoming stuck there (`internal/budget/aimd_replay_test.go`).
+
+**Measured against a real fan-out, the loop controls and it over-controls.**
+[control-proof.md](control-proof.md) drove ten concurrent `go build -a` runs through a live
+daemon and the same load with no hooks at all. Governed, the machine admitted 1 build of 10,
+spent 4.8× less CPU on builds, and held the run queue to 4.22 per core against 11.93. Two
+things came out of it that belong here:
+
+- **Peak child cores cannot measure this and the acceptance criterion that named it was
+  wrong.** It came out *higher* with the governor on — 6.67 against 4.84 — because one build
+  alone gets the whole machine and compiles at full width, while ten at once thrash and
+  deliver less. The metric tracks how fast the machine is going, not how oversubscribed it is,
+  and it is bounded above by the core count. The run queue is the instrument that works, which
+  is the same conclusion the trace analysis above reached from the other direction.
+- **`RunQueueMax` is the binding constraint, not the setpoint.** One legitimate `go build -a`
+  alone drives the run queue to ~2.9 per core, over the 1.2 threshold, so the loop reaches the
+  floor within three ticks of the first build starting and `B_max` is unreachable in practice.
+  1.2 is right as a description of ordinary use (p90 0.820) and too tight as a control
+  threshold, and the two are different questions. Sweeping it needs measurements at several
+  values rather than a line edit, so the number is unchanged here and the diagnosis is
+  recorded instead.
 
 ### 5.3 Thermal
 
@@ -652,7 +838,72 @@ decision is not random; it is not the last word.
 
 **18.4% of calls taking a lease is a reduction, not cheapness.** It turns a 220× problem into
 roughly an 11× one. §4.4's performance budget was priced for a gate firing a few dozen times a
-week and must be re-derived against the 12× figure before `Bash` is actually gated.
+week and must be re-derived against the 11× figure before `Bash` is actually gated.
+
+### 5.6 How long a `Bash` lease lives, and why the reaper is the primary mechanism
+
+A subagent lease is returned by `SubagentStop`, and the TTL is a backstop for the rare lost
+event. **A `Bash` lease is not like that.** `hook-surface.md` §19 measured `PostToolUse` on
+`Bash` and found it wrong in both directions: absent when the command failed, and present while
+the command was still running when it was backgrounded or timed out. Invariant 2's posture —
+*assume the stop hooks never fire; leaks are the default outcome* — is, on this path, no longer
+a posture. It is the measured behaviour.
+
+**What actually returns a `Bash` lease:**
+
+| Outcome | Returned by | Slot held for |
+|---|---|---|
+| command succeeds | `PostToolUse` | its real runtime |
+| non-zero exit the harness interprets (`grep`, no match) | `PostToolUse` | its real runtime |
+| **command errors** — non-zero exit, failed compile, missing binary | **the reaper, at TTL** | the full TTL |
+| **`run_in_background: true`** | **the reaper, at TTL** | the full TTL |
+| **`timeout` exceeded** (backgrounded, not killed) | **the reaper, at TTL** | the full TTL |
+| session dies | `SessionEnd`, or the reaper's session check | — |
+
+Three of six rows are the reaper. A failing build is the *normal* state of a build under
+development, so this is not a tail case.
+
+**The TTL is therefore a control constant, not a safety margin, and it is set from
+measurement.** Over the corpus `tools/bashcorpus` collects — 20,614 `Bash` calls from 498
+transcripts, the same instrument and the same attribution GOV-14 used — the runtime of
+**foreground** calls the classifier gates:
+
+| | n | p50 | p90 | p99 |
+|---|---|---|---|---|
+| all foreground `Bash` | 20,261 | 1.7 s | 14.5 s | 227.7 s |
+| **gated** foreground | 3,699 | **6.4 s** | **57.5 s** | **360.7 s** |
+| gated, class Heavy | 858 | 18.1 s | 140.9 s | 602.0 s |
+
+Background calls are excluded from every row above, and must be: their recorded end is the
+launch receipt, not a completion, so their duration is not runtime. There were 353 of them,
+87 gated.
+
+The choice the table forces:
+
+| TTL | gated calls that outlive it |
+|---|---|
+| 30 s (`DefaultTentativeTTL`) | 662 — **17.9%** |
+| 60 s | 363 — 9.8% |
+| 120 s | 207 — 5.6% |
+| **300 s** | **51 — 1.4%** |
+| 600 s | 19 — 0.5% |
+
+**300 s.** The two errors are not symmetric and that is what picks the number. A TTL that is
+too *short* reaps a lease out from under a build that is still running, so the budget
+over-grants against real load — the governor's own failure mode, silent, and worst under
+exactly the heavy fan-out it exists to control. A TTL that is too *long* holds a slot after a
+failed build for up to five minutes, which costs throughput and is visible in `governor status`
+as a slot count that does not match reality.
+
+At 30 s the first error happens to nearly one build in five. At 300 s the second error is
+bounded by the failure rate of builds, decays on its own, and covers 98.6% of gated commands
+outright. Going further to 600 s buys 0.9 points of coverage for double the leak cost, which is
+the wrong side of the trade.
+
+**This does not make the reaper's session check less important — it makes it more.** A five
+minute TTL on a session that has been killed would hold slots for five minutes; the session-PID
+rule in §4.3 is what collects those in two seconds instead, and it applies to `Bash` leases
+exactly as it does to tentative agent ones.
 
 ---
 
@@ -824,7 +1075,7 @@ claude-governor/                  the repo
 
 ~/.claude/skills/claude-governor/ the installed plugin, written by `governor install`
 ├── .claude-plugin/plugin.json    name, version, description
-├── hooks/hooks.json              the five hooks in section 4.1
+├── hooks/hooks.json              the six hooks in section 4.1
 └── bin/governor                  the binary those hooks run
 
 state  → ~/.claude/governor/      sock, daemon.pid, daemon.log, daemon.start, statusline.json,
@@ -937,7 +1188,10 @@ one-directional check would have passed.
 (GOV-01), and RE-CONFIRMED against `2.1.270` on macOS/arm64, 2026-09-13 (GOV-30,
 [hook-surface.md](hook-surface.md) section 18).** All four facts below were re-measured on
 2.1.270 by GOV-01's own method and none of them moved; section 18 records what did change,
-none of it load-bearing for the gate. Raw payloads are in
+none of it load-bearing for the gate. **The `Bash` half of the surface — which GOV-15 gates —
+was measured separately on `2.1.270`, 2026-09-14, in [hook-surface.md](hook-surface.md)
+section 19**, and its conclusions are in §4.3 and §5.6 rather than below, because they are
+about release rather than about spawning. Raw payloads are in
 [hook-surface.md](hook-surface.md); this section is the conclusion only. Nothing below is
 inferred from documentation. A session that needs a detail not stated here MUST measure it
 and extend both files, not guess.
@@ -1053,7 +1307,17 @@ Named so they are not mistaken for settled:
 - Whether the observed `PreToolUse`/`SubagentStart` interleaving holds under machine load
   heavy enough to slow the harness itself. Phase 0's traces are the place to watch for it.
 - Whether `SubagentStart` fires for a subagent restored by session resume.
+- Whether a user **declining the permission prompt** suppresses `PostToolUse` — another `Bash`
+  lease leak path if it does. Every probe in `hook-surface.md` §19 ran `bypassPermissions`.
+- Whether the `backgroundTaskId` discriminator of §19.3 holds for tools other than `Bash`.
 - Linux: every measurement above is macOS. Re-run the probe on Linux before trusting §10 there.
+
+**No longer on this list, measured 2026-09-14 on 2.1.270 for GOV-15** (`hook-surface.md` §19):
+`PostToolUse` on `Bash` carries the same `tool_use_id` as its `PreToolUse`; it does **not** fire
+when the command errors; it fires as a launch receipt within ~50 ms for `run_in_background`; a
+command that exceeds its `timeout` is backgrounded rather than killed and its `PostToolUse`
+carries `timedOutAfterMs` beside `backgroundTaskId`; and a background task's completion raises
+no event of any kind.
 
 ### 10.4 The surface is re-confirmed continuously, not re-asserted
 
@@ -1303,7 +1567,7 @@ Uninstall is only verifiable if this list is exhaustive, so it is normative.
 | Path | Written by | Removed by |
 |---|---|---|
 | `~/.claude/skills/claude-governor/.claude-plugin/plugin.json` | install | uninstall |
-| `~/.claude/skills/claude-governor/hooks/hooks.json` (the five hooks) | install | uninstall |
+| `~/.claude/skills/claude-governor/hooks/hooks.json` (the six hooks) | install | uninstall |
 | `~/.claude/skills/claude-governor/bin/governor` | install, copied from the running binary | uninstall |
 | `~/.claude/skills/` | install, only if absent | uninstall, only if it empties |
 | `~/.claude/settings.json` (`statusLine` key only) | install, merged | uninstall, previous value restored from backup |
