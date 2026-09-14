@@ -514,6 +514,15 @@ figure — the same answer a non-cgroup machine gives.
 
 ### 5.2 AIMD
 
+> **`B` is no longer a count of agents.** Phase 0 measured agent cost to be small and
+> near-constant while build cost is zero almost always and occasionally enormous, so the
+> quantity this loop rations moved to build and test concurrency (docs/phase-0-findings.md §7,
+> and §5.5 below for what now takes a lease). **The mechanism in this section is unchanged and
+> is inherited wholesale** — additive increase, multiplicative decrease, the thermal floor and
+> the `demand_waiting` guard all survive the pivot untouched; only the variable moved. Re-aiming
+> the loop and re-deriving its constants is GOV-15's work, and the constants below have not yet
+> been re-derived against build slots.
+
 Borrowed from TCP congestion control, and the right shape for the same reason: reclaim
 headroom cautiously, give it back immediately.
 
@@ -597,6 +606,53 @@ Raw host CPU% cannot tell a build from Chrome. Sum CPU across the `claude` proce
 its children, divide by the count of confirmed leases, and you have a live estimate of the
 marginal cost of one more agent — so `B = headroom / cost_per_agent` predicts instead of
 reacting. Build this only after Phase 0 shows the per-agent cost is real and measurable.
+
+### 5.5 Classification: which `Bash` is build-shaped
+
+Phase 0 moved the control variable from agent count to build and test concurrency (§7 of
+docs/phase-0-findings.md). That makes `Bash` the gated tool, and `Bash` fires 184–2,221 times a
+day against the gate's 0–37. **Leasing per call is not an option, so a predicate is required,
+and the predicate is the hard half — pointing the matcher at `Bash` is the easy one.**
+
+`internal/classify` is that predicate. It is a pure function of the command text with no I/O,
+called **gate-side before the daemon is contacted**, because the obvious alternative — ask the
+daemon about every command and let it answer "not gated" — is a socket round trip on `cat`.
+
+**The measured behaviour, from docs/bash-corpus.md, which is normative for anything built on
+top of it:**
+
+| | |
+|---|---|
+| Catch rate | 53.0% of expensive commands (35.2% held out) |
+| False positives | 35.7% of cheap commands (28.8% held out) |
+| Gated share | 18.4% of all `Bash` calls |
+| Cost captured | 78.6% of measured child core-seconds |
+| Cost of classifying | ~5 µs per call |
+
+"Expensive" is **peak child cores ≥ 1.0** during the command. Peak, not mean: a cold
+`go test ./...` measures 0.06 cores *mean* over 44 s because compilation is bursty and test
+binaries then block on I/O, and a loop protecting against saturation must size work by its
+peak.
+
+**The ceiling is the number to design against.** Of 115 expensive commands, 61 name a
+recognisable build tool and **all 61 are caught**; 54 name none and **none is caught**. The
+misses are ad-hoc `python3` scripts, a pathological `grep` over a 100 MB binary, a `DerivedData`
+sweep. No table edit reaches them, and a predicate that tried would have to gate `grep`. If a
+later story needs that 47%, the mechanism is reacting to observed load after a command starts —
+not a better predicate.
+
+**Cost classes are a prior, not a constant.** `Class.ExpectedPeakCores()` returns 0.1 / 1.2 /
+4.5 cores for Light / Medium / Heavy, from measured p90 peaks. They are a floor: the window
+under-represents heavy modes. And they cannot be right everywhere, because **the same tool is
+not the same cost in two repositories** — `uv run pytest` in one project here is expensive in
+0.7% of 148 calls, while `python -m pytest` in another is among the most expensive commands on
+the machine. A per-host table keyed on command shape, seeded from these classes and corrected
+from what the sampler observes, is the design this points at. The seed exists so the first
+decision is not random; it is not the last word.
+
+**18.4% of calls taking a lease is a reduction, not cheapness.** It turns a 220× problem into
+roughly an 11× one. §4.4's performance budget was priced for a gate firing a few dozen times a
+week and must be re-derived against the 12× figure before `Bash` is actually gated.
 
 ---
 
