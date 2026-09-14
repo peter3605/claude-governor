@@ -41,7 +41,7 @@ import (
 // at once (GOV-14 lands AIMD). Max-min fair share (section 6.1) is also still absent: the
 // wait queue below decides *order* and does not yet decide who may join it.
 
-// defaultBudget is how many concurrent agents the daemon allows until the control loop
+// defaultBudget is how many slots the daemon allows until the control loop
 // exists.
 //
 // This number is arbitrary and provisional. It is NOT a measured default and must not be
