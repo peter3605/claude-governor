@@ -632,7 +632,7 @@ headroom cautiously, give it back immediately.
 ```
 # every tick, after sampling
 headroom = setpoint - util_ewma            # setpoint 0.75
-queue_ok = loadavg1 / usable_cores < 1.2
+queue_ok = loadavg1 / usable_cores < 2.0
 
 if thermal is serious or critical:    B = B_min                # hard floor
 elif util_ewma > setpoint + 0.05 or not queue_ok:
@@ -660,13 +660,17 @@ above a candidate setpoint moves by 1.5 points across the whole plausible range 
 kept for a reason. Retuning it to 0.71 would have been inventing a precision the distribution
 does not carry.
 
-**The run queue is doing more of the work than the setpoint, which is the opposite of what
-this section implied.** Over the same trace it is p50 0.351, p90 0.820, p95 2.946, p99
-**27.103**, max **49.620**. The 1.2 threshold sits just above the 90th percentile and fires on
-7.68% of samples against the setpoint's 4.89%. More importantly, CPU% saturates at 1.0 and
-stops carrying information, while a run queue of 27 per core does not — at the top of the
-range the run queue is the **only** signal still moving, which is exactly the state the loop
-exists for. 1.2 is the design's number and the measurement endorses it.
+**The run queue does more of the work than the setpoint in ordinary use, and none of it under
+build load — GOV-31 measured both.** Over the trace the run queue is p50 0.352, p90 0.813,
+p95 2.664, p99 **24.584**, max **49.620**, and a threshold there fires on more of the trace
+than the setpoint does (5.62% at 2.0 against the setpoint's 4.27%). CPU% saturates at 1.0 and
+stops carrying information while a run queue of 25 per core does not, which is the property
+§5.1 wants from it. **But under a build fan-out CPU is pegged at p50 1.00 and is over
+`setpoint + 0.05` on 72–99% of ticks, so the CPU disjunct decides every cut and the run-queue
+threshold decides none of them.** Five values of the threshold from 1.2 to 6.0, measured twice
+under the same ten-way fan-out, produced no difference the experiment could detect. Both
+statements are kept because the loop meets both kinds of load; see
+[run-queue-sweep.md](run-queue-sweep.md).
 
 **`B_max` could not be carried over, because it counted agents.** `min(2 × performance_cores,
 12)` was a statement about how many mostly-idle, I/O-bound things fit beside each other. A
@@ -732,13 +736,23 @@ things came out of it that belong here:
   deliver less. The metric tracks how fast the machine is going, not how oversubscribed it is,
   and it is bounded above by the core count. The run queue is the instrument that works, which
   is the same conclusion the trace analysis above reached from the other direction.
-- **`RunQueueMax` is the binding constraint, not the setpoint.** One legitimate `go build -a`
-  alone drives the run queue to ~2.9 per core, over the 1.2 threshold, so the loop reaches the
-  floor within three ticks of the first build starting and `B_max` is unreachable in practice.
-  1.2 is right as a description of ordinary use (p90 0.820) and too tight as a control
-  threshold, and the two are different questions. Sweeping it needs measurements at several
-  values rather than a line edit, so the number is unchanged here and the diagnosis is
-  recorded instead.
+- **`RunQueueMax` was diagnosed as the binding constraint. GOV-31 swept it and the diagnosis
+  was wrong.** The threshold is now **2.0**, raised from 1.2, but the change is small and the
+  reason for it is not the one predicted. One `go build -a` alone measures **1.22** run queue
+  per core on a settled machine, not the ~2.9 recorded here — that figure was read off a
+  ten-way fan-out arm. So 1.2 was too tight by 2%, not by a factor of two to three. The sweep
+  itself found the threshold's value undetectable between 1.2 and 6.0 under build load, because
+  the setpoint binds there instead; 2.0 is chosen from the ordinary-use distribution and the
+  concurrency curve, and it costs 1.92 points of trace coverage to buy a single Medium build
+  that no longer floors the budget. `loadavg1` is also a one-minute average and a build runs
+  eight seconds, so this signal cannot see a short build at all — a limit of the instrument
+  that no choice of number fixes. [run-queue-sweep.md](run-queue-sweep.md) carries the
+  experiment, the daemon logs and the curve.
+- **The open question GOV-31 leaves behind is the loop's shape, not its constants.** Under
+  build load the budget cannot climb back at all, because the increase branch requires CPU
+  below `setpoint - 0.10` = 0.65 and a build never leaves CPU that low. A fan-out therefore
+  floors the budget and pins it there until the load drains. Whether that is control or
+  over-control is a question about `setpoint` and the headroom together, and it is not settled.
 
 ### 5.3 Thermal
 

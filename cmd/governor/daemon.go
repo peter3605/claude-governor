@@ -723,11 +723,37 @@ func (d *daemon) observeThisMachine() {
 	// The loop is wired here and nowhere else, beside the sampler that feeds it. A daemon
 	// built by a test has neither, and so keeps the fixed budget it was constructed with —
 	// which is what lets a lease test assert against a number it chose.
-	d.loop = &budget.Controller{}
+	d.loop = &budget.Controller{RunQueueMax: runQueueMaxOverride(d.diag)}
 	d.sources = []budget.Source{budget.LocalSource{
 		Live:  d.liveBudget,
 		InUse: d.table.InUse,
 	}}
+}
+
+// runQueueMaxEnv overrides internal/budget.RunQueueMax for one daemon.
+//
+// EXPERIMENT SURFACE, NOT A TUNING SURFACE. tools/sweep sets it to measure the threshold
+// under load; nothing in the shipped product reads it, `governor calibrate` does not write
+// it, and an unset or unparseable value leaves the compiled-in constant alone. It is here
+// because a constant cannot be swept, and the alternative — rebuilding the binary per arm —
+// is the kind of method a person who was not there cannot reproduce.
+const runQueueMaxEnv = "GOVERNOR_RUNQUEUE_MAX"
+
+// runQueueMaxOverride reads that variable. A malformed value is reported and ignored rather
+// than defaulted to zero, because silently governing at the wrong threshold is how a sweep
+// produces a confident wrong number.
+func runQueueMaxOverride(diag io.Writer) float64 {
+	raw := strings.TrimSpace(os.Getenv(runQueueMaxEnv))
+	if raw == "" {
+		return 0
+	}
+	v, err := strconv.ParseFloat(raw, 64)
+	if err != nil || v <= 0 {
+		fmt.Fprintf(diag, "governor daemon: ignoring %s=%q: want a positive number\n", runQueueMaxEnv, raw)
+		return 0
+	}
+	fmt.Fprintf(diag, "governor daemon: %s=%g overriding the compiled-in run-queue threshold of %g\n", runQueueMaxEnv, v, budget.RunQueueMax)
+	return v
 }
 
 // liveBudget is the controller's current answer, read under the daemon's signals lock
