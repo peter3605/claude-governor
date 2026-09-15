@@ -57,8 +57,23 @@ type Reading struct {
 // that the data cannot support. Reporting a tuned value here — 0.71, say — would be inventing
 // a precision the distribution does not have.
 //
-// What this does mean is that RunQueueMax below is doing more of the work than the setpoint
-// is, which is the opposite of what section 5.2 implied.
+// WHAT THIS PARAGRAPH USED TO CONCLUDE WAS TRUE OF THE TRACE AND FALSE OF BUILD LOAD, and
+// GOV-31 measured the difference. It said RunQueueMax was "doing more of the work than the
+// setpoint is". Over the Phase 0 trace that holds — ordinary use is above this setpoint on
+// 4.27% of samples and above the run-queue threshold on more. Under a build fan-out it is
+// exactly backwards: host CPU sits at p50 1.00 and is over Setpoint+SetpointBand on 72-99% of
+// ticks, so THIS constant decides every cut and the run-queue threshold decides none of them.
+//
+// The two regimes disagree because CPU is bimodal, and a build is the upper mode. Both
+// statements are kept because the loop meets both kinds of load, and a reader tuning either
+// constant needs to know which regime the number in front of them came from.
+// docs/run-queue-sweep.md section 3 has the daemon logs that show the cut happening.
+//
+// THE PRACTICAL CONSEQUENCE IS NOT A NEW SETPOINT. It is that the budget cannot climb back
+// while any build is running, because the increase branch requires CPU below
+// Setpoint-Headroom = 0.65. On this machine that means a fan-out floors the budget and pins it
+// there until the load drains. Whether that is correct behaviour or an over-control is a
+// question about this constant and Headroom together, and it is not settled here.
 const Setpoint = 0.75
 
 // SetpointBand is how far above Setpoint utilisation must go before the budget is halved.
@@ -76,22 +91,52 @@ const Headroom = 0.10
 
 // RunQueueMax is the run-queue-per-core above which the budget is halved.
 //
-// MEASURED, AND IT IS THE SIGNAL THAT ACTUALLY DISCRIMINATES. Over the same 312,515 samples
-// the run queue is p50 0.351, p90 0.820, p95 2.946, p99 27.103, max 49.620. Two things follow.
+// RAISED FROM 1.2 TO 2.0 BY GOV-31, and the sweep that raised it also found that this
+// constant matters far less than section 5.2 assumed. docs/run-queue-sweep.md is the
+// evidence; the short version is in three parts.
 //
-// First, 1.2 sits just above the 90th percentile, so it fires on genuinely loaded moments and
-// not on ordinary work — 7.68% of samples, against 4.89% for CPU over the setpoint. It is
-// catching contention that CPU% misses, which is exactly the job section 5.1 gives it.
+// FIRST, WHAT IT COSTS AND BUYS IN ORDINARY USE. Re-counted over the Phase 0 trace — 379,915
+// host samples, p50 0.352, p90 0.813, p95 2.664, p99 24.584, max 49.620, materially the same
+// distribution GOV-15 read off 312,515 of them — the share of ordinary samples a candidate
+// threshold fires on is:
 //
-// Second, and this is why the threshold is not raised: the tail is enormous. A run queue of
-// 27 per core at p99, and 49.6 at maximum, is a machine with hundreds of runnable threads on
-// eight cores. CPU% cannot express that at all — it saturates at 1.0 and stops carrying
-// information — so at the extreme end the run queue is the ONLY signal that still moves.
-// Raising this threshold would blind the loop in precisely the state it exists for.
+//	> 1.2   7.54%   <- was here
+//	> 1.5   6.51%
+//	> 2.0   5.62%   <- now here
+//	> 2.5   5.13%
+//	> 3.0   4.76%
+//	> 6.0   3.75%
 //
-// 1.2 is the design's number and the measurement endorses it, which is worth recording as
-// plainly as a correction would be.
-const RunQueueMax = 1.2
+// against 4.27% for CPU over the setpoint. So 2.0 gives up 1.92 points of coverage, which is
+// the same order as the 1.5 points that span the setpoint's ENTIRE plausible range and that
+// GOV-15 judged too small to tune on. It keeps the run-queue test firing on more of the trace
+// than the CPU test does, which is what makes it worth having at all.
+//
+// SECOND, WHY NOT ITS NEIGHBOURS. 1.5 clears one build's measured pressure by only 23%, and a
+// developer machine with a slightly busier baseline re-creates the defect this story was filed
+// for. From 2.5 upward the firing rate converges on the CPU test's own 4.27%, so the run-queue
+// test stops carrying independent information in the one regime where it is currently doing
+// the work; and 3.0 is above what THREE concurrent builds produce at p50 (2.55 measured), so
+// three builds on an eight-core machine would never trip it.
+//
+// THIRD, AND MOST IMPORTANTLY, THIS CONSTANT IS NEARLY INERT UNDER BUILD LOAD — which is the
+// regime the governor exists for, and the reason the sweep GOV-31 asked for came back empty.
+// Five values from 1.2 to 6.0, measured twice under the same ten-way fan-out, produced no
+// difference the experiment could detect: build CPU 205.2, 188.7, 194.2, 202.6 core-seconds
+// against a run-to-run variance on a FIXED threshold of 30%. The cause is measured rather than
+// argued. A fan-out pegs host CPU, so `CPU > Setpoint+SetpointBand` is true on 72-99% of ticks
+// and decides the cut on its own, while the increase needs CPU below 0.65 and so cannot fire
+// at all while a build runs. The run-queue test is shadowed on both sides.
+//
+// THE FIGURE THIS STORY WAS FILED ON WAS WRONG, and correcting it is why the change is small.
+// GOV-15 reported one `go build -a` driving the run queue to ~2.9 per core on its own, making
+// 1.2 "too tight by a factor of two to three". Measured on a settled machine it is 1.22 — over
+// 1.2, but by 2%. The 2.9 was read off a ten-way fan-out arm. Worse, `loadavg1` is a
+// one-minute decaying average and one build runs eight seconds, so most of that 1.22 is the
+// machine's baseline rather than the build: the signal cannot see a short build at all. Any
+// threshold here is a statement about SUSTAINED load, which is a property of the instrument
+// and not something a different number fixes.
+const RunQueueMax = 2.0
 
 // NominalTicksBeforeIncrease is the hysteresis on the way back up from a thermal cut
 // (design.md section 5.3): require clean ticks before the additive increase resumes, so the
@@ -129,6 +174,19 @@ type Controller struct {
 	// host whose capacity has not been read yet.
 	Max int
 
+	// RunQueueMax overrides the package constant of the same name. Zero means use the
+	// constant, which is what every caller outside the sweep harness does.
+	//
+	// IT EXISTS SO THE THRESHOLD CAN BE SWEPT, and for no other reason. GOV-31 had to
+	// measure four values of it under the same load, which is impossible while it is a
+	// compile-time constant; tools/sweep sets it through the daemon's GOVERNOR_RUNQUEUE_MAX
+	// environment variable. It is deliberately NOT part of internal/config: config is the
+	// surface `governor calibrate` writes, and putting a knob there asserts that the right
+	// value is host-dependent, which is a claim the sweep has to earn. So it stays an
+	// experiment-only escape hatch until a measurement says otherwise; see
+	// docs/run-queue-sweep.md for what the sweep concluded about host dependence.
+	RunQueueMax float64
+
 	b int
 	// clean counts consecutive ticks with no severe thermal state, for the hysteresis.
 	clean int
@@ -157,6 +215,15 @@ func (c *Controller) start() int {
 		return Floor
 	}
 	return c.Max
+}
+
+// runQueueMax is the threshold this controller cuts at: the field if it was set, the
+// package constant otherwise.
+func (c *Controller) runQueueMax() float64 {
+	if c.RunQueueMax > 0 {
+		return c.RunQueueMax
+	}
+	return RunQueueMax
 }
 
 // Step advances the loop by one tick and returns the new budget.
@@ -200,7 +267,7 @@ func (c *Controller) Step(r Reading) int {
 		// that does throttle.
 		c.b = Floor
 		c.clean = 0
-	case r.CPU > Setpoint+SetpointBand || r.RunQueue > RunQueueMax:
+	case r.CPU > Setpoint+SetpointBand || r.RunQueue > c.runQueueMax():
 		c.clean++
 		c.b = c.b / 2
 		if c.b < Floor {
@@ -211,7 +278,7 @@ func (c *Controller) Step(r Reading) int {
 		// for three consecutive ticks, so the budget does not oscillate against the
 		// platform's own governor (design.md section 5.3).
 		c.clean++
-	case Setpoint-r.CPU > Headroom && r.RunQueue <= RunQueueMax && r.DemandWaiting:
+	case Setpoint-r.CPU > Headroom && r.RunQueue <= c.runQueueMax() && r.DemandWaiting:
 		// DemandWaiting gates the increase: do not climb when nobody is asking, or the first
 		// fan-out after an idle period arrives with an unearned budget.
 		if c.b < max {

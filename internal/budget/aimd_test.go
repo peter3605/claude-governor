@@ -247,3 +247,93 @@ func min(a, b int) int {
 	}
 	return b
 }
+
+// ---------------------------------------------------------------------------
+// GOV-31: what one build actually does to the loop
+// ---------------------------------------------------------------------------
+
+// oneMediumBuild is one `go build -a ./...` running alone on a settled 8-core machine.
+//
+// MEASURED, and the measurement corrects the figure this story was filed on. GOV-15 reported
+// that one build drives the run queue to ~2.9 per core on its own, and GOV-31 was filed to
+// raise the threshold on that basis. Measured properly — one build, nothing else running, the
+// machine settled below 0.8 first — it is 1.22 (p50, p90 and max all 1.22), with host CPU at
+// p50 0.77. See docs/run-queue-sweep.md section 4. The 2.9 was read off a ten-way fan-out
+// arm, not off one build.
+//
+// One build is Medium by internal/classify's table (`"go": Medium`), which is what makes it
+// the reading clause 5 asks about.
+func oneMediumBuild() tick { return tick{cpu: 0.77, runQueue: 1.22, demand: true} }
+
+// TestOneMediumBuildsRunQueueDoesNotFloorTheBudget is GOV-31 clause 5's regression: the
+// specific failure the story was filed for must not come back silently.
+//
+// It supplies ONLY the run-queue pressure of one Medium build, holding CPU below the cut, so
+// that it tests the thing the clause names rather than passing or failing for a reason next
+// door. With the threshold where it is, one build's 1.22 is 2% over 1.2 and does cut — which
+// is the defect, in the direction GOV-31 claimed and roughly twenty times smaller than it
+// estimated.
+func TestOneMediumBuildsRunQueueDoesNotFloorTheBudget(t *testing.T) {
+	c := &Controller{Max: MaxSlots(8)}
+	b := oneMediumBuild()
+	// CPU held under the cut so that the run queue is the only thing that can fire. The
+	// measured p50 of 0.77 is itself under Setpoint+SetpointBand; see the sibling test for
+	// what happens at the measured distribution rather than its median.
+	for i := 0; i < 20; i++ {
+		c.Step(Reading{CPU: 0.60, RunQueue: b.runQueue, DemandWaiting: true})
+	}
+	if got := c.Budget(); got <= Floor {
+		t.Errorf("one Medium build's run-queue pressure (%.2f per core, measured) drove the "+
+			"budget to %d against a ceiling of %d: a single build must not exhaust the "+
+			"machine's whole build concurrency (GOV-31 clause 5, docs/run-queue-sweep.md)",
+			b.runQueue, got, MaxSlots(8))
+	}
+}
+
+// TestUnderBuildLoadTheSetpointBindsAndTheRunQueueDoesNot pins the finding that made GOV-31's
+// sweep come back empty, so that a later session does not re-run it expecting a different
+// answer.
+//
+// The loop cuts on `CPU > Setpoint+SetpointBand` OR `RunQueue > RunQueueMax`. Measured across
+// a ten-way fan-out, host CPU sits at p50 1.00 and is above the cut on 72-99% of ticks
+// (docs/run-queue-sweep.md sections 2 and 4), so the CPU disjunct decides and the run-queue
+// threshold is shadowed. Five values of RunQueueMax from 1.2 to 6.0, measured twice under the
+// same load, produced no difference the experiment could detect.
+//
+// The test states that as a property: at build-load CPU, the budget floors identically no
+// matter what the run-queue threshold is.
+func TestUnderBuildLoadTheSetpointBindsAndTheRunQueueDoesNot(t *testing.T) {
+	// The measured fan-out reading: CPU pegged, run queue well under even a raised threshold.
+	const fanOutCPU, fanOutRunQueue = 1.00, 2.5
+
+	var floors []int
+	for _, threshold := range []float64{1.2, 2.0, 3.0, 4.5, 6.0} {
+		c := &Controller{Max: MaxSlots(8), RunQueueMax: threshold}
+		for i := 0; i < 20; i++ {
+			c.Step(Reading{CPU: fanOutCPU, RunQueue: fanOutRunQueue, DemandWaiting: true})
+		}
+		floors = append(floors, c.Budget())
+	}
+	for i, got := range floors {
+		if got != Floor {
+			t.Errorf("threshold %d of the sweep settled at %d, want the floor %d", i, got, Floor)
+		}
+	}
+
+	// And the other half of the same finding: it cannot climb back either, because the
+	// increase needs CPU below Setpoint-Headroom = 0.65, which never happens while a build
+	// runs. Without this the reader could conclude the cut was transient.
+	c := &Controller{Max: MaxSlots(8), RunQueueMax: 6.0}
+	for i := 0; i < 20; i++ {
+		c.Step(Reading{CPU: fanOutCPU, RunQueue: fanOutRunQueue, DemandWaiting: true})
+	}
+	for i := 0; i < 50; i++ {
+		// Run queue now far below the threshold, CPU still pegged as it is throughout a build.
+		c.Step(Reading{CPU: fanOutCPU, RunQueue: 0.1, DemandWaiting: true})
+	}
+	if got := c.Budget(); got != Floor {
+		t.Errorf("budget recovered to %d with CPU still at %.2f; the increase requires CPU "+
+			"below %.2f, so a build fan-out should pin it at the floor", got, fanOutCPU,
+			Setpoint-Headroom)
+	}
+}
