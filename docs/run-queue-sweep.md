@@ -290,6 +290,35 @@ does not. `TestOneMediumBuildsRunQueueDoesNotFloorTheBudget` pins that.
   two builds' peaks (p90 2.72) and three builds' p50 (2.55). It tolerates the states the slot
   ceiling already governs and begins reacting as the machine goes past them.
 
+### The trade in the terms GOV-31 clause 3 names
+
+The clause asks for the chosen threshold's cost in contention and its gain in throughput,
+against its neighbours. Stated directly, from pass 2:
+
+| | 1.2 | **2.0** | 3.0 | 4.5 |
+|---|---|---|---|---|
+| contention, run queue p50 | 6.12 | **8.04** | 10.20 | 9.44 |
+| throughput, builds completed | 10/10 | **10/10** | 10/10 | 10/10 |
+| throughput, drain time | 80.4 s | **79.0 s** | 83.1 s | 82.7 s |
+| build CPU admitted, core-sec | 205.2 | **188.7** | 194.2 | 202.6 |
+
+**Every one of those differences is smaller than the variance of the same threshold measured
+twice** — 147.3 against 194.2 core-seconds at 3.0, 135.0 against 99.1 at 6.0. So the answer
+clause 3 asks for is that the cost is zero and the gain is zero, to the resolution this
+experiment can reach, and that answer is the same for every candidate in the range.
+
+This is worth stating plainly rather than dressing up: **the trade the clause was written to
+elicit does not exist in the fan-out regime**, because the threshold is not what decides
+anything there (§3). The argument above for 2.0 is therefore made from the ordinary-use
+distribution and the concurrency curve. That is a weaker footing than the clause intended, and
+it is the reason this document spends more words on why the sweep found nothing than on the
+value it settled.
+
+What the choice is emphatically *not* justified by is "it sits above the p90 of ordinary use",
+which the clause rules out by name — and rightly, since that is the reasoning that produced
+1.2. The binding reason for 2.0 is a measured fact about builds: one Medium build produces
+1.22, and the threshold must sit above it.
+
 ### The honest caveat on all of that
 
 **Under build load this constant is nearly inert at any of those values**, and the sweep is
