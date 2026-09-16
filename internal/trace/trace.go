@@ -29,6 +29,7 @@ const StateDirEnv = "GOVERNOR_STATE_DIR"
 const (
 	KindAgent  = "agent"
 	KindSample = "sample"
+	KindBuild  = "build"
 )
 
 // Record is one line of the log.
@@ -48,6 +49,53 @@ type Record struct {
 
 	Agent  *Agent  `json:"agent,omitempty"`
 	Sample *Sample `json:"sample,omitempty"`
+	Build  *Build  `json:"build,omitempty"`
+}
+
+// Build is one gated Bash command, as the gate decided it.
+//
+// WHY THIS EXISTS, given that daemon.log already records parks and denials. It records the
+// opposite thing: daemon.log is written only when the budget MOVES OR BINDS (design.md §4.5),
+// so an ordinary grant leaves no trace anywhere. That is the right rule for a log about the
+// budget and the wrong one for GOV-17, whose clause 3 has to notice a session that stopped
+// running its tests — an absence, which is invisible in a log that only records friction.
+//
+// It is also the only place the fail-open outcomes are visible at all. When the daemon is
+// unreachable the build RUNS, ungoverned, and the daemon by definition records nothing about
+// it. A window scored from daemon.log alone would count those as "no builds", which is the
+// exact inversion of what happened.
+type Build struct {
+	// SessionID identifies the Claude Code session.
+	SessionID string `json:"session_id"`
+	// Shapes are the gated invocations, as "bin" or "bin sub" — classify.Result.Shapes.
+	// Names only, never arguments; the closed vocabulary is enforced there and tested there.
+	Shapes []string `json:"shapes,omitempty"`
+	// Class is the cost class: medium or heavy. Never light — a light command is not gated
+	// and never reaches this record.
+	Class string `json:"class"`
+	// Weight is the slots the gate asked for, from budget.SlotsFor.
+	Weight float64 `json:"weight"`
+	// Outcome is what happened to the command, and the vocabulary is closed:
+	//
+	//	granted       a lease was issued immediately. The build ran.
+	//	parked        the daemon held the request and then granted it. The build ran late.
+	//	denied        the gate emitted a deny. The build did NOT run.
+	//	failed-open   no usable answer — no daemon, a version mismatch, an unrecognised
+	//	              refusal, an expired budget. The build ran, ungoverned.
+	//
+	// THE SPLIT THAT MATTERS IS granted/parked/failed-open VERSUS denied, because the first
+	// three are builds that happened and the last is one that did not. Counting "test-suite
+	// runs" means counting the first three. Merging failed-open into granted would hide the
+	// ungoverned ones; merging it into denied would count a build that ran as one that was
+	// stopped.
+	Outcome string `json:"outcome"`
+	// WaitedMS is how long a parked build waited before it was granted. Zero otherwise.
+	WaitedMS float64 `json:"waited_ms,omitempty"`
+	// Why carries the fail-open or denial reason, for reading a window that went wrong.
+	// It is a reason string this binary produced, never anything from the payload.
+	Why string `json:"why,omitempty"`
+	// CWD is the session's working directory, which is what attributes a build to a project.
+	CWD string `json:"cwd,omitempty"`
 }
 
 // Agent is a subagent lifecycle observation: SubagentStart, SubagentStop, Stop, or
@@ -152,12 +200,19 @@ type Sample struct {
 
 // RecordV is the current record schema version.
 //
+// Bumped to 3 by GOV-17, which added KindBuild. Backward compatible in the same way the last
+// bump was — every v2 field means what it always did — and versioned for the same reason:
+// "no build records before this line" is a fact about the INSTRUMENT and not about the
+// machine, and GOV-17 is scored by comparing two windows. A reader that could not tell the
+// two apart would read the instrument's own arrival as a change in behaviour, which is the
+// single most likely way to get this story's answer wrong.
+//
 // Bumped to 2 by GOV-27, which added the PostToolUse correlation fields to Agent and began
 // recording two further events (PostToolUse and Stop). The addition is backward compatible —
 // every v1 field means what it always did — but the file is read as a whole by Phase 0
 // analysis and "no PostToolUse records before this line" is a fact about the instrument
 // rather than about the machine. That distinction is the entire reason this field exists.
-const RecordV = 2
+const RecordV = 3
 
 // StateDir is the directory holding the governor's state, per design.md section 13.3.
 func StateDir() (string, error) {

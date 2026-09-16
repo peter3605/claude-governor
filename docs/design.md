@@ -1280,13 +1280,54 @@ The name a session actually sees is
 `governor` appears three times. That is measured, not composed (hook-surface.md §20.5); the
 obvious guess is wrong and produces a permission denial that reads like a broken server.
 
-The `SessionStart` `additionalContext` line and the bundled skill that tell a session to call
-this before a heavy build are **not** part of GOV-16 and have not shipped. Until they do, the
-tool is available to a session that looks for it and invisible to one that does not, so the
-success metric below cannot yet be read as a measure of whether the advice works.
+**Three channels carry the advice, and they are not interchangeable.** The tool above is
+useless to a session that does not know it exists, and what a session knows *before* it decides
+to run a build is not the same as what it can go and read afterwards. Measured in
+[hook-surface.md](hook-surface.md) §16.1 and §21.2:
+
+| Channel | When the model sees it | What belongs there |
+|---|---|---|
+| `SessionStart` `additionalContext` | every session, unconditionally | the standing instruction: call the tool before an expensive build, and **not** before ordinary shell work |
+| the bundled skill's `description` | resident, from session start | one line saying the skill exists and when to reach for it |
+| the bundled skill's **body** | only after the skill is invoked | the detail — how to read `wait_hint_ms`, what to do on a refusal |
+
+**A standing instruction cannot live in the skill body.** §21.2 measured progressive
+disclosure directly: a marker in the frontmatter description was in context with no tools
+available, and a marker in the body was invisible until the model invoked the skill. A model
+that has to invoke a skill to learn it should have asked has already run the build.
+
+The skill's name as a session sees it is `claude-governor:heavy-build` — colon-separated, and
+prefixed with the **manifest `name`** rather than the directory name, which is a different rule
+from the MCP tool's underscores above (§21.2, answer 4). Neither name can be composed from the
+other; both are measured.
+
+These three are **not** part of GOV-16 and have not shipped. Until they do, the tool is
+available to a session that looks for it and invisible to one that does not, so the success
+metric below cannot yet be read as a measure of whether the advice works.
 
 Success metric: denials per hour, before and after Phase 3. If advice is landing, denials
 approach zero without the budget changing.
+
+**And a counter-metric, which is not optional.** Denials per hour falls to zero if sessions
+stop building at all, and that is a worse machine, not a better one — the metric above would
+report it as a complete success. So the gate records every gated build and what became of it
+(`trace.Build`, record schema v3), including the ones that RAN, which `daemon.log` deliberately
+does not: it writes only when the budget moves or binds, and a session that quietly stops
+running its tests moves nothing. Test-suite runs are counted from the build records and a drop
+in them falsifies the story regardless of what denials do.
+
+The instrument, its known defects and the reading rule fixed in advance are in
+[advice.md](advice.md). The rule is written before the window opens, for the reason
+[dogfooding.md](dogfooding.md) gives: a week of impressions is not the evidence this repo
+accepts anywhere else.
+
+**The instrument is strictly downstream of enforcement.** The build record is written after any
+refusal has reached stdout, never before, because `trace.Append` opens a file and an open can
+block — and a write ordered ahead of the deny would turn a wedged disk into a governor that
+silently grants everything. The accepted cost of that ordering is that a gate whose budget
+expires mid-write loses the line, so a window's build count is a floor rather than an exact
+figure. Measured cost of the write: 29.5 us, against a 100 ms budget, on the 18.4% of `Bash`
+calls that are gated and already pay a round trip.
 
 ---
 
@@ -1298,19 +1339,21 @@ claude-governor/                  the repo
 ├── cmd/governor/                 one static binary
 │   ├── daemon gate confirm release session status mcp statusline
 │   ├── install uninstall doctor calibrate version
-│   └── trace                     Phase 0 only — removed when the gate ships
+│   └── trace                     the measurement log: Phase 0 traces, and GOV-17's builds
 ├── internal/
 │   ├── transport/                endpoint URL → net.Conn. unix:// in v1, tcp:// later
 │   ├── budget/                   Source interface; LocalSource in v1; reduced by min()
 │   ├── lease/                    table, TTL, Liveness interface (PID+starttime in v1)
 │   ├── signals/                  Sampler interface; sampler_darwin.go, sampler_linux.go
 │   └── config/                   versioned schema, migration, atomic write
-├── skills/fleet-budget/SKILL.md  "ask before you fan out"
+├── skills/heavy-build/SKILL.md   "ask before you launch a heavy build" (section 8)
 └── commands/governor.md          /governor status | limit N | pause | boost
 
 ~/.claude/skills/claude-governor/ the installed plugin, written by `governor install`
 ├── .claude-plugin/plugin.json    name, version, description
 ├── hooks/hooks.json              the six hooks in section 4.1
+├── .mcp.json                     the advisory server in section 8
+├── skills/heavy-build/SKILL.md   the advice a session loads on demand (section 8)
 └── bin/governor                  the binary those hooks run
 
 state  → ~/.claude/governor/      sock, daemon.pid, daemon.log, daemon.start, statusline.json,
@@ -1549,6 +1592,13 @@ Named so they are not mistaken for settled:
   lease leak path if it does. Every probe in `hook-surface.md` §19 ran `bypassPermissions`.
 - Whether the `backgroundTaskId` discriminator of §19.3 holds for tools other than `Bash`.
 - Linux: every measurement above is macOS. Re-run the probe on Linux before trusting §10 there.
+
+**No longer on this list, measured 2026-09-16 on 2.1.273 for GOV-17** (`hook-surface.md` §21):
+a skills-dir plugin's bundled `SKILL.md` **is** surfaced to the model; its frontmatter
+`description` is resident in context from session start while its **body** loads only on
+invocation; and the name a session sees is `<manifest name>:<skill name>`, colon-separated and
+taken from `.claude-plugin/plugin.json`'s `name` rather than from the directory. §8's channel
+table is the consequence.
 
 **No longer on this list, measured 2026-09-14 on 2.1.270 for GOV-15** (`hook-surface.md` §19):
 `PostToolUse` on `Bash` carries the same `tool_use_id` as its `PreToolUse`; it does **not** fire
@@ -1810,6 +1860,7 @@ Uninstall is only verifiable if this list is exhaustive, so it is normative.
 | `~/.claude/skills/claude-governor/.claude-plugin/plugin.json` | install | uninstall |
 | `~/.claude/skills/claude-governor/hooks/hooks.json` (the six hooks) | install | uninstall |
 | `~/.claude/skills/claude-governor/.mcp.json` (the advisory server, section 8) | install | uninstall |
+| `~/.claude/skills/claude-governor/skills/heavy-build/SKILL.md` (the advice, section 8) | install | uninstall |
 | `~/.claude/skills/claude-governor/bin/governor` | install, copied from the running binary | uninstall |
 | `~/.claude/skills/` | install, only if absent | uninstall, only if it empties |
 | `~/.claude/settings.json` (`statusLine` key only) | install, merged | uninstall, previous value restored from backup |
@@ -1930,7 +1981,7 @@ listed is a path uninstall silently stops covering. All of them go when Phase 1 
 |---|---|---|
 | `~/.claude/settings.json` (five `trace` hooks) | `trace install`, merged after backup | `trace uninstall`, surgically |
 | `~/.claude/settings.json.governor-trace-backup-<ts>` | `trace install` | `trace uninstall` |
-| `~/.claude/governor/samples.jsonl` | `trace agent`, `trace sample` | by hand — it is the measurement, and deleting it on uninstall would throw away the phase |
+| `~/.claude/governor/samples.jsonl` | `trace agent`, `trace sample`, and the gate's build records (section 8) | by hand — it is the measurement, and deleting it on uninstall would throw away the phase |
 | `~/.claude/governor/sampler.lock` | `trace sample` | by hand |
 | `~/.claude/governor/sampler.log` | `trace sample` | by hand |
 | `bin/governor` in the repo, staged by hand in Phase 0 | by hand | by hand — GOV-21's `governor install` supersedes it, and installs into the plugin instead |

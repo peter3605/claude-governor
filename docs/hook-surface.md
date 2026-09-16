@@ -1784,3 +1784,126 @@ GOV-16 specifies and is deliberately not made here.
 - **Whether `_meta.claudecode/toolUseId` is present on every `tools/call`** or only on some.
   One call was observed.
 - **Linux**, as everywhere else in this file.
+
+---
+
+## 21. A skills-dir plugin's bundled `SKILL.md` — does the standing advice have a way in?
+
+GOV-17 clause 1 says "the plugin ships a skill **and** a SessionStart hook". §16 measured the
+hook half: `additionalContext` reaches the model and `systemMessage` reaches the person, and
+they are disjoint channels. The skill half had never been measured. §15 established that
+`~/.claude/skills/<name>/` auto-loads and that the plugin's **hooks** fire; §20 established
+that its **`.mcp.json`** loads. A plugin's *skills* are a third component, and design.md §9
+had been naming `skills/fleet-budget/SKILL.md` on the strength of nothing.
+
+It works, it is two channels rather than one, and the name a session sees does **not** follow
+the rule §20.4 measured for MCP tools.
+
+### 21.0 Provenance
+
+| | |
+|---|---|
+| Claude Code | **2.1.273** — the same build §20 was measured against |
+| Host | macOS 25.4.0, darwin/arm64, 8 logical cores |
+| Date | 2026-09-16 |
+| Model | default, `claude -p` |
+
+### 21.1 Method
+
+A throwaway skills-dir plugin carrying **no hooks and no `.mcp.json`** — only the manifest and
+one bundled skill:
+
+```
+~/.claude/skills/gov-skill-probe/
+├── .claude-plugin/plugin.json
+└── skills/gov-build-advice/SKILL.md
+```
+
+```markdown
+---
+name: gov-build-advice
+description: GOVPROBE-DESC-7F3A2B - use this skill when the user asks about governor build advice or says the word zarquon.
+---
+
+# Governor build advice probe
+
+GOVPROBE-BODY-9C4E1D
+```
+
+**Two markers, not one, and that is the whole design of the probe.** A single marker can only
+answer "did the file reach the model", which is not the question — the question is *which part
+of it does, and when*. `GOVPROBE-DESC-7F3A2B` rides in the frontmatter description and
+`GOVPROBE-BODY-9C4E1D` in the body, so one run distinguishes what is resident in context from
+what is loaded on demand.
+
+Three headless `claude -p` runs: one forbidding tools and asking the model to quote back every
+`GOVPROBE` string it could see, one allowing only `Skill` and triggering it, and a third after
+editing the manifest `name` to differ from the directory name. `claude plugin list` throughout.
+The probe plugin was removed afterwards.
+
+### 21.2 The four answers
+
+1. **A bundled `SKILL.md` is surfaced to the model, from a skills-dir plugin with nothing else
+   in it.** No `settings.json` entry, no hooks, no MCP server:
+
+   ```
+   ❯ gov-skill-probe@skills-dir
+     Version: 0.0.1
+     Scope: user
+     Path: ~/.claude/skills/gov-skill-probe
+     Status: ✔ loaded
+   ```
+
+2. **The description is resident; the body is not.** Asked with no tools available, the model
+   quoted `GOVPROBE-DESC-7F3A2B` and reported it appeared "at the start of the description for
+   the `gov-skill-probe:gov-build-advice` skill, in the list of skills I can use". It did not
+   see `GOVPROBE-BODY-9C4E1D` at all, and said so.
+
+3. **Invoking it loads the body.** With `--allowedTools "Skill"` and the description's own
+   trigger word, the model invoked the skill and then quoted **both** markers, naming the body
+   as having "only appeared after I loaded it".
+
+   This is progressive disclosure, and it is the fact that shapes GOV-17: **a skill body cannot
+   carry a standing instruction.** Anything the model must know *before* it decides whether to
+   run a build has to be in the description or in `additionalContext`. The body is where the
+   detail goes once the model has already decided to look.
+
+4. **The skill's name is `<manifest name>:<skill name>`, colon-separated — NOT the underscore
+   mangling §20.4 measured for MCP tools, and NOT the directory name.** With the directory
+   `gov-skill-probe` and the manifest `name` changed to `gov-manifest-name`, the model reported
+   the skill as:
+
+   ```
+   gov-manifest-name:gov-build-advice
+   ```
+
+   Two traps in one line. The prefix follows `.claude-plugin/plugin.json`'s `name` field, so a
+   plugin whose manifest name and directory name diverge advertises a skill under a name that
+   matches neither its path nor its listing. And the separator is a colon here while §20.4's
+   MCP tool name uses underscores — the two components of the same plugin are named by
+   different rules, so neither can be composed from the other.
+
+   For the shipped plugin both sources read `claude-governor`, so the skill is
+   `claude-governor:<skill>`. That it is correct today is a coincidence of the two names
+   agreeing, not a property of the installer, which writes them independently
+   (`cmd/governor/install.go`, `pluginManifest`).
+
+### 21.3 Consequences folded into design.md
+
+- §8 gains the division of labour this measured: the standing instruction goes in
+  `additionalContext` and the skill's **description**, never in the skill body.
+- §9's `skills/fleet-budget/SKILL.md` is re-aimed and renamed by GOV-17 — it was named for the
+  withdrawn "ask before you fan out" framing.
+- §13.3's path table gains the skill's installed path, without which `uninstall` would leave it
+  behind.
+
+### 21.4 Still unmeasured
+
+- **Whether a bundled skill is picked up by a session already running.** §15.5 and §20.7 record
+  the same open question for hooks and for MCP servers. `install` makes the same claim for all
+  three, which is the safe one.
+- **What happens to two plugins bundling skills of the same name**, or to a plugin whose
+  manifest name collides with another plugin's.
+- **Whether the description has a length cap**, as §16.3's channels do. The probe's description
+  was one line.
+- **Linux**, as everywhere else in this file.

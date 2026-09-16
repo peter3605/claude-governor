@@ -170,6 +170,10 @@ type hookPayload struct {
 	SessionID string `json:"session_id"`
 	ToolName  string `json:"tool_name"`
 	ToolUseID string `json:"tool_use_id"`
+	// CWD is the session's working directory, present on a Bash PreToolUse payload
+	// (docs/hook-surface.md section 2, measured). It is read for one purpose — attributing a
+	// recorded build to a project — and is never sent to the daemon.
+	CWD string `json:"cwd"`
 	// AgentID is the *caller*, not the agent about to be created. Absent at top level means
 	// the main session is spawning (depth 0); present means a subagent is (depth >= 1).
 	// It is the only depth signal the surface carries — there is no depth field
@@ -323,6 +327,11 @@ type intent struct {
 	weight float64
 	// class is the cost class of a build, for the daemon's log. Empty for a spawn.
 	class string
+	// shapes names the gated invocations, for the build record. Empty for a spawn.
+	//
+	// Carried here rather than re-derived, because the alternative is calling the classifier
+	// a second time on the hot path to recover something it already computed.
+	shapes []string
 }
 
 // decide works out what this payload is worth, WITHOUT touching the network.
@@ -344,6 +353,7 @@ func decide(p hookPayload) intent {
 			take:   true,
 			kind:   "build",
 			class:  r.Class.String(),
+			shapes: r.Shapes,
 			weight: budget.SlotsFor(r.Class.ExpectedPeakCores()),
 		}
 	}
@@ -427,9 +437,24 @@ func gateOnce(stdin io.Reader, stdout, diag io.Writer, dialer transport.Dialer, 
 		return
 	}
 
+	// The instrument for GOV-17 clauses 2 and 3. Only a gated BUILD is recorded: an agent
+	// spawn is already fully described by daemon.log, and a command that was never gated
+	// returned above having done nothing at all, which is the property the cheap path exists
+	// to have.
+	//
+	// The defer is registered here, before the first I/O, so that every exit below records
+	// something — and it runs last, after any deny has reached stdout. buildlog.go's write()
+	// explains why that ordering is a fail-open argument rather than a stylistic one.
+	var rec *buildRecorder
+	if in.kind == "build" {
+		rec = newBuildRecorder(p, in)
+		defer func() { rec.write(diag) }()
+	}
+
 	conn, replies, err := dialAndSend(dialer, clock.Deadline(), acquireRequestFor(p, in, speaks))
 	if err != nil {
 		fmt.Fprintf(diag, "governor gate: %v\n", err)
+		rec.failOpen("daemon unreachable")
 		if errors.Is(err, errNoDaemon) {
 			// Nothing is listening. This spawn is already ungoverned — the decision was
 			// made the instant the dial failed — so the start is for the next one, and
@@ -443,6 +468,7 @@ func gateOnce(stdin io.Reader, stdout, diag io.Writer, dialer transport.Dialer, 
 	var resp acquireResponse
 	if err := readLineInto(replies, &resp); err != nil {
 		fmt.Fprintf(diag, "governor gate: read response: %v\n", err)
+		rec.failOpen("no readable response")
 		return
 	}
 
@@ -453,13 +479,18 @@ func gateOnce(stdin io.Reader, stdout, diag io.Writer, dialer transport.Dialer, 
 		// where a stalled session is not.
 		fmt.Fprintf(diag, "governor gate: daemon speaks protocol v%d, this binary speaks v%d: failing open\n",
 			resp.V, speaks)
+		rec.failOpen("protocol version mismatch")
 		return
 	}
 
+	parkedFor := time.Duration(0)
 	if !resp.OK && resp.Reason == waitingReason {
+		parkStart := time.Now()
 		if !awaitParked(diag, conn, replies, clock, &resp, speaks) {
+			rec.failOpen("parked, then no usable answer")
 			return
 		}
+		parkedFor = time.Since(parkStart)
 	}
 
 	if resp.OK {
@@ -468,12 +499,18 @@ func gateOnce(stdin io.Reader, stdout, diag io.Writer, dialer transport.Dialer, 
 		// process (design.md section 4.3).
 		fmt.Fprintf(diag, "governor gate: granted lease %s (%d/%d in use)\n",
 			resp.Lease, resp.InUse, resp.Budget)
+		if parkedFor > 0 {
+			rec.parkedThenGranted(parkedFor)
+		} else {
+			rec.grantedNow()
+		}
 		return
 	}
 
 	if !refusalsThisVersionHonours[resp.Reason] {
 		fmt.Fprintf(diag, "governor gate: refused for reason %q, which this binary does not "+
 			"recognise: failing open\n", resp.Reason)
+		rec.failOpen("unrecognised refusal reason")
 		return
 	}
 
@@ -486,13 +523,16 @@ func gateOnce(stdin io.Reader, stdout, diag io.Writer, dialer transport.Dialer, 
 		// Failing to encode a refusal means the spawn proceeds. That is the correct way
 		// round: the alternative is a session blocked by a bug in this binary.
 		fmt.Fprintf(diag, "governor gate: encode deny: %v: failing open\n", err)
+		rec.failOpen("could not encode the refusal")
 		return
 	}
 	if _, err := stdout.Write(append(out, '\n')); err != nil {
 		fmt.Fprintf(diag, "governor gate: write deny: %v\n", err)
+		rec.failOpen("could not write the refusal")
 		return
 	}
 	fmt.Fprintf(diag, "governor gate: refused (%d/%d in use)\n", resp.InUse, resp.Budget)
+	rec.denied(resp.Reason)
 }
 
 // awaitParked reads the second line of a parked acquire, having first bought the time to do

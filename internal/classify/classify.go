@@ -88,6 +88,22 @@ type Result struct {
 	Gated bool
 	// Class is how big it is expected to be. Light whenever Gated is false.
 	Class Class
+	// Shapes names the gated invocations, as "bin" or "bin sub" — `go test`, `xcodebuild`,
+	// `npm run build`. Empty whenever Gated is false, and in classifier order, so a command
+	// chaining two gated invocations reports both.
+	//
+	// IT IS THE SHAPE AND NEVER THE COMMAND. A command line carries paths, flags, hostnames
+	// and occasionally a secret; these two tokens carry none of them, and the instrument
+	// that records them (internal/trace) is written to the user's disk and read by analysis
+	// later. The same rule governs Agent.RawKeys there: names, never values.
+	//
+	// It exists because GOV-17 clause 3 has to count TEST-SUITE runs specifically, and the
+	// Class enum cannot express that — `go build` and `go test` are both Medium, which is
+	// correct for sizing a lease and useless for noticing that a session stopped running its
+	// tests. Putting the distinction here rather than in the enum keeps it out of the sizing
+	// decision, so the analysis can revise what counts as a test run without touching the
+	// hot path or reopening the classifier's measured error rate.
+	Shapes []string
 }
 
 // Classify decides whether a command is build-shaped.
@@ -100,6 +116,7 @@ type Result struct {
 func Classify(cmd string) Result {
 	worst := Light
 	gated := false
+	var shapes []string
 	for _, inv := range invocations(cmd) {
 		b, sub := inv.bin, inv.sub
 		if light[pair{b, sub}] {
@@ -113,11 +130,49 @@ func Classify(cmd string) Result {
 		if c > worst {
 			worst = c
 		}
+		shapes = append(shapes, invocationShape(b, sub))
 	}
 	if !gated {
 		return Result{Gated: false, Class: Light}
 	}
-	return Result{Gated: true, Class: worst}
+	return Result{Gated: true, Class: worst, Shapes: shapes}
+}
+
+// recordableSub is the CLOSED vocabulary of subcommands that may be written to the trace log.
+//
+// It exists because `sub` is not a subcommand in general — it is the first word after the
+// binary that is not a flag or an assignment, and for `xcodebuild -scheme Foo` that word is
+// `Foo`, the name of somebody's product. Recording sub unfiltered would put project names,
+// branch names and script names into a log on the user's disk. So the shape carries a
+// subcommand only when it is one of these, and otherwise degrades to the bare binary, which
+// is compiled in and cannot leak anything.
+//
+// The gated-subcommand half is derived from heavySub rather than retyped, so a pair added
+// there is recordable without a second edit. The verbs below are the ones the toolchain
+// entries take, and `test` is the one GOV-17 clause 3 turns on: `go build` and `go test` are
+// the same Class and must not be the same shape.
+var recordableSub = func() map[string]bool {
+	m := map[string]bool{
+		"test": true, "build": true, "bench": true, "check": true, "run": true,
+	}
+	for p := range heavySub {
+		m[p.sub] = true
+	}
+	return m
+}()
+
+// invocationShape renders one invocation as the two tokens that identify it, and nothing else.
+//
+// Distinct from eval_test.go's shapeOf, which names a whole COMMAND by its gated binaries
+// with the subcommand dropped and duplicates removed. That one groups the cost-class table in
+// docs/bash-corpus.md, where `go test` and `go build` belong in one `go` row because the row
+// is about what the binary costs. This one keeps the subcommand because the question it
+// answers is the opposite: which of those two did the session actually run.
+func invocationShape(bin, sub string) string {
+	if sub == "" || !recordableSub[sub] {
+		return bin
+	}
+	return bin + " " + sub
 }
 
 type pair struct{ bin, sub string }

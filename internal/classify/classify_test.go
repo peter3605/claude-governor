@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"encoding/json"
 	"os"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -287,4 +288,73 @@ func firstLine(s string) string {
 		return s[:i] + " …"
 	}
 	return s
+}
+
+// TestShapesNameTheInvocationAndNeverTheArguments is the privacy test for Result.Shapes.
+//
+// Shapes is written to ~/.claude/governor/samples.jsonl by the gate and read back weeks later
+// by whoever analyses the window. `sub` is NOT a subcommand in general — it is the first
+// non-flag word after the binary — so an unfiltered shape puts scheme names, repository URLs
+// and npm script names on disk. The closed vocabulary in recordableSub is what prevents that,
+// and this test is what keeps it closed: every case below is a real command shape whose
+// second word is somebody's private string.
+func TestShapesNameTheInvocationAndNeverTheArguments(t *testing.T) {
+	leaky := []struct {
+		cmd    string
+		secret string
+		want   []string
+	}{
+		{"xcodebuild -scheme SecretProductName", "SecretProductName", []string{"xcodebuild"}},
+		{"xcodebuild ArchiveForAcmeCorp", "ArchiveForAcmeCorp", []string{"xcodebuild"}},
+		{"go frobnicate ./...", "frobnicate", []string{"go"}},
+		{"make deploy-prod-eu-west", "deploy-prod-eu-west", []string{"make"}},
+		{"cargo unreleased-internal-tool", "unreleased-internal-tool", []string{"cargo"}},
+	}
+	for _, c := range leaky {
+		r := Classify(c.cmd)
+		for _, s := range r.Shapes {
+			if strings.Contains(s, c.secret) {
+				t.Errorf("Classify(%q).Shapes = %v, which carries the argument %q onto disk",
+					c.cmd, r.Shapes, c.secret)
+			}
+		}
+		if !slices.Equal(r.Shapes, c.want) {
+			t.Errorf("Classify(%q).Shapes = %v, want %v", c.cmd, r.Shapes, c.want)
+		}
+	}
+}
+
+// TestShapesSeparateABuildFromATestRun is GOV-17 clause 3 expressed as a test.
+//
+// Clause 3 requires a count of test-suite runs, so that a session responding to "ask before
+// you build" by quietly not running its tests is VISIBLE rather than scored as a saving. The
+// Class enum cannot express it — `go build` and `go test` are both Medium, correctly, because
+// they cost about the same. If these two ever collapse to the same shape, the instrument stops
+// being able to answer the question the story is measured on.
+func TestShapesSeparateABuildFromATestRun(t *testing.T) {
+	for _, c := range []struct{ build, test string }{
+		{"go build ./...", "go test ./..."},
+		{"npm run build", "npm test"},
+		{"swift build", "swift test"},
+		{"cargo build --release", "cargo test"},
+	} {
+		b, tst := Classify(c.build), Classify(c.test)
+		if !b.Gated || !tst.Gated {
+			t.Fatalf("expected both gated: %q=%v %q=%v", c.build, b.Gated, c.test, tst.Gated)
+		}
+		if slices.Equal(b.Shapes, tst.Shapes) {
+			t.Errorf("%q and %q both report shapes %v; a test run is not distinguishable "+
+				"from a build and clause 3 cannot be measured", c.build, c.test, b.Shapes)
+		}
+	}
+}
+
+// TestShapesAreEmptyWhenNothingIsGated keeps the cheap path clean: 81.6% of Bash calls are not
+// build-shaped, and none of them should be allocating a slice, let alone writing a record.
+func TestShapesAreEmptyWhenNothingIsGated(t *testing.T) {
+	for _, c := range []string{"ls", "cat go.mod", "git status", "echo hi", "grep -r foo ."} {
+		if r := Classify(c); len(r.Shapes) != 0 {
+			t.Errorf("Classify(%q).Shapes = %v, want none", c, r.Shapes)
+		}
+	}
 }
