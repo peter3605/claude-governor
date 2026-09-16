@@ -26,9 +26,29 @@ type Config struct {
 	// Endpoint is the daemon endpoint URL passed to transport.Dialer.
 	Endpoint string
 	// Setpoint is the target CPU utilisation the AIMD loop steers to (section 5.2).
+	//
+	// IT IS NO LONGER A CONTROL INPUT AND `calibrate` DOES NOT WRITE IT. GOV-32 removed
+	// utilisation from the loop, so a value here changes nothing; the key stays so that a
+	// config written before that still round-trips rather than being reported as unknown.
+	// The reasoning is at budget.Setpoint.
 	Setpoint float64
 	// BMax is the ceiling on concurrency for this host, in slots.
+	//
+	// Zero means uncalibrated, and the daemon then derives the ceiling from CPUCapacity on
+	// every tick exactly as it did before — the inert default section 13.4 requires. A
+	// non-zero value CAPS that derivation rather than replacing it; see the daemon.
 	BMax int
+	// RunQueueMax is the run-queue-per-core above which the budget is halved.
+	//
+	// The one control input the loop has, after GOV-32. Zero means uncalibrated and the
+	// compiled-in budget.RunQueueMax stands.
+	RunQueueMax float64
+	// CalibratedAt is when `governor calibrate` last measured this host, RFC3339.
+	CalibratedAt string
+	// CalibratedFrom is the one-line provenance note: the readings the numbers above were
+	// derived from. A number nobody can trace back to a measurement gets treated as
+	// arbitrary and edited at random six months later.
+	CalibratedFrom string
 	// WaitMax is how long the gate will wait for a slot before refusing.
 	WaitMaxMS int
 	// Unknown holds keys this binary does not recognise, so a round trip through an older

@@ -93,9 +93,22 @@ type Sample struct {
 // Host is the fixed shape of the machine, measured once by `governor calibrate` rather
 // than compiled in as a constant.
 type Host struct {
-	Cores            int
+	Cores int
+	// PerformanceCores is how many of Cores are the fast ones on a heterogeneous machine.
+	//
+	// It equals Cores when the platform draws no distinction, so a caller that only wants a
+	// number can read it without branching. PerformanceCoresKnown is how a caller that cares
+	// tells that apart from a genuine measurement.
 	PerformanceCores int
-	MemoryBytes      uint64
+	// PerformanceCoresKnown reports whether the split above was measured or defaulted.
+	//
+	// IT IS NOT PEDANTRY: on an 8-core Apple silicon machine "4 of 8 are performance cores"
+	// and "all 8 are performance cores" are different facts about the same hardware, and the
+	// second is what this struct reported for every host until GOV-25. A field that cannot
+	// say "I did not measure this" is a field that quietly asserts the default, which is how
+	// sampler.go came to claim every Mac was homogeneous.
+	PerformanceCoresKnown bool
+	MemoryBytes           uint64
 }
 
 // Sampler reads the host. Implementations are per-platform and MUST NOT require

@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -115,6 +116,20 @@ func (w *world) writeHooks(path, bin string, specs []hookSpec) {
 }
 
 // writeConfig stages a config.json at the path config.Path resolves to.
+// writeCalibration gives the world a config of the shape `governor calibrate` writes.
+//
+// A FULLY WORKING INSTALL IS A CALIBRATED ONE, which is why this belongs in the fixtures that
+// assert every check passes rather than only in the calibration tests. `governor install` ends
+// by running `calibrate` (GOV-25), so a machine that has been installed and not calibrated is
+// not the ordinary state — it is the state of a machine whose calibration could not run, and
+// doctor is supposed to say so. A fixture that hand-assembles a working install has to
+// assemble that part too, or it is testing a machine no user has.
+func (w *world) writeCalibration() {
+	w.writeConfig(fmt.Sprintf(
+		`{"schema": %d, "run_queue_max": 3.42, "b_max": 4, "calibrated_at": "2026-09-16T00:00:00Z", "calibrated_from": "governor calibrate 2026-09-16T00:00:00Z; %d cores (4 performance, 4 efficiency); ambient run queue 1.77 per core"}`,
+		configSchemaVersion, runtime.NumCPU()))
+}
+
 func (w *world) writeConfig(body string) {
 	w.t.Helper()
 	path, err := config.Path()
@@ -313,6 +328,7 @@ func TestDoctorPassesOnAWorkingInstall(t *testing.T) {
 	endpoint, _ := startTestDaemon(t, 4)
 	t.Setenv(transport.EndpointEnv, endpoint)
 	w.writeHooks(w.settings, selfBinary(t), goodHooks())
+	w.writeCalibration()
 
 	code, found, out := doctor(t)
 	// NOTHING TO FIX is the property, and it is asserted as "nothing failed" rather than
@@ -886,5 +902,106 @@ func TestDoctorNamesASocketPathTooLongToBind(t *testing.T) {
 	}
 	if !strings.Contains(got.fix, transport.StateDirEnv) {
 		t.Errorf("the fix does not name the variable to shorten: %q", got.fix)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// calibration
+// ---------------------------------------------------------------------------
+
+// TestDoctorReportsWhetherThisHostWasEverMeasured.
+//
+// A separate finding from `config`, because the two have different fixes — `config` asks
+// whether the file can be read and its fix is to move it aside; this asks whether anybody
+// measured this machine and its fix is one command. design.md section 13.2 records the same
+// reasoning for splitting "versions agree" into three findings.
+//
+// Never calibrated is a WARN and not a FAIL. Every calibrated key ships with a default that
+// leaves it inert, so an uncalibrated governor works — it just works to constants measured on
+// somebody else's laptop, which is real, worth printing, and not a defect in this
+// installation. A warn does not move the exit code.
+func TestDoctorReportsWhetherThisHostWasEverMeasured(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		body  string
+		write bool
+		state string
+	}{
+		{name: "no config at all", write: false, state: "warn"},
+		{
+			name: "a config with no calibration in it", write: true,
+			body:  fmt.Sprintf(`{"schema": %d, "b_max": 4}`, configSchemaVersion),
+			state: "warn",
+		},
+		{
+			name: "calibrated on this machine", write: true,
+			body: fmt.Sprintf(`{"schema": %d, "run_queue_max": 3.4, "b_max": 5, "calibrated_at": "2026-09-16T00:00:00Z", "calibrated_from": "governor calibrate 2026-09-16T00:00:00Z; %d cores (4 performance, 4 efficiency)"}`,
+				configSchemaVersion, runtime.NumCPU()),
+			state: "ok",
+		},
+		{
+			name: "calibrated on a machine with a different core count", write: true,
+			body: fmt.Sprintf(`{"schema": %d, "run_queue_max": 3.4, "b_max": 5, "calibrated_at": "2026-09-16T00:00:00Z", "calibrated_from": "governor calibrate 2026-09-16T00:00:00Z; %d cores (no performance/efficiency split published by this platform)"}`,
+				configSchemaVersion, runtime.NumCPU()+9),
+			state: "warn",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			w := newWorld(t)
+			if tc.write {
+				w.writeConfig(tc.body)
+			}
+			_, found, out := doctor(t)
+			want(t, found, "calibration", tc.state, out)
+		})
+	}
+}
+
+// TestBeingUncalibratedDoesNotMoveTheExitCode.
+//
+// The warn state exists so a finding can be worth printing without being a defect, and the
+// summary line may not round one off. This matters beyond tidiness because `install` ends by
+// running doctor and PROPAGATES ITS EXIT CODE: if an uncalibrated machine failed, then every
+// host where the calibration could not run would report a failed install — and every machine
+// is uncalibrated for the moment between the binary landing and `calibrate` finishing.
+//
+// It is asserted by running the same world twice, calibrated and not, rather than against an
+// absolute exit code. The fixture has no hooks installed, so doctor exits non-zero either way
+// for a reason that has nothing to do with this check; what this has to show is that the
+// calibration finding does not CHANGE the answer.
+func TestBeingUncalibratedDoesNotMoveTheExitCode(t *testing.T) {
+	calibrated := fmt.Sprintf(
+		`{"schema": %d, "run_queue_max": 3.4, "b_max": 5, "calibrated_at": "2026-09-16T00:00:00Z", "calibrated_from": "governor calibrate 2026-09-16T00:00:00Z; %d cores (4 performance, 4 efficiency)"}`,
+		configSchemaVersion, runtime.NumCPU())
+
+	withCalibration := func(body string) (int, line) {
+		t.Helper()
+		w := newWorld(t)
+		if body != "" {
+			w.writeConfig(body)
+		}
+		code, found, out := doctor(t)
+		got, ok := found["calibration"]
+		if !ok {
+			t.Fatalf("no calibration check in the report:\n%s", out)
+		}
+		return code, got
+	}
+
+	withCode, withFinding := withCalibration(calibrated)
+	withoutCode, withoutFinding := withCalibration("")
+
+	if withFinding.state != "ok" {
+		t.Errorf("a calibrated host reported %q", withFinding.state)
+	}
+	if withoutFinding.state != "warn" {
+		t.Errorf("an uncalibrated host reported %q, want warn", withoutFinding.state)
+	}
+	if withoutFinding.fix == "" {
+		t.Error("the calibration warning names no fix, so it is a description rather than a diagnosis")
+	}
+	if withCode != withoutCode {
+		t.Errorf("exit %d calibrated against %d uncalibrated: the warning moved the exit code, so `install` would fail on a host that could not calibrate",
+			withCode, withoutCode)
 	}
 }

@@ -195,13 +195,26 @@ func cpuDelta(total, prev float64, hadPrev bool, elapsed float64, cores int) (fl
 
 // Host reports the fixed shape of the machine.
 //
-// PerformanceCores is not distinguishable from gopsutil on Apple silicon, so it is reported
-// equal to Cores here and left for `governor calibrate` (GOV-16) to measure properly. B_max
-// depends on it (section 5.2) and the control loop does not exist yet, so guessing a split
-// now would bake a number nobody measured into a trace nobody can correct.
+// THE PERFORMANCE-CORE SPLIT IS NOW MEASURED WHERE THE PLATFORM PUBLISHES IT (GOV-25). This
+// function used to set PerformanceCores equal to Cores unconditionally, with a note deferring
+// the split to `governor calibrate` on the grounds that guessing one would bake a number
+// nobody measured into a trace nobody could correct. That reasoning was right and the
+// conclusion is now reachable: macOS publishes the split through `hw.perflevelN.*` with no
+// privilege at all, so it does not have to be guessed. See perfcores_darwin.go.
+//
+// Where no platform publishes it, PerformanceCores still equals Cores — but
+// PerformanceCoresKnown is false, which is the difference between defaulting and measuring
+// and is the bit the old code had no way to express.
 func (s *hostSampler) Host(ctx context.Context) (Host, error) {
 	h := Host{Cores: runtime.NumCPU()}
 	h.PerformanceCores = h.Cores
+	if n, ok := performanceCores(); ok && n > 0 && n <= h.Cores {
+		// The upper bound is not defensive clutter. A perflevel count above the visible core
+		// count means the two readings disagree about what machine this is — a VM exposing a
+		// subset of host CPUs is the ordinary way that happens — and a "performance core"
+		// count larger than the cores available to run on is not a number to calibrate from.
+		h.PerformanceCores, h.PerformanceCoresKnown = n, true
+	}
 	if v, err := mem.VirtualMemoryWithContext(ctx); err == nil {
 		h.MemoryBytes = v.Total
 	}

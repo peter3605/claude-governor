@@ -37,6 +37,20 @@ touched. **Claude Code binds hooks when a session starts, so every session you a
 open stays ungoverned until you restart it** — install counts them and names them, and
 `governor doctor` fails while any of them is still running.
 
+**It measures your machine before it checks anything.** `governor install` ends by running
+`governor calibrate`, which reads your core count, how many of them are performance cores where
+the platform says, your RAM, and — the number that actually decides how the governor behaves —
+what your machine's run queue already sits at while you work. It then runs a short, announced
+load probe, about four seconds, to find out how many cores this hardware really delivers in
+parallel, which is not the number it advertises: a laptop with four performance and four
+efficiency cores measures about six. The limits it writes are derived from those readings and
+recorded with a note saying when they were taken and from what.
+
+None of the shipped constants were measured on your machine, and that is the whole point of
+this step. It is also why the advice is to **re-run `governor calibrate` while you are actually
+working** — the baseline it places your threshold above is whatever the machine was doing in
+the preceding minute, and a machine measured while idle will throttle you once it is not.
+
 **It then checks its own work.** `governor install` finishes by running `governor doctor` and
 printing the report, and exits non-zero if any check fails. An install can write every file
 correctly and still govern nothing — a socket it cannot bind, an older `governor` earlier on
@@ -50,6 +64,7 @@ goes to you rather than into the model's context.
 ```sh
 governor doctor       # is it working, and if not, what exactly do I type
 governor status       # budget, holders, CPU, thermal
+governor calibrate    # re-measure this machine; run it while you are working
 governor uninstall    # remove all of it
 ```
 

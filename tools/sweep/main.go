@@ -89,7 +89,7 @@ type options struct {
 
 func run() error {
 	var (
-		thresholds  = flag.String("thresholds", "1.2,2.0,3.0,4.5", "comma-separated run-queue-per-core thresholds to measure; 1.2 is the shipped value")
+		thresholds  = flag.String("thresholds", "1.2,2.0,3.0,4.5", "comma-separated run-queue-per-core thresholds to measure; 2.0 is the shipped value, and `governor calibrate` raises it above this host's ambient load")
 		ungoverned  = flag.Bool("ungoverned", true, "also measure an arm with no gate at all, as the reference")
 		builds      = flag.Int("builds", 10, "build requests in the batch")
 		modules     = flag.Int("modules", 8, "generated Go modules the builds compile")

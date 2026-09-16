@@ -215,14 +215,25 @@ type Controller struct {
 	// RunQueueMax overrides the package constant of the same name. Zero means use the
 	// constant, which is what every caller outside the sweep harness does.
 	//
-	// IT EXISTS SO THE THRESHOLD CAN BE SWEPT, and for no other reason. GOV-31 had to
-	// measure four values of it under the same load, which is impossible while it is a
-	// compile-time constant; tools/sweep sets it through the daemon's GOVERNOR_RUNQUEUE_MAX
-	// environment variable. It is deliberately NOT part of internal/config: config is the
-	// surface `governor calibrate` writes, and putting a knob there asserts that the right
-	// value is host-dependent, which is a claim the sweep has to earn. So it stays an
-	// experiment-only escape hatch until a measurement says otherwise; see
-	// docs/run-queue-sweep.md for what the sweep concluded about host dependence.
+	// IT EXISTS SO THE THRESHOLD CAN BE SWEPT. GOV-31 had to measure four values of it under
+	// the same load, which is impossible while it is a compile-time constant; tools/sweep
+	// sets it through the daemon's GOVERNOR_RUNQUEUE_MAX environment variable.
+	//
+	// IT IS NOW ALSO WHAT `governor calibrate` WRITES THROUGH, and this comment used to say
+	// the opposite. It read: "deliberately NOT part of internal/config — putting a knob there
+	// asserts that the right value is host-dependent, which is a claim the sweep has to
+	// earn." The claim is earned. GOV-31 could not earn it because its sweep found the
+	// threshold nearly inert, and docs/climb-condition.md §7 records why: the CPU disjunct
+	// decided every cut before the threshold was consulted, so five values from 1.2 to 6.0
+	// were shadowed. GOV-32 removed the disjunct. GOV-25 then measured the thing that
+	// actually varies between hosts — not what a build costs, but what the machine is already
+	// doing before the governor sees it, which on a working developer laptop is ABOVE the
+	// shipped cut on its own. docs/calibration.md is the evidence; internal/calibrate is the
+	// derivation.
+	//
+	// The daemon resolves environment, then config, then this constant — the experiment
+	// handle must still beat the calibrated value, or a sweep would silently measure
+	// something other than the number it set.
 	RunQueueMax float64
 
 	b int
