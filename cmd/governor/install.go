@@ -82,6 +82,7 @@ type paths struct {
 	plugin   string // ~/.claude/skills/claude-governor
 	manifest string // <plugin>/.claude-plugin/plugin.json
 	hooks    string // <plugin>/hooks/hooks.json
+	mcp      string // <plugin>/.mcp.json
 	binary   string // <plugin>/bin/governor
 	settings string // ~/.claude/settings.json
 	// link is a convenience symlink onto the user's PATH. It is only ever written when its
@@ -109,6 +110,7 @@ func resolvePaths() (paths, error) {
 		plugin:   plugin,
 		manifest: filepath.Join(plugin, ".claude-plugin", "plugin.json"),
 		hooks:    filepath.Join(plugin, "hooks", "hooks.json"),
+		mcp:      filepath.Join(plugin, ".mcp.json"),
 		binary:   filepath.Join(plugin, "bin", installedBinaryName),
 		settings: filepath.Join(home, ".claude", "settings.json"),
 		link:     filepath.Join(home, ".local", "bin", installedBinaryName),
@@ -195,6 +197,33 @@ func pluginHooks() ([]byte, error) {
 		hooks[w.event] = []any{entry}
 	}
 	return marshalSettings(map[string]any{"hooks": hooks})
+}
+
+// pluginMCP is .mcp.json: the advisory channel of design.md section 8, registered as a
+// stdio server on the same one binary everything else runs from.
+//
+// THAT A SKILLS-DIR PLUGIN LOADS THIS FILE AT ALL WAS MEASURED, not assumed
+// (hook-surface.md section 20). A plugin's MCP registration is a different component from
+// its hooks, and section 15 had only ever measured hooks — so writing this on the strength
+// of the two being "both plugin files" would have been the silent never-loads failure that
+// section 10.1 exists to prevent, arriving by a third door.
+//
+// The server key is `governor`, and it is half of the tool's name in a session: Claude Code
+// composes `mcp__plugin_<plugin>_<server>__` from the plugin name and this key and PREFIXES
+// it onto the tool's own name, giving
+// `mcp__plugin_claude-governor_governor__governor__request_build` — measured in
+// hook-surface.md section 20.5, stutter and all. Renaming either the plugin or this key
+// renames the tool, and anything that allowlists it then breaks silently: the model simply
+// reports it lacks permission, which reads like a server that failed to start.
+func pluginMCP() ([]byte, error) {
+	return marshalSettings(map[string]any{
+		"mcpServers": map[string]any{
+			"governor": map[string]any{
+				"command": "${CLAUDE_PLUGIN_ROOT}/bin/" + installedBinaryName,
+				"args":    []any{"mcp"},
+			},
+		},
+	})
 }
 
 // gateHookTimeout bounds the gate hook, in seconds (design.md section 4.1).
@@ -345,6 +374,11 @@ func runInstall(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "governor install: hooks: %v\n", err)
 		return 1
 	}
+	mcp, err := pluginMCP()
+	if err != nil {
+		fmt.Fprintf(stderr, "governor install: mcp: %v\n", err)
+		return 1
+	}
 
 	// Settings are merged into an in-memory copy first, so that --dry-run can report the
 	// change without any of the write path running.
@@ -360,6 +394,7 @@ func runInstall(args []string, stdout, stderr io.Writer) int {
 	if *dryRun {
 		in.planFile(p.manifest, manifest)
 		in.planFile(p.hooks, hooks)
+		in.planFile(p.mcp, mcp)
 		in.planBinary(self)
 		in.planSettings(settingsChanged)
 		in.planLink()
@@ -376,6 +411,10 @@ func runInstall(args []string, stdout, stderr io.Writer) int {
 		return 1
 	}
 	if err := in.writeFile(p.hooks, hooks); err != nil {
+		fmt.Fprintf(stderr, "governor install: %v\n", err)
+		return 1
+	}
+	if err := in.writeFile(p.mcp, mcp); err != nil {
 		fmt.Fprintf(stderr, "governor install: %v\n", err)
 		return 1
 	}

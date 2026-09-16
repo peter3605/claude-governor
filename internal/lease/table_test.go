@@ -412,3 +412,65 @@ func TestLeaseCountNeverExceedsBudgetUnderConcurrency(t *testing.T) {
 		t.Fatalf("in use %d after every worker released, want 0", tbl.InUse())
 	}
 }
+
+// TestFitsAndAcquireCannotDisagree is the structural half of GOV-16's fourth clause.
+//
+// The advisory tool answers from Fits and the gate takes its lease from Acquire, and the
+// whole promise of the channel is that those two never say different things about the same
+// machine. They share fitsLocked today, so this test cannot fail — which is the point: it is
+// here to fail the moment somebody gives either one its own copy of the arithmetic, which is
+// the only way the promise realistically breaks.
+//
+// It is driven over the shapes where the rule is actually interesting: an empty table (which
+// admits anything, work-conservingly, even a Heavy build that cannot fit), a partly full one,
+// and a request whose weight is absent and must be read as a whole slot.
+func TestFitsAndAcquireCannotDisagree(t *testing.T) {
+	weights := []float64{0, 0.098, 1, 1.2, 3.75, 4.5, 100}
+	limits := []int{1, 2, 6}
+	fills := []int{0, 1, 3}
+
+	for _, limit := range limits {
+		for _, fill := range fills {
+			for _, w := range weights {
+				tbl := NewTable(Options{})
+				for i := 0; i < fill; i++ {
+					tbl.Acquire(Request{Session: "filler", Kind: Build, Weight: 1,
+						ToolUseID: fmt.Sprintf("t%d", i)}, limit)
+				}
+
+				req := Request{Session: "asking", Kind: Build, Weight: w, ToolUseID: "asked"}
+				advised := tbl.Fits(req, limit)
+				_, acquired := tbl.Acquire(req, limit)
+
+				if advised != acquired {
+					t.Errorf("limit=%d fill=%d weight=%v: Fits says %v and Acquire says %v\n"+
+						"the advisory tool would tell a model the opposite of what the gate "+
+						"then does to it", limit, fill, w, advised, acquired)
+				}
+			}
+		}
+	}
+}
+
+// TestFitsTakesNothing is the other property the advisory channel depends on: asking is free.
+//
+// Without it, a model that consulted the tool before every build would consume the budget by
+// asking about it — a second, invisible way to saturate the machine, and one that punishes
+// exactly the cooperative behaviour the channel exists to encourage.
+func TestFitsTakesNothing(t *testing.T) {
+	tbl := NewTable(Options{})
+	req := Request{Session: "asking", Kind: Build, Weight: 1, ToolUseID: "asked"}
+
+	for i := 0; i < 100; i++ {
+		tbl.Fits(req, 4)
+	}
+	if n := tbl.InUse(); n != 0 {
+		t.Errorf("in use = %d after 100 Fits calls, want 0", n)
+	}
+	if s := tbl.Slots(); s != 0 {
+		t.Errorf("slots = %v after 100 Fits calls, want 0", s)
+	}
+	if _, ok := tbl.Acquire(req, 4); !ok {
+		t.Error("a table that has only been asked questions refused a lease")
+	}
+}

@@ -18,8 +18,10 @@ load and thermal pressure, and every session asks it before spawning.
   evidence of throttling behind it.
 - **Fails open.** If the daemon isn't running, every spawn proceeds ungoverned. A broken
   governor never bricks a session.
-- **Tells the model the number.** An MCP tool lets a session ask how many agents it may run,
-  so it plans a right-sized fan-out instead of being refused into shape.
+- **Tells the model first.** An MCP tool, `governor__request_build`, lets a session ask
+  whether the machine has room for a build before it starts one — so it waits a few seconds
+  instead of being refused into shape. It answers cheap commands without contacting the
+  daemon at all, and grants everything when the daemon is down.
 
 Status: **Phase 0 — measuring.** The control loop is designed but not built; what runs today
 is instrumentation only. See [`docs/design.md`](docs/design.md).

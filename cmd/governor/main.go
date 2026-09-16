@@ -53,7 +53,7 @@ var commands = []command{
 	{"finish", "PostToolUse hook: return a build lease when its command completes", runFinish},
 	{"session", "SessionStart/SessionEnd hook: register or drop a session", runSession},
 	{"status", "print the current budget and its holders", runStatus},
-	{"mcp", "serve the advisory MCP tool over stdio", stub("mcp")},
+	{"mcp", "serve the advisory MCP tool over stdio", runMCP},
 	{"statusline", "render the one-line status for a session", runStatusline},
 	{"trace", "Phase 0 instrumentation: record hook events and 1 Hz host samples", runTrace},
 	{"install", "install the plugin, hooks and daemon", runInstall},

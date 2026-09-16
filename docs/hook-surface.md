@@ -1591,3 +1591,196 @@ And probe H's, for finding 5 — the background task ends near +11.9 s and nothi
 - **Whether the `backgroundTaskId` discriminator holds for tools other than `Bash`.** Only
   `Bash` was probed here.
 - **Interactive, non-headless sessions**, and **Linux** — as everywhere else in this file.
+
+---
+
+## 20. A skills-dir plugin's `.mcp.json` — does the advisory channel have a way in?
+
+GOV-16 ships `governor mcp`, and clause 1 says "`.mcp.json` in the plugin starts it".
+design.md §9 had deliberately not written that file yet, and §15.5 did not cover it: §15
+measured that `~/.claude/skills/<name>/` auto-loads and that its `hooks/hooks.json` fires,
+but a **plugin's MCP registration is a different component of a plugin than its hooks**, and
+nothing here had seen one load. `claude plugin init --with` listing `mcp` among the
+components (§15.4) is documentation, not a measurement on this machine.
+
+It works, and the whole handshake is below.
+
+### 20.0 Provenance
+
+| | |
+|---|---|
+| Claude Code | **2.1.273** — newer than the 2.1.270 §18 and §19 were measured against |
+| Host | macOS 25.4.0, darwin/arm64, 8 logical cores |
+| Date | 2026-09-16 |
+| Model | default, `claude -p`, `--allowedTools <the one tool>` |
+
+### 20.1 Method
+
+A throwaway skills-dir plugin, the same shape §15 used, carrying **no hooks at all** — only
+the plugin manifest and an `.mcp.json`:
+
+```
+~/.claude/skills/gov-mcp-probe/
+├── .claude-plugin/plugin.json
+├── .mcp.json
+└── server.py
+```
+
+```jsonc
+// .mcp.json, verbatim
+{"mcpServers":{"govprobe":{"command":"python3",
+  "args":["${CLAUDE_PLUGIN_ROOT}/server.py"],
+  "env":{"GOV_PROBE_LOG":"<scratchpad>/probe.log"}}}}
+```
+
+`server.py` is a transcript recorder: it appends every line it receives to the log and
+answers `initialize`, `tools/list` and `tools/call` minimally, exposing one tool
+`probe_ping` that returns the text `pong`. Python rather than Go deliberately — the question
+is what the *harness* does, and a probe that has to be compiled first is a probe that gets
+run less.
+
+Three observations: `claude plugin list`, `claude mcp list` (which performs a health check,
+and so a full handshake), and a headless `claude -p` told to call the tool.
+
+The whole probe was then repeated against the **real** artefacts — the `.mcp.json` that
+`governor install` generates, verbatim including its `${CLAUDE_PLUGIN_ROOT}` reference, and
+the compiled `governor mcp` binary — in a second throwaway plugin. That run is what §20.5
+records, and it confirmed that `${CLAUDE_PLUGIN_ROOT}` expands in the `command` field as
+well as in `args`. Both probe plugins were removed afterwards.
+
+### 20.2 The five answers
+
+1. **A skills-dir plugin's root `.mcp.json` is loaded.** No `settings.json` entry, no
+   `installed_plugins.json` entry, no hooks in the plugin at all:
+
+   ```
+   ❯ gov-mcp-probe@skills-dir
+     Version: 0.0.1
+     Scope: user
+     Path: ~/.claude/skills/gov-mcp-probe
+     Status: ✔ loaded
+   ```
+
+2. **The server connects, and is named `plugin:<plugin>:<server>`.** From `claude mcp list`:
+
+   ```
+   plugin:gov-mcp-probe:govprobe: python3 /Users/peterho/.claude/skills/gov-mcp-probe/server.py - ✔ Connected
+   ```
+
+3. **`${CLAUDE_PLUGIN_ROOT}` and `${CLAUDE_PLUGIN_DATA}` expand**, in `args` and in the
+   process environment respectively — the same expansion §15.2 measured for hook command
+   strings, now confirmed for an MCP server's argv. The server was launched with
+   `CLAUDE_PLUGIN_ROOT=/Users/peterho/.claude/skills/gov-mcp-probe` and
+   `CLAUDE_PLUGIN_DATA=/Users/peterho/.claude/plugins/data/gov-mcp-probe-skills-dir`, and
+   `cwd` set to the directory the session was started in, **not** to the plugin root.
+
+4. **The in-session tool name separates with UNDERSCORES, not the colons `claude mcp list`
+   prints.** This cost a probe run and is the trap of this section. The listing says
+   `plugin:gov-mcp-probe:govprobe`, but the name a session knows is:
+
+   ```
+   mcp__plugin_gov-mcp-probe_govprobe__probe_ping
+   ```
+
+   `--allowedTools "mcp__plugin:gov-mcp-probe:govprobe__probe_ping"` does not match, and the
+   failure is not an error — the model simply reports it lacks permission, which reads
+   exactly like a server that failed to load. The general form is
+   `mcp__plugin_<plugin>_<server>__<tool>`.
+
+   **The prefix is added to the tool's own name, not substituted for it**, which is worth
+   stating because the obvious reading is wrong and it cost a second probe run. §20.5 below
+   has the shipped plugin's real name, measured rather than composed by hand.
+
+5. **A session calls it and gets the answer back.** The `-p` run replied `pong`, and the
+   server's log carries the call.
+
+### 20.3 The handshake, verbatim
+
+Every line the harness sent, from the log. This is what `governor mcp` has to answer:
+
+```jsonc
+// -> initialize
+{"method":"initialize","params":{"protocolVersion":"2025-11-25",
+ "capabilities":{"roots":{"listChanged":true},"elicitation":{}},
+ "clientInfo":{"name":"claude-code","title":"Claude Code","version":"2.1.273",
+ "description":"Anthropic's agentic coding tool","websiteUrl":"https://claude.com/claude-code"}},
+ "jsonrpc":"2.0","id":0}
+// -> notifications/initialized          (no id: a notification, and it MUST NOT be answered)
+{"jsonrpc":"2.0","method":"notifications/initialized"}
+// -> tools/list
+{"method":"tools/list","jsonrpc":"2.0","id":1}
+// -> tools/call
+{"method":"tools/call","params":{"name":"probe_ping","arguments":{"why":"GOV-16 surface probe"},
+ "_meta":{"claudecode/toolUseId":"toolu_01J9VjzacrYT84p2GDiEL58V","progressToken":2}},
+ "jsonrpc":"2.0","id":2}
+```
+
+Three details in that transcript that a server written from the specification alone would
+get wrong or miss:
+
+- **`protocolVersion` is `2025-11-25`.** The probe echoed back whatever it was sent and the
+  handshake succeeded; a server that asserts a different version was not tested here.
+- **`notifications/initialized` has no `id`.** Replying to it is a protocol error, so the
+  server's dispatch has to discriminate on the *absence of `id`*, not on the method name.
+- **`_meta` carries `claudecode/toolUseId`** — the same `tool_use_id` shape the hook payloads
+  carry (§1). The advisory channel therefore *could* correlate an ask with the `PreToolUse`
+  that follows it. GOV-16 does not use it, and it is recorded here because the next story
+  that wants to would otherwise have to re-measure it.
+
+### 20.4 The server is started at session start, not on first use
+
+The probe's log shows a fresh `START` line for every `claude -p` invocation, including the
+one whose prompt failed before any tool was called, and one for `claude mcp list`'s health
+check. **There is no lazy start**: every session pays this process's startup cost whether or
+not the tool is ever called.
+
+That is the measurement behind GOV-16's last trap — a stdio MCP server is a descendant of the
+session process and is therefore inside `claude_cpu`, unlike the HTTP and native-host servers
+of phase-0-findings.md §5. It is also the argument for the server being the same static Go
+binary as everything else rather than a script: the cost is paid per session, unconditionally,
+on a machine that runs five or six of them.
+
+### 20.5 The shipped tool's real name — measured, and it stutters
+
+Predicting this name from the form in §20.2 gets it wrong, and the failure mode is the one
+above: a denied permission that reads like a broken server. So it was measured, against the
+real `governor mcp` binary registered by the real `.mcp.json` that `governor install`
+generates, in a headless session that called it and got its answer back:
+
+```
+mcp__plugin_gov-mcp-verify_governor__governor__request_build
+                                  ^^^^^^^^^^^^^^^^^^^^^^^^^^ the tool's own name, whole
+           ^^^^^^^^^^^^^^^ ^^^^^^^^ plugin, then server key
+```
+
+**The harness prefixes; it does not replace.** The tool advertises itself over MCP as
+`governor__request_build` (design.md §8 specifies that name), the plugin is
+`claude-governor` and the server key is `governor`, so the name a session actually sees on
+the shipped plugin is:
+
+```
+mcp__plugin_claude-governor_governor__governor__request_build
+```
+
+`governor` three times. That is ugly and it is nonetheless the measured string — anything
+that allowlists the tool, or names it to the model in prose, must use it verbatim. Dropping
+the `governor__` prefix from the tool's own name would shorten it to
+`mcp__plugin_claude-governor_governor__request_build`, which is a change to the interface
+GOV-16 specifies and is deliberately not made here.
+
+### 20.6 Consequences folded into design.md
+
+- §9's "`.mcp.json` is not written yet" note is retired: the file is written by `governor
+  install`, and §13.3 gains a row for it.
+- §8 records the tool's name as a session sees it, from §20.5 above.
+
+### 20.7 Still unmeasured
+
+- **Whether a `.mcp.json` server is picked up by a session already running.** §15.5 records
+  the same open question for hooks; `install` makes the same claim for both, which is the
+  safe one.
+- **What the harness does with a server that fails to start, or that answers `initialize`
+  with a protocol version it did not offer.** The probe always answered, and always echoed.
+- **Whether `_meta.claudecode/toolUseId` is present on every `tools/call`** or only on some.
+  One call was observed.
+- **Linux**, as everywhere else in this file.

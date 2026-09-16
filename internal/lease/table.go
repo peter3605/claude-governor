@@ -182,24 +182,52 @@ type Request struct {
 	ToolUseID string
 }
 
+// Fits reports whether Acquire would admit this request right now, WITHOUT taking a lease,
+// changing any state, or counting a denial.
+//
+// IT EXISTS FOR THE ADVISORY CHANNEL (design.md section 8) AND IT SHARES ACQUIRE'S RULE BY
+// CALLING IT, not by restating it. GOV-16's fourth clause is that what the MCP tool tells a
+// model must match what the gate will do to it, and the cheapest way for that to stop being
+// true is two copies of the admission arithmetic drifting a release apart. So there is one
+// copy, in fitsLocked, and Acquire is its only other caller.
+//
+// The answer is a snapshot and nothing reserves anything on the strength of it: a slot can be
+// taken between this call and the acquire it advised. That is correct — advice steers, the
+// gate enforces — and it is why this is not a two-phase reservation.
+func (t *Table) Fits(r Request, limit int) bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.fitsLocked(normalWeight(r.Weight), limit)
+}
+
+// fitsLocked is THE ADMISSION RULE, and it is WORK-CONSERVING because it has to be. The
+// budget is an integer count of slots where one slot is one Medium build, so a Heavy build
+// weighs 3.75 and a budget floored at 1 (invariant 4) could never admit one. Refusing it
+// would not be conservative, it would be a deadlock: the machine would sit idle refusing the
+// only work it had. So a request that does not fit an EMPTY table is admitted anyway and
+// simply runs alone. That is what invariant 4 means by "still makes progress, one at a time"
+// once slots stopped being interchangeable.
+func (t *Table) fitsLocked(weight float64, limit int) bool {
+	return len(t.byID) == 0 || t.weight+weight <= float64(limit)
+}
+
+// normalWeight is how a request's weight is read before anything compares it. A request that
+// names no weight is one whole slot — the shape every gate before GOV-15 sent — and reading
+// an absent weight as zero would admit an unbounded number of them.
+func normalWeight(w float64) float64 {
+	if w <= 0 {
+		return 1
+	}
+	return w
+}
+
 // Acquire takes a lease if the budget has room for it.
 func (t *Table) Acquire(r Request, limit int) (Lease, bool) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
-	w := r.Weight
-	if w <= 0 {
-		w = 1
-	}
-
-	// THE ADMISSION RULE IS WORK-CONSERVING, and it has to be. The budget is an integer
-	// count of slots where one slot is one Medium build, so a Heavy build weighs 3.75 and a
-	// budget floored at 1 (invariant 4) could never admit one. Refusing it would not be
-	// conservative, it would be a deadlock: the machine would sit idle refusing the only
-	// work it had. So a request that does not fit an EMPTY table is admitted anyway and
-	// simply runs alone. That is what invariant 4 means by "still makes progress, one at a
-	// time" once slots stopped being interchangeable.
-	if len(t.byID) > 0 && t.weight+w > float64(limit) {
+	w := normalWeight(r.Weight)
+	if !t.fitsLocked(w, limit) {
 		return Lease{}, false
 	}
 
