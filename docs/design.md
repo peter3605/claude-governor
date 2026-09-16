@@ -815,7 +815,12 @@ things came out of it that belong here:
   threshold was consulted. Removing the CPU test removes that shadow. `RunQueueMax` and
   `RunQueueBand` together now set the operating point under exactly the load the sweep could
   not see them under, so the sweep that found nothing is worth re-running against this loop,
-  and it would this time be measuring a live constant. The value is unchanged pending that.
+  and it would this time be measuring a live constant. **GOV-25 re-ran it, and 2.0 stays the
+  compiled-in value — what changed is that it is no longer the only value a host can have.**
+  `governor calibrate` raises it above whatever this machine's own ambient run queue is, which
+  is the quantity that differs between a developer's laptop and a CI box and the one the
+  original constant could not express. §5.2a is the derivation and
+  [calibration.md](calibration.md) is the re-sweep.
 - **GOV-31 left the loop's shape open, and GOV-32 closed it: it was over-control.** Under
   build load the budget could not climb back at all, because the increase branch required CPU
   below `setpoint − 0.10` = 0.65 and a build never leaves CPU that low, so a fan-out floored
@@ -829,6 +834,86 @@ things came out of it that belong here:
   tree, and `go build` spawns many short-lived `compile` processes, so it undercounts — and
   undercounts *more* at low concurrency. The wall-clock and host-CPU columns are unaffected,
   and every conclusion drawn here rests on those.
+
+### 5.2a Calibration: where those constants come from on a machine that is not this one
+
+Everything in §5.2 was measured on one 8-core fanless laptop. The project rule is that nothing
+tuned there ships as anyone else's default, so `governor calibrate` (GOV-25) measures the host
+it is running on and writes two of those constants into `config.json`. Absent config means the
+compiled-in values stand, exactly as before — the inert default §13.4 requires of every key.
+
+**The cut threshold is placed a fixed headroom above what the host is *already doing*.**
+`RunQueueMax = ambient + 4.30`. The split between the two terms is the design: what differs
+between machines is not how much run queue a build produces — that is a property of the build
+and the core count, which the existing arithmetic already handles — but what the machine was
+doing before the governor saw it.
+
+**The headroom is bounded on both sides by a measured curve, and the first value this story
+derived was wrong.** 1.65 came from subtracting the Phase 0 trace's settled run queue (p50
+0.352) from GOV-31's 2.0, which has the pleasing property that a host idling where that trace's
+host idled calibrates back to 2.0 exactly. It is wrong because GOV-31's concurrency curve is
+**under-converged**, as [run-queue-sweep.md](run-queue-sweep.md) §4 Correction 2 says of its own
+numbers: one build runs 8.1 s against a one-minute decaying average, so its 1.22 per core "is
+mostly the residue of the settle threshold". Re-measured under *sustained* load — builds
+relaunched for 180 s, three averaging windows — one build reaches **3.04 p50 and 4.07 peak**,
+two reach 5.83, three reach 10.06. So 1.65 put the cut at 2.30 on a host measured idling at
+0.65, below what one build produces, and the budget floored with a single build running. The
+interval the measurement bounds is `cut > 4.07` (the peak at one build) and `cut ≤ 5.83` (the
+median at two, so a second build still trips it); 4.30 is its midpoint less that host's ambient.
+
+**The bound is the peak, not the median, and that is the sweep's real finding.** AIMD halves on
+a cut and climbs one slot per tick, so a rare excursion above the threshold is not rare for the
+budget: an arm whose threshold sat 0.04 *below* its own peak run queue satisfied the cut
+condition on 7% of ticks, the climb condition on 48%, and still ended at the floor. Sorting the
+four sweep arms by whether the threshold cleared that arm's own peak orders all four; sorting
+them by the threshold's value does not.
+
+A floor at the shipped 2.0 remains, but **no longer binds on any real host** — every
+non-negative ambient reading now lands above it. It is kept as a guard on the constant, not on
+the reading. **A host whose load average could not be read is not calibrated at all**, rather
+than treated as idle: the threshold is placed relative to a baseline, and without one there is
+nothing to place it relative to.
+
+**The measurement that matters is the ambient baseline, and it needs no load probe.** This is
+where the probe-length trap is resolved rather than fought. `loadavg1` is a one-minute decaying
+average, so a bounded probe cannot move it — but *reading it once is already a sixty-second
+measurement*, of the preceding minute of the developer's real work, decayed and waiting in the
+kernel. The window has elapsed before `calibrate` starts. It costs nothing and perturbs
+nothing. Its one limitation is that a moment is not a day: a machine measured at 07:00 idle and
+the same machine at 15:00 with Xcode indexing are three run-queue units apart
+([climb-condition.md](climb-condition.md) §4.3 measured **2.91 per core** on this host
+mid-work, against a settled 0.35). `calibrate` prints the reading and the time, records both in
+the provenance, and says to re-run it mid-session.
+
+**The probe measures something else entirely: effective cores, for `B_max`.** Throughput is
+instantaneous and therefore *is* measurable in seconds, which is what separates it from the
+run queue. `runtime.NumCPU()` reports 8 on a machine with four performance and four efficiency
+cores; the probe measures parallel throughput over single-worker throughput and reports about
+**6.1**, which is what that hardware physically predicts. It also catches, without enumerating
+them, every other reason a core is not a core — SMT siblings, a noisy cloud neighbour, a quota
+the cgroup reader missed. A calibrated `B_max` may only **lower** the per-tick
+`floor(capacity / 1.2)`, never raise it, because that recomputation exists so a cgroup quota
+changed under a running daemon is followed within the second.
+
+**The probe's estimator is the maximum over repetitions, and that is a measured choice.**
+Background work can only ever depress the ratio, so the noise is one-sided and the hardware's
+true scaling is the upper envelope. Measured: a single three-phase reading, taken twelve times
+as this host settled, ranged **1.89 to 6.05** — a 3.2× spread on a fixed property, with four of
+twelve failing their drift check. The maximum over five, taken six times across background load
+from 7.9 to 12.1, gave **5.70, 5.71, 6.31, 5.69, 6.53, 6.81**. The estimator that survives a
+50% change in background load is the one measuring the machine. The probe is announced before
+it runs, is about 3.8 s of load, and declines outright on a machine already loaded past 4.0 per
+core, where it would be measuring the other workload.
+
+**Not calibrated: the setpoint, and the EWMA window.** Both would be numbers no code reads. The
+setpoint stopped being a control input when GOV-32 removed utilisation from the loop. The EWMA
+window smooths CPU, which after the same change survives only as the diagnostic column `status`
+and `tools/sweep` report — and the one alternative, smoothing the run queue instead, is worse
+than leaving it alone, because `loadavg1` is already a one-minute average and the loop is
+already the slower of the two on a rising edge. Writing either would be the exact failure GOV-32
+named when it struck the setpoint from GOV-25's own acceptance criteria.
+
+[calibration.md](calibration.md) carries the re-sweep of the threshold against this loop.
 
 ### 5.3 Thermal
 
@@ -1177,8 +1262,8 @@ claude-governor/                  the repo
 └── bin/governor                  the binary those hooks run
 
 state  → ~/.claude/governor/      sock, daemon.pid, daemon.log, daemon.start, statusline.json,
-                                  onboarded, surface.json, surface.json.tmp, samples.jsonl,
-                                  sampler.lock, sampler.log
+                                  onboarded, surface.json, surface.json.tmp, config.json,
+                                  samples.jsonl, sampler.lock, sampler.log
 config → ${CLAUDE_PLUGIN_DATA}/config.json, falling back to the state directory
 ```
 
@@ -1530,7 +1615,10 @@ being asked of them is to run a hook on every subagent spawn.
 - **`doctor` diagnoses, it does not describe.** It is the first thing a confused user runs,
   and every check it fails must name the fix.
 - **Defaults come from the machine.** `calibrate` measures this host and writes real numbers;
-  no constant compiled in from Peter's laptop ships as anyone else's default.
+  no constant compiled in from Peter's laptop ships as anyone else's default. It runs at the
+  end of `install` and can be re-run by hand — and re-running it *while actually working* is
+  the documented advice, because the quantity it measures is what the machine is already
+  doing. See §5.2a.
 
 ### 13.2 Command surface
 
@@ -1540,7 +1628,7 @@ being asked of them is to run a hook on every subagent spawn.
 | `governor install` | write the plugin (manifest, hooks, binary), merge the statusline into settings (after backup), start the daemon, print exactly what it touched, then run `doctor` and exit non-zero if it fails |
 | `governor uninstall` | reverse all of it, restore the settings backup, stop the daemon, remove state on `--purge` |
 | `governor doctor` | daemon reachable? hooks registered? matcher matches the real tool name? **are the sessions running right now actually governed?** binary and plugin versions agree? config schema current? each failure names its fix |
-| `governor calibrate` | measure cores, performance cores, RAM and a short load probe; write setpoint and B_max for *this* machine |
+| `governor calibrate` | measure cores, performance cores, RAM, this host's ambient run queue and a short load probe; write the run-queue cut threshold and B_max for *this* machine, with a provenance note |
 | `governor version` | binary version, protocol version, config schema version |
 
 GOV-20 shipped `doctor`, and it reports eleven findings rather than the six checks this table
@@ -1679,6 +1767,7 @@ Uninstall is only verifiable if this list is exhaustive, so it is normative.
 | `~/.claude/governor/onboarded` | `session start`, only in the fallback below, and only when the directory already exists | uninstall |
 | `~/.claude/governor/surface.json` | daemon, when it first sees a spawn tool name it has not recorded for that Claude Code version (GOV-30) | uninstall |
 | `~/.claude/governor/surface.json.tmp` | daemon, staging the file above before the rename | uninstall |
+| `~/.claude/governor/config.json` | `calibrate`, **only** when `${CLAUDE_PLUGIN_DATA}` is unset — see below | uninstall |
 | `~/.claude/governor/` | daemon (`transport.Listen`) | uninstall, only once it is empty; `--purge` regardless |
 | `~/.claude/plugins/data/claude-governor-skills-dir/` (`${CLAUDE_PLUGIN_DATA}`: config, onboarding marker) | Claude Code creates it; the governor writes config.json and `onboarded` | uninstall `--purge` only |
 
@@ -1721,6 +1810,21 @@ by hand, or a `doctor` run outside a plugin context — `config.json` resolves t
 directory above, beside the socket, rather than to a location of its own. One directory holds
 all of the governor's state, and a second home for the config would be a path uninstall
 silently stops covering.
+
+**So `config.json` has two rows in this table, and a plain uninstall removes exactly one of
+them** — the state-directory copy, on the same rule `onboarded` follows: in a plugin context
+your calibration survives an ordinary uninstall and only `--purge` discards it, because
+reinstalling is the same machine and re-measuring it is work you already did; outside one there
+is no such directory and it goes with everything else.
+
+GOV-25 is why both rows exist. Before it, `install` wrote no config at all, so the state-
+directory path was reachable only by running `calibrate` by hand and its absence from
+`stateFiles` cost nothing. The moment install started calibrating, an uninstall left
+`config.json` behind and `~/.claude/governor/` could never empty — and every existing test
+stayed green, because `TestUninstallLeavesTheMachineByteIdentical` digests the home directory
+and that fixture keeps the state directory outside it. `TestUninstallEmptiesTheStateDirectory`
+is the one that now covers it, asserted against a listing rather than against `stateFiles`, so
+a file missing from both cannot pass.
 
 `onboarded` is the record that the first-run notice has been shown (GOV-22), and it lives
 beside `config.json` for `config.json`'s reason: one directory holds the governor's state, and
@@ -1818,6 +1922,30 @@ store treats it. **A missing file is not one of them**: a machine that has never
 Every config key ships with a default that leaves its feature **inert**. An upgraded binary
 reading an old config must behave exactly as it did before until the user opts in, which is
 what makes an upgrade a non-event rather than a change of behaviour nobody asked for.
+
+The keys, and who owns each:
+
+| Key | Written by | Read by | Absent means |
+|---|---|---|---|
+| `schema` | every write | `Load`, `doctor` | refused — nothing can tell which version wrote it |
+| `endpoint` | the user, by hand | — | the default endpoint |
+| `run_queue_max` | `calibrate` | the daemon, into `budget.Controller` | the compiled-in `RunQueueMax` |
+| `b_max` | `calibrate` | the daemon, as a **cap** on `floor(capacity / 1.2)` | the per-tick derivation alone |
+| `calibrated_at` | `calibrate` | `doctor` | this host has never been measured |
+| `calibrated_from` | `calibrate` | `doctor`, and a person reading the file | as above |
+| `setpoint` | nothing | nothing | — |
+| `wait_max_ms` | the user, by hand | — | the compiled-in wait budget |
+
+`setpoint` is in that table with two dashes on purpose. It is no longer written and no longer
+read, and the key is kept only so a config written before GOV-32 still round-trips instead of
+being reported as unrecognised. §5.2a has the reasoning.
+
+**The daemon reads this file once, at start-up, and the gate never reads it at all.** The
+gate's whole cost is process start — ~6 ms against ~0.6 ms of round trip — so a file read on
+every `Bash` call to look up a constant the daemon already holds would spend the one budget
+that matters. Every failure to read resolves to "this host was never calibrated" and the
+compiled-in defaults: a daemon that refused to start over an unreadable tuning file would take
+the machine ungoverned to protect a number that has a working default.
 
 **Never overwrite the binary in place.** Measured in GOV-02, on macOS: `cp` onto the existing
 `bin/governor` invalidates its code signature, and the kernel then **SIGKILLs** every

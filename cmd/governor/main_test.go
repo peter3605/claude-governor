@@ -101,15 +101,22 @@ func registered(name string) bool {
 // A stub must look like a grant, not a refusal: the gate's grant path is exit 0 with an
 // empty stdout, and anything on stdout is read by Claude Code as a hook decision.
 //
-// version, status, statusline and doctor are exempt because they are implemented and
-// printing is their job, and daemon because it does not return. None of the five is wired to
-// a hook, so none of their stdout is ever read as a decision.
+// version, status, statusline, doctor and calibrate are exempt because they are implemented
+// and printing is their job, and daemon because it does not return. None of the six is wired
+// to a hook, so none of their stdout is ever read as a decision.
 //
 // statusline is the one worth being explicit about: its stdout IS read by Claude Code, but
 // as the text of the status line rather than as a permission decision, and it is required
 // to produce a line even when everything has gone wrong. The rule this test enforces —
 // silence on stdout — is the opposite of that command's contract, not a weaker version of it.
-var implemented = map[string]bool{"version": true, "status": true, "statusline": true, "doctor": true}
+var implemented = map[string]bool{
+	"version": true, "status": true, "statusline": true, "doctor": true,
+	// calibrate reports what it measured and what it derived, which is the whole point of
+	// running it by hand. It is NOT in `mutating`, because the file it writes is
+	// config.json in the state directory and isolateRealState already redirects that —
+	// unlike install, whose blast radius is HOME and cannot be redirected process-wide.
+	"calibrate": true,
+}
 
 func TestStubsWriteNothingToStdout(t *testing.T) {
 	isolateRealState(t)

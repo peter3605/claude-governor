@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -221,6 +222,7 @@ func (d *diagnosis) run() {
 	d.checkProtocol()
 	d.checkBinary()
 	d.checkConfig()
+	d.checkCalibration()
 	d.checkSessions()
 	d.checkLeases()
 	d.checkStrayDaemons()
@@ -1795,4 +1797,86 @@ func sameFile(a, b string) bool {
 		return false
 	}
 	return os.SameFile(fa, fb)
+}
+
+// ---------------------------------------------------------------------------
+// calibration
+// ---------------------------------------------------------------------------
+
+// checkCalibration reports whether this host's limits were measured on this host.
+//
+// IT IS SEPARATE FROM checkConfig BECAUSE THE TWO HAVE DIFFERENT FIXES, which is the same
+// reason design.md section 13.2 records for splitting "versions agree" into three findings: a
+// line carrying two fixes is a line nobody acts on. checkConfig asks whether the file can be
+// read at all and its fix is to move it aside; this asks whether anybody ever measured this
+// machine and its fix is to run one command.
+//
+// NEVER CALIBRATED IS A WARN, NOT A FAIL. Every calibrated key ships with a default that
+// leaves it inert (section 13.4), so an uncalibrated governor works — it just works to
+// constants measured on somebody else's laptop, which is precisely the thing the project rule
+// objects to. That is real, worth printing, and not a defect in this installation, which is
+// what the warn state is for. It does not move the exit code.
+//
+// A CALIBRATION FROM A DIFFERENT MACHINE IS THE CHECK WORTH HAVING. `${CLAUDE_PLUGIN_DATA}`
+// lives in a home directory, and home directories get synced, imaged and copied into
+// containers. A config carrying an 8-core laptop's ceiling on a 2-core container is not
+// corrupt and not from the future, so nothing else here would say a word about it — and the
+// number is wrong in the direction that over-admits.
+func (d *diagnosis) checkCalibration() {
+	path, err := config.Path()
+	if err != nil {
+		// checkConfig has already failed on this and named the fix. Saying it twice would
+		// print two problems for one cause, which is what the skip state is for.
+		d.add("calibration", skip, "cannot locate the config", "")
+		return
+	}
+	store := &config.FileStore{Path: path}
+	c, err := store.Load(context.Background())
+	if err != nil {
+		d.add("calibration", skip, "the config could not be read; see the config check above", "")
+		return
+	}
+	if c.CalibratedAt == "" {
+		d.add("calibration", warn,
+			"this host has never been measured, so the budget runs on constants measured on another machine",
+			"governor calibrate")
+		return
+	}
+
+	detail := fmt.Sprintf("measured %s: run-queue cut %.2f per core, b_max %d slots",
+		c.CalibratedAt, c.RunQueueMax, c.BMax)
+
+	if cores, ok := coresInProvenance(c.CalibratedFrom); ok {
+		if now := runtime.NumCPU(); now != cores {
+			d.add("calibration", warn,
+				fmt.Sprintf("calibrated on a %d-core machine and this one has %d — the numbers are somebody else's", cores, now),
+				"governor calibrate")
+			return
+		}
+	}
+	d.add("calibration", pass, detail, "")
+}
+
+// coresInProvenance digs the core count back out of the provenance note.
+//
+// READING IT BACK OUT OF PROSE IS NOT THE NICE VERSION, and the nice version is a structured
+// field. It is done this way because the note is written to be read by a PERSON opening
+// config.json — that is the whole reason it exists — and adding a parallel machine-readable
+// copy of one number inside it would be two representations of the same fact, which is how
+// they come to disagree. The failure mode is benign and one-directional: a note this cannot
+// parse produces no finding at all, never a wrong one.
+func coresInProvenance(note string) (int, bool) {
+	_, rest, found := strings.Cut(note, "; ")
+	if !found {
+		return 0, false
+	}
+	count, _, found := strings.Cut(rest, " cores")
+	if !found {
+		return 0, false
+	}
+	n, err := strconv.Atoi(strings.TrimSpace(count))
+	if err != nil || n <= 0 {
+		return 0, false
+	}
+	return n, true
 }

@@ -59,7 +59,7 @@ var commands = []command{
 	{"install", "install the plugin, hooks and daemon", runInstall},
 	{"uninstall", "reverse install and restore the settings backup", runUninstall},
 	{"doctor", "diagnose a broken install and name each fix", runDoctor},
-	{"calibrate", "measure this host and write its defaults", stub("calibrate")},
+	{"calibrate", "measure this host and write its defaults", runCalibrate},
 	{"version", "print binary, protocol and config schema versions", runVersion},
 }
 

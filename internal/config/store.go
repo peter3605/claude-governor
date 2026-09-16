@@ -53,22 +53,28 @@ var _ Store = (*FileStore)(nil)
 // knownKeys maps each JSON key to the Config field it fills. Anything not listed here is an
 // unknown key: preserved, warned about, never dropped and never fatal.
 const (
-	keySchema    = "schema"
-	keyEndpoint  = "endpoint"
-	keySetpoint  = "setpoint"
-	keyBMax      = "b_max"
-	keyWaitMaxMS = "wait_max_ms"
+	keySchema         = "schema"
+	keyEndpoint       = "endpoint"
+	keySetpoint       = "setpoint"
+	keyBMax           = "b_max"
+	keyRunQueueMax    = "run_queue_max"
+	keyCalibratedAt   = "calibrated_at"
+	keyCalibratedFrom = "calibrated_from"
+	keyWaitMaxMS      = "wait_max_ms"
 )
 
 // document is the typed view of the known keys. Every field is a pointer so that "absent"
 // and "present and zero" stay distinguishable, and every field is omitempty on the way out
 // only through explicitly building the map in Save.
 type document struct {
-	Schema    *int     `json:"schema"`
-	Endpoint  *string  `json:"endpoint"`
-	Setpoint  *float64 `json:"setpoint"`
-	BMax      *int     `json:"b_max"`
-	WaitMaxMS *int     `json:"wait_max_ms"`
+	Schema         *int     `json:"schema"`
+	Endpoint       *string  `json:"endpoint"`
+	Setpoint       *float64 `json:"setpoint"`
+	BMax           *int     `json:"b_max"`
+	RunQueueMax    *float64 `json:"run_queue_max"`
+	CalibratedAt   *string  `json:"calibrated_at"`
+	CalibratedFrom *string  `json:"calibrated_from"`
+	WaitMaxMS      *int     `json:"wait_max_ms"`
 }
 
 func (s *FileStore) targetSchema() int {
@@ -155,6 +161,15 @@ func (s *FileStore) Load(ctx context.Context) (Config, error) {
 	if typed.BMax != nil {
 		c.BMax = *typed.BMax
 	}
+	if typed.RunQueueMax != nil {
+		c.RunQueueMax = *typed.RunQueueMax
+	}
+	if typed.CalibratedAt != nil {
+		c.CalibratedAt = *typed.CalibratedAt
+	}
+	if typed.CalibratedFrom != nil {
+		c.CalibratedFrom = *typed.CalibratedFrom
+	}
 	if typed.WaitMaxMS != nil {
 		c.WaitMaxMS = *typed.WaitMaxMS
 	}
@@ -219,7 +234,8 @@ func (s *FileStore) unknown(doc map[string]json.RawMessage) map[string]any {
 	var names []string
 	for k := range doc {
 		switch k {
-		case keySchema, keyEndpoint, keySetpoint, keyBMax, keyWaitMaxMS:
+		case keySchema, keyEndpoint, keySetpoint, keyBMax, keyWaitMaxMS,
+			keyRunQueueMax, keyCalibratedAt, keyCalibratedFrom:
 			continue
 		}
 		names = append(names, k)
@@ -255,11 +271,14 @@ func (s *FileStore) Save(ctx context.Context, c Config) error {
 	target := s.targetSchema()
 
 	doc := map[string]any{
-		keySchema:    target,
-		keyEndpoint:  c.Endpoint,
-		keySetpoint:  c.Setpoint,
-		keyBMax:      c.BMax,
-		keyWaitMaxMS: c.WaitMaxMS,
+		keySchema:         target,
+		keyEndpoint:       c.Endpoint,
+		keySetpoint:       c.Setpoint,
+		keyBMax:           c.BMax,
+		keyRunQueueMax:    c.RunQueueMax,
+		keyCalibratedAt:   c.CalibratedAt,
+		keyCalibratedFrom: c.CalibratedFrom,
+		keyWaitMaxMS:      c.WaitMaxMS,
 	}
 	for k, v := range c.Unknown {
 		if _, clash := doc[k]; clash {

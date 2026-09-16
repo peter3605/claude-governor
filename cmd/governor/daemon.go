@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/peter3605/claude-governor/internal/budget"
+	"github.com/peter3605/claude-governor/internal/config"
 	"github.com/peter3605/claude-governor/internal/lease"
 	"github.com/peter3605/claude-governor/internal/signals"
 	"github.com/peter3605/claude-governor/internal/transport"
@@ -400,6 +401,14 @@ type daemon struct {
 	// a moving budget from nothing, and LocalSource falls back to its fixed N.
 	loop *budget.Controller
 
+	// calibratedBMax is the ceiling `governor calibrate` measured for this host, in slots.
+	//
+	// Zero means uncalibrated, and the ceiling is then whatever budget.MaxSlots derives from
+	// CPUCapacity — byte-identical behaviour to before GOV-25, which is the inert default
+	// design.md section 13.4 requires of every config key. See ceiling for why a calibrated
+	// value CAPS that derivation rather than replacing it.
+	calibratedBMax int
+
 	// sampler reads this host's load. It is nil unless something wired one in, and a nil
 	// sampler means the daemon reports every signal as null rather than as zero.
 	//
@@ -723,7 +732,9 @@ func (d *daemon) observeThisMachine() {
 	// The loop is wired here and nowhere else, beside the sampler that feeds it. A daemon
 	// built by a test has neither, and so keeps the fixed budget it was constructed with —
 	// which is what lets a lease test assert against a number it chose.
-	d.loop = &budget.Controller{RunQueueMax: runQueueMaxOverride(d.diag)}
+	cal := loadCalibration(d.diag)
+	d.loop = &budget.Controller{RunQueueMax: resolveRunQueueMax(cal, d.diag)}
+	d.calibratedBMax = cal.BMax
 	d.sources = []budget.Source{budget.LocalSource{
 		Live:  d.liveBudget,
 		InUse: d.table.InUse,
@@ -881,7 +892,7 @@ func (d *daemon) sample(ctx context.Context) {
 				// The ceiling comes from the machine on every tick rather than once at
 				// start-up, because CPUCapacity is the cgroup quota where there is one and a
 				// quota can be changed under a running daemon.
-				d.loop.Max = budget.MaxSlots(s.CPUCapacity)
+				d.loop.Max = d.ceiling(s.CPUCapacity)
 				d.loop.Step(budget.Reading{
 					CPU:           avg,
 					RunQueue:      s.RunQueue,
@@ -1409,4 +1420,80 @@ func sourceName(quotas []budget.Quota) string {
 		}
 	}
 	return name
+}
+
+// loadCalibration reads what `governor calibrate` measured for this host.
+//
+// IT IS READ ONCE, IN THE DAEMON, AND NEVER ON THE HOT PATH. The gate's whole cost is process
+// start (~6 ms against ~0.6 ms of round trip, measured in GOV-15), so adding a file read to
+// every Bash call to look up a constant would be spending the one budget that matters on
+// information the daemon already has. The daemon holds it and the gate asks the daemon, which
+// is the arrangement every other signal already uses.
+//
+// EVERY FAILURE PATH RETURNS THE ZERO CONFIG, WHICH MEANS THE COMPILED-IN DEFAULTS. A config
+// that is missing, unreadable, from the future or malformed all resolve to "this host was
+// never calibrated" — a state and not a fault (design.md section 13.4). The alternative is a
+// daemon that refuses to start because a tuning file was unreadable, which takes the machine
+// ungoverned in order to protect a number that has a working default.
+func loadCalibration(diag io.Writer) config.Config {
+	path, err := config.Path()
+	if err != nil {
+		fmt.Fprintf(diag, "governor daemon: cannot locate config, using built-in defaults: %v\n", err)
+		return config.Config{}
+	}
+	store := &config.FileStore{Path: path, Warn: func(s string) { fmt.Fprintln(diag, s) }}
+	c, err := store.Load(context.Background())
+	if err != nil {
+		fmt.Fprintf(diag, "governor daemon: cannot read %s, using built-in defaults: %v\n", path, err)
+		return config.Config{}
+	}
+	return c
+}
+
+// resolveRunQueueMax picks the threshold this daemon cuts at, from three possible sources.
+//
+// THE ORDER IS ENVIRONMENT, THEN CONFIG, THEN THE COMPILED-IN CONSTANT, and each step has a
+// different owner. The environment variable is tools/sweep's experiment handle and has to win,
+// because a sweep that silently measured the calibrated value instead of the one it set would
+// produce a confident wrong number — which is exactly the failure GOV-31's first pass made and
+// had to discard a run over. The config is what `governor calibrate` wrote for this machine.
+// The constant is what ships.
+//
+// GOV-25 IS WHY THE MIDDLE ENTRY EXISTS. budget.Controller.RunQueueMax carried a note that it
+// was deliberately NOT part of internal/config, because putting a knob there asserts that the
+// right value is host-dependent and that was a claim the sweep had to earn. GOV-31 could not
+// earn it: its sweep found the threshold nearly inert, and docs/climb-condition.md §7 records
+// why — the CPU disjunct decided every cut before the threshold was consulted. GOV-32 removed
+// the disjunct. The claim is now earned by measurement: docs/calibration.md.
+func resolveRunQueueMax(c config.Config, diag io.Writer) float64 {
+	if v := runQueueMaxOverride(diag); v > 0 {
+		return v
+	}
+	if c.RunQueueMax > 0 {
+		fmt.Fprintf(diag, "governor daemon: run-queue threshold %g, calibrated for this host (%s)\n",
+			c.RunQueueMax, c.CalibratedAt)
+		return c.RunQueueMax
+	}
+	return 0
+}
+
+// ceiling is the most build concurrency this daemon will allow, in slots.
+//
+// A CALIBRATED B_MAX CAPS THE DERIVED ONE RATHER THAN REPLACING IT, and the asymmetry is
+// deliberate. budget.MaxSlots is recomputed from CPUCapacity on every tick, on purpose: a
+// cgroup quota is bandwidth that can be changed under a running daemon, and a container
+// throttled from eight cores to two must have its ceiling follow it down within the second.
+// A calibrated value that simply replaced that would break the one case the per-tick
+// recomputation exists for.
+//
+// So calibration may only lower the ceiling. That is also the only direction it has evidence
+// for: the probe measures that this host delivers FEWER effective cores than it advertises —
+// six of eight, where four are efficiency cores — and a measurement that says "you have less
+// than you think" cannot justify handing out more than the quota allows.
+func (d *daemon) ceiling(capacity float64) int {
+	max := budget.MaxSlots(capacity)
+	if d.calibratedBMax > 0 && d.calibratedBMax < max {
+		return d.calibratedBMax
+	}
+	return max
 }

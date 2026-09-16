@@ -20,6 +20,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/peter3605/claude-governor/internal/config"
 	"github.com/peter3605/claude-governor/internal/signals"
 	"github.com/peter3605/claude-governor/internal/transport"
 )
@@ -126,8 +127,24 @@ func resolvePaths() (paths, error) {
 // measurement, and throwing it away on uninstall would throw away the phase. The directory
 // itself is removed only once it is empty, so a machine that still has its samples keeps
 // them and everything else goes.
+// stateFiles is every file the governor writes into the state directory, and it is the list
+// uninstall removes. design.md section 13.3 is the normative version; this must agree with it.
+//
+// config.File IS IN THIS LIST AND onboardMarker'S COMMENT EXPLAINS WHY. Both files live in
+// ${CLAUDE_PLUGIN_DATA} when Claude Code has named one, and fall back to the state directory
+// when it has not. In the plugin case a plain uninstall keeps them and only --purge removes
+// them, deliberately: reinstalling after an ordinary uninstall is the same machine and the
+// same person, and throwing away their calibration is as unwelcome as re-showing the first-run
+// notice. In the fallback case there is no such directory, so they are removed here along with
+// everything else — which is also what stops the state directory from failing to empty.
+//
+// GOV-25 ADDED config.File AND IT LEAKED UNTIL IT DID. `install` did not write a config before
+// GOV-25, so nothing in the state directory needed removing and its absence from this list
+// cost nothing. The moment install started calibrating, an uninstall left config.json behind
+// and ~/.claude/governor/ could never empty — the one piece of residue a user cannot see in a
+// directory listing they were told would be gone.
 var stateFiles = []string{"sock", "statusline.json", daemonPIDFile, daemonLogFile, daemonStartFile, onboardMarker,
-	surfaceFile, surfaceTempFile}
+	surfaceFile, surfaceTempFile, config.File}
 
 // ---------------------------------------------------------------------------
 // the plugin's files
@@ -399,6 +416,13 @@ func runInstall(args []string, stdout, stderr io.Writer) int {
 		startDaemon(p, in.binaryReplaced, stdout, stderr)
 	}
 
+	// CALIBRATE BEFORE DOCTOR, NOT AFTER, so that the verification at the end of install sees
+	// the config this install wrote rather than the absence of one. It is also the last thing
+	// that touches the machine, which is what "runs automatically at the end of install"
+	// means: every file is in place and the daemon is up, so a calibration measuring this
+	// host measures the machine as the governor will actually find it.
+	calibrateDuringInstall(stdout, stderr)
+
 	fmt.Fprintln(stdout, "\nRemove it with: governor uninstall")
 	// The hooks are read when a session starts, so a session already running is not
 	// governed yet. Saying so is the difference between "it does not work" and "restart".
@@ -412,6 +436,25 @@ func runInstall(args []string, stdout, stderr io.Writer) int {
 		return 0
 	}
 	return verifyInstall(stdout, stderr)
+}
+
+// calibrateDuringInstall measures this host and writes its constants, as part of install.
+//
+// IT CANNOT FAIL THE INSTALL, and that is the whole of its error handling. Every number it
+// writes has a compiled-in default that works — that is the rule design.md section 13.4 states
+// for every config key, and it is what makes an upgrade a non-event. So a calibration that
+// cannot run leaves a governor that runs on the shipped constants, which is strictly better
+// than an install that refuses to complete because a load average was unreadable. The exit
+// code is deliberately discarded rather than propagated.
+//
+// The banner is printed first because the probe is about four seconds of full load and the
+// story's trap is explicit that an installer which pegs someone's CPU without warning is a bad
+// first impression. `calibrate` announces the probe itself as well; this line is what explains
+// why an install is suddenly busy.
+func calibrateDuringInstall(stdout, stderr io.Writer) {
+	fmt.Fprintln(stdout, "\n--- governor calibrate ---")
+	fmt.Fprintln(stdout, "Measuring this machine so its limits come from your hardware, not from ours.")
+	runCalibrate(nil, stdout, stderr)
 }
 
 // verifyInstall ends the install by running doctor and printing its findings (GOV-22).

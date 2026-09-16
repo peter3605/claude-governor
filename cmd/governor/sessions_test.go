@@ -110,6 +110,11 @@ func stageWorkingInstall(t *testing.T) *world {
 	t.Helper()
 	w := newWorld(t)
 	w.writeHooks(w.settings, selfBinary(t), goodHooks())
+	// A working install is a CALIBRATED one after GOV-25: `governor install` ends by running
+	// `calibrate`, so a machine with hooks and no calibration is not the ordinary state but
+	// the state of one whose calibration could not run — which doctor is supposed to warn
+	// about. See world.writeCalibration.
+	w.writeCalibration()
 	return w
 }
 

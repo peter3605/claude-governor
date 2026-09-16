@@ -1352,3 +1352,47 @@ func keysOf[V any](m map[string]V) []string {
 	sort.Strings(out)
 	return out
 }
+
+// TestUninstallEmptiesTheStateDirectory closes a blind spot in the byte-identical test above.
+//
+// THAT TEST SNAPSHOTS THE HOME DIRECTORY, AND THE STATE DIRECTORY IS NOT INSIDE IT in this
+// fixture — so a file left in the state directory is invisible to it. GOV-25 found that the
+// hard way: `install` began running `calibrate`, which writes config.json, and config.File was
+// not in stateFiles. Uninstall left it behind and ~/.claude/governor/ could then never empty,
+// with every existing test still green.
+//
+// So this asserts the property design.md section 13.3 actually promises — uninstall leaves no
+// file it wrote — against the directory the other test cannot see. It is deliberately written
+// against a LISTING rather than against stateFiles, because a test that iterated the same list
+// the implementation removes would pass for any file missing from both.
+func TestUninstallEmptiesTheStateDirectory(t *testing.T) {
+	p := stagedHome(t)
+
+	installOK(t)
+	entries, err := os.ReadDir(p.state)
+	if err != nil {
+		t.Fatalf("install left no state directory to check: %v", err)
+	}
+	if len(entries) == 0 {
+		t.Fatal("install wrote nothing to the state directory; this test would pass vacuously")
+	}
+	var wrote []string
+	for _, e := range entries {
+		wrote = append(wrote, e.Name())
+	}
+	t.Logf("install wrote %v", wrote)
+
+	uninstallOK(t)
+
+	entries, err = os.ReadDir(p.state)
+	if os.IsNotExist(err) {
+		return // removed once empty, which is the promise
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range entries {
+		t.Errorf("uninstall left %s behind, so %s can never empty — add it to stateFiles and to design.md section 13.3",
+			e.Name(), p.state)
+	}
+}
