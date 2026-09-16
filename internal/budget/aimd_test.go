@@ -276,11 +276,13 @@ func oneMediumBuild() tick { return tick{cpu: 0.77, runQueue: 1.22, demand: true
 func TestOneMediumBuildsRunQueueDoesNotFloorTheBudget(t *testing.T) {
 	c := &Controller{Max: MaxSlots(8)}
 	b := oneMediumBuild()
-	// CPU held under the cut so that the run queue is the only thing that can fire. The
-	// measured p50 of 0.77 is itself under Setpoint+SetpointBand; see the sibling test for
-	// what happens at the measured distribution rather than its median.
+	// The build's OWN measured CPU is used here, not a value held under the cut. Until GOV-32
+	// this test had to pass CPU 0.60 so that the run queue was the only thing that could
+	// fire, because the real reading — 0.77 — sat close enough to the cut that the test would
+	// have been measuring the CPU disjunct instead of the threshold it names. The loop no
+	// longer cuts on utilisation, so the measurement can be used as measured.
 	for i := 0; i < 20; i++ {
-		c.Step(Reading{CPU: 0.60, RunQueue: b.runQueue, DemandWaiting: true})
+		c.Step(Reading{CPU: b.cpu, RunQueue: b.runQueue, DemandWaiting: true})
 	}
 	if got := c.Budget(); got <= Floor {
 		t.Errorf("one Medium build's run-queue pressure (%.2f per core, measured) drove the "+
@@ -290,50 +292,142 @@ func TestOneMediumBuildsRunQueueDoesNotFloorTheBudget(t *testing.T) {
 	}
 }
 
-// TestUnderBuildLoadTheSetpointBindsAndTheRunQueueDoesNot pins the finding that made GOV-31's
-// sweep come back empty, so that a later session does not re-run it expecting a different
-// answer.
+// TestUnderBuildLoadTheRunQueueDecidesAndTheBudgetCanLeaveTheFloor replaces
+// TestUnderBuildLoadTheSetpointBindsAndTheRunQueueDoesNot, which pinned the behaviour GOV-32
+// removed.
 //
-// The loop cuts on `CPU > Setpoint+SetpointBand` OR `RunQueue > RunQueueMax`. Measured across
-// a ten-way fan-out, host CPU sits at p50 1.00 and is above the cut on 72-99% of ticks
-// (docs/run-queue-sweep.md sections 2 and 4), so the CPU disjunct decides and the run-queue
-// threshold is shadowed. Five values of RunQueueMax from 1.2 to 6.0, measured twice under the
-// same load, produced no difference the experiment could detect.
+// WHAT THE OLD TEST SAID, because deleting it silently would erase the finding it recorded:
+// the loop cut on `CPU > Setpoint+SetpointBand || RunQueue > RunQueueMax`, host CPU under a
+// fan-out sits at p50 1.00, so the CPU disjunct decided every cut and five values of
+// RunQueueMax from 1.2 to 6.0 produced no difference any experiment could detect. That was
+// true, it was GOV-31's real finding, and it is now false BY CONSTRUCTION rather than by
+// retuning: the CPU disjunct is gone. docs/climb-condition.md section 3 is why.
 //
-// The test states that as a property: at build-load CPU, the budget floors identically no
-// matter what the run-queue threshold is.
-func TestUnderBuildLoadTheSetpointBindsAndTheRunQueueDoesNot(t *testing.T) {
-	// The measured fan-out reading: CPU pegged, run queue well under even a raised threshold.
-	const fanOutCPU, fanOutRunQueue = 1.00, 2.5
+// The property this asserts is the mirror image: at build-load CPU, the run-queue threshold is
+// the only thing that decides, so a different threshold must give a different answer.
+func TestUnderBuildLoadTheRunQueueDecidesAndTheBudgetCanLeaveTheFloor(t *testing.T) {
+	// The measured fan-out reading: CPU pegged throughout, which is now a fact about the
+	// machine that the loop does not act on.
+	const fanOutCPU = 1.00
 
-	var floors []int
-	for _, threshold := range []float64{1.2, 2.0, 3.0, 4.5, 6.0} {
+	// Three builds' measured run queue (2.55, docs/run-queue-sweep.md section 4) is over the
+	// shipped threshold and under a raised one. The old loop floored at every threshold here;
+	// the new one must not, or the threshold is still shadowed by something.
+	const threeBuilds = 2.55
+	settled := map[float64]int{}
+	for _, threshold := range []float64{2.0, 6.0} {
 		c := &Controller{Max: MaxSlots(8), RunQueueMax: threshold}
-		for i := 0; i < 20; i++ {
-			c.Step(Reading{CPU: fanOutCPU, RunQueue: fanOutRunQueue, DemandWaiting: true})
+		for i := 0; i < 40; i++ {
+			c.Step(Reading{CPU: fanOutCPU, RunQueue: threeBuilds, DemandWaiting: true})
 		}
-		floors = append(floors, c.Budget())
+		settled[threshold] = c.Budget()
 	}
-	for i, got := range floors {
-		if got != Floor {
-			t.Errorf("threshold %d of the sweep settled at %d, want the floor %d", i, got, Floor)
-		}
+	if settled[2.0] != Floor {
+		t.Errorf("at a threshold of 2.0 a run queue of %.2f settled at %d, want the floor %d: "+
+			"%.2f is over the threshold and must still cut", threeBuilds, settled[2.0], Floor, threeBuilds)
+	}
+	if settled[6.0] <= Floor {
+		t.Errorf("at a threshold of 6.0 a run queue of %.2f settled at %d; it is well under "+
+			"that threshold, so the budget must be able to sit above the floor. A floor here "+
+			"means something other than the run queue is still deciding", threeBuilds, settled[6.0])
 	}
 
-	// And the other half of the same finding: it cannot climb back either, because the
-	// increase needs CPU below Setpoint-Headroom = 0.65, which never happens while a build
-	// runs. Without this the reader could conclude the cut was transient.
-	c := &Controller{Max: MaxSlots(8), RunQueueMax: 6.0}
+	// And the half the story is named for: with CPU pegged for the whole run, the budget must
+	// climb back once the queue drains. Under the old loop this was the assertion that it
+	// could NOT.
+	c := &Controller{Max: MaxSlots(8)}
 	for i := 0; i < 20; i++ {
-		c.Step(Reading{CPU: fanOutCPU, RunQueue: fanOutRunQueue, DemandWaiting: true})
-	}
-	for i := 0; i < 50; i++ {
-		// Run queue now far below the threshold, CPU still pegged as it is throughout a build.
-		c.Step(Reading{CPU: fanOutCPU, RunQueue: 0.1, DemandWaiting: true})
+		c.Step(Reading{CPU: fanOutCPU, RunQueue: 10.0, DemandWaiting: true})
 	}
 	if got := c.Budget(); got != Floor {
-		t.Errorf("budget recovered to %d with CPU still at %.2f; the increase requires CPU "+
-			"below %.2f, so a build fan-out should pin it at the floor", got, fanOutCPU,
-			Setpoint-Headroom)
+		t.Fatalf("a run queue of 10.0 per core did not reach the floor (got %d); the rest of "+
+			"this test cannot tell a recovery from a budget that never cut", got)
 	}
+	for i := 0; i < 50; i++ {
+		// The queue has drained. CPU is still pegged, as it is for as long as any build runs.
+		c.Step(Reading{CPU: fanOutCPU, RunQueue: 0.1, DemandWaiting: true})
+	}
+	if got := c.Budget(); got != MaxSlots(8) {
+		t.Errorf("with the queue drained to 0.1 per core the budget recovered only to %d of "+
+			"%d, with CPU at %.2f throughout; B_max must be reachable while builds are "+
+			"running, which is the defect GOV-31 left open", got, MaxSlots(8), fanOutCPU)
+	}
+}
+
+// TestTheLoopSettlesWhereTheMachineSaturates closes the loop against the MEASURED response of
+// this host, rather than asserting against a reading chosen by hand.
+//
+// IT IS A MODEL AND IT IS LABELLED ONE. `runQueueFor` is the concurrency curve of
+// docs/run-queue-sweep.md section 4 — real measurements of what N concurrent builds do to the
+// run queue on this machine — interpolated between its points. Feeding the loop its own
+// consequences is the only way a unit test can ask "where does this settle", and the honest
+// caveat is that the curve was measured at steady state while `loadavg1` takes a minute to
+// get there. The fan-out arms in docs/climb-condition.md section 4 are the measurement; this
+// is the mechanism that explains their shape.
+//
+// WHAT IT PROTECTS. The operating point is set by where the curve crosses the threshold, and
+// both the curve and the threshold can move. If a later change puts the settling point back at
+// the floor, that is the GOV-32 defect returning; if it puts it at the ceiling, the loop has
+// stopped governing. Either way this fails and says which.
+func TestTheLoopSettlesWhereTheMachineSaturates(t *testing.T) {
+	c := &Controller{Max: MaxSlots(8)}
+	var last []int
+	for i := 0; i < 200; i++ {
+		b := c.Budget()
+		// CPU pegged from two builds onward, and 0.77 at one: the measured curve.
+		cpu := 1.00
+		if b <= 1 {
+			cpu = 0.77
+		}
+		c.Step(Reading{CPU: cpu, RunQueue: runQueueFor(b), DemandWaiting: true})
+		if i >= 180 {
+			last = append(last, c.Budget())
+		}
+	}
+
+	lo, hi := last[0], last[0]
+	for _, b := range last {
+		if b < lo {
+			lo = b
+		}
+		if b > hi {
+			hi = b
+		}
+	}
+	if lo <= Floor {
+		t.Errorf("driven by this machine's own measured response the budget still visits the "+
+			"floor (range %d..%d over the last 20 ticks). At one build this host reads CPU "+
+			"0.77 and run queue 1.22 per core — not full and not oversubscribed — so a loop "+
+			"that settles there is over-controlling, which is what GOV-32 fixed", lo, hi)
+	}
+	if hi >= MaxSlots(8) {
+		t.Errorf("the budget reached the ceiling %d (range %d..%d) against a run queue of "+
+			"%.2f per core at that concurrency; the loop is not reacting to saturation",
+			MaxSlots(8), lo, hi, runQueueFor(MaxSlots(8)))
+	}
+	t.Logf("closed against the measured curve, the budget settles in %d..%d slots "+
+		"(run queue %.2f..%.2f per core)", lo, hi, runQueueFor(lo), runQueueFor(hi))
+}
+
+// runQueueFor is this host's measured run-queue-per-core at N concurrent builds, interpolated.
+//
+// The points are docs/run-queue-sweep.md section 4's concurrency curve, measured ungoverned on
+// a settled machine, one level at a time. Above the last point it extrapolates from the final
+// segment, which is steep on purpose: that is where the curve actually goes.
+func runQueueFor(builds int) float64 {
+	curve := []struct{ n, rq float64 }{
+		{1, 1.22}, {2, 1.53}, {3, 2.55}, {4, 2.85}, {6, 4.83}, {8, 24.98},
+	}
+	n := float64(builds)
+	if n <= curve[0].n {
+		return curve[0].rq
+	}
+	for i := 1; i < len(curve); i++ {
+		if n <= curve[i].n {
+			lo, hi := curve[i-1], curve[i]
+			f := (n - lo.n) / (hi.n - lo.n)
+			return lo.rq + f*(hi.rq-lo.rq)
+		}
+	}
+	return curve[len(curve)-1].rq
 }

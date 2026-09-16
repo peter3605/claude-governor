@@ -84,6 +84,7 @@ type options struct {
 	reverse      bool
 	canary       bool
 	concurrency  []int
+	recovery     int
 }
 
 func run() error {
@@ -106,6 +107,7 @@ func run() error {
 		concurrency = flag.String("concurrency", "", "instead of sweeping thresholds, measure the run queue produced by each of these concurrent build counts, ungoverned")
 		reverse     = flag.Bool("reverse", false, "run the arms in reverse order, to separate the threshold's effect from the arm order's")
 		canary      = flag.Bool("canary", true, "time one build alone before each arm, as a check on whether the machine itself is drifting")
+		recovery    = flag.Int("recovery", 0, "instead of a fan-out, hold this many builds running continuously and record what the daemon's budget does; the measurement of whether the budget can climb while a build runs")
 	)
 	flag.Parse()
 
@@ -113,7 +115,7 @@ func run() error {
 		ungoverned: *ungoverned, builds: *builds, modules: *modules, funcs: *funcs,
 		window: *window, retry: *retry, settleBelow: *below, settleFor: *settleFor,
 		settleWait: *settleWait, workdir: *workdir, out: *out, keepWorkdir: *keep,
-		buildCommand: *buildCmd, reverse: *reverse, canary: *canary,
+		buildCommand: *buildCmd, reverse: *reverse, canary: *canary, recovery: *recovery,
 	}
 	for _, f := range strings.Split(*concurrency, ",") {
 		f = strings.TrimSpace(f)
@@ -137,8 +139,8 @@ func run() error {
 		}
 		o.thresholds = append(o.thresholds, v)
 	}
-	if len(o.thresholds) == 0 && !o.ungoverned && len(o.concurrency) == 0 {
-		return fmt.Errorf("nothing to measure: pass -thresholds, -concurrency, or -ungoverned")
+	if len(o.thresholds) == 0 && !o.ungoverned && len(o.concurrency) == 0 && o.recovery == 0 {
+		return fmt.Errorf("nothing to measure: pass -thresholds, -concurrency, -recovery, or -ungoverned")
 	}
 	abs, err := filepath.Abs(*governor)
 	if err != nil {
@@ -167,6 +169,9 @@ func run() error {
 		BuildCommand: o.buildCommand,
 	}
 
+	if o.recovery > 0 {
+		return runRecovery(ctx, o, work, &res)
+	}
 	if len(o.concurrency) > 0 {
 		return runCurve(ctx, o, work, &res)
 	}
@@ -209,23 +214,41 @@ func run() error {
 		plan[i].Position = i + 1
 		a, err := runArm(ctx, o, work, plan[i])
 		if err != nil {
+			// THE ARMS THAT DID FINISH ARE WRITTEN OUT ANYWAY, and the reason is a run that
+			// was lost. A sweep's last arm failed to settle — the previous arm had left the
+			// machine at loadavg 243 and five minutes was not enough decay — and because the
+			// results were serialised only after the whole plan completed, the completed arm's
+			// four minutes of measurement went with it. An arm is expensive and irreproducible;
+			// the failure that follows it is neither.
+			if werr := writeResults(o, res); werr != nil {
+				fmt.Fprintf(os.Stderr, "sweep: also failed to write partial results: %v\n", werr)
+			}
 			return err
 		}
 		res.Arms = append(res.Arms, a)
 		printArm(a)
+		// Written after every arm, not only at the end, for the same reason.
+		if err := writeResults(o, res); err != nil {
+			return err
+		}
 	}
 
 	fmt.Println()
 	printTable(res)
-	if o.out != "" {
-		b, err := json.MarshalIndent(res, "", "  ")
-		if err != nil {
-			return err
-		}
-		if err := os.WriteFile(o.out, append(b, '\n'), 0o644); err != nil {
-			return err
-		}
-		fmt.Fprintf(os.Stderr, "\nraw results written to %s\n", o.out)
+	return writeResults(o, res)
+}
+
+// writeResults serialises what has been measured so far. It is a no-op without -out.
+func writeResults(o options, res results) error {
+	if o.out == "" {
+		return nil
+	}
+	b, err := json.MarshalIndent(res, "", "  ")
+	if err != nil {
+		return err
+	}
+	if err := os.WriteFile(o.out, append(b, '\n'), 0o644); err != nil {
+		return err
 	}
 	return nil
 }
@@ -297,12 +320,60 @@ type arm struct {
 	CPUP50      float64 `json:"cpu_p50"`
 	CPUAboveCut float64 `json:"cpu_share_above_cut"`
 
+	// CutShare and ClimbShare are budget.Cutting and budget.Climbing evaluated over the
+	// busy window on the SMOOTHED CPU series — the loop's own conditions, over what the loop
+	// would actually have seen.
+	//
+	// CLIMBSHARE IS THE NUMBER GOV-32 CLAUSE 1 ASKS FOR. GOV-31 measured the cut side at
+	// 72-99% and left the increase side unmeasured, which is what let "the budget cannot
+	// climb back" stand as a reading of the code rather than as a measurement.
+	CPUEWMAP50 float64 `json:"cpu_ewma_p50"`
+	CutShare   float64 `json:"cut_condition_share"`
+	ClimbShare float64 `json:"climb_condition_share"`
+	// DroppedTicks is busy ticks discarded because host CPU would not read; see
+	// runQueue.sample. Non-zero here means the shares cover fewer ticks than the run-queue
+	// percentiles do, and it is reported rather than silently absorbed.
+	DroppedTicks int `json:"dropped_ticks,omitempty"`
+
+	// Series is the per-tick busy window, kept so that a later story can evaluate a NEW
+	// condition over this arm without re-running it.
+	//
+	// GOV-32 had to re-run GOV-31's entire sweep to answer a one-line question about the
+	// same load, because pass1.json and pass2.json recorded only summary statistics. A
+	// fan-out arm costs four minutes of a settled machine and cannot be reconstructed
+	// afterwards; the summary it collapses to costs nothing to keep in full.
+	Series *series `json:"series,omitempty"`
+
 	SettleSeconds float64 `json:"settle_seconds"`
 	WindowSeconds float64 `json:"window_seconds"`
 
 	// DaemonLog is the governed arm's budget event log, kept verbatim so the trajectory of
 	// the loop can be read back rather than reasoned about from the outside.
 	DaemonLog string `json:"daemon_log,omitempty"`
+
+	// Budgets is the daemon's budget read once per second, and BudgetMin/Max/Final summarise
+	// it. Recorded by -recovery only; the fan-out arms leave it empty.
+	//
+	// IT IS READ FROM `governor status` RATHER THAN INFERRED FROM THE EVENT LOG, because the
+	// log only prints a budget when something happens — a park, a denial, a new peak — so a
+	// budget that changed quietly between events is invisible in it. GOV-32 spent a
+	// measurement discovering that two arms with identical event logs could not be told apart.
+	Budgets     []int `json:"budgets,omitempty"`
+	BudgetMin   int   `json:"budget_min,omitempty"`
+	BudgetMax   int   `json:"budget_max,omitempty"`
+	BudgetFinal int   `json:"budget_final,omitempty"`
+}
+
+// series is one arm's busy window, tick by tick, at 1 Hz.
+//
+// RunQueue and CPU are index-aligned by construction (runQueue.sample drops a tick from both
+// or neither), so entry i of each is one moment on the machine. CPUEWMA is CPU after the 5 s
+// window the daemon applies, and is the series any condition of the loop's should be
+// evaluated against.
+type series struct {
+	RunQueue []float64 `json:"run_queue"`
+	CPU      []float64 `json:"cpu_raw"`
+	CPUEWMA  []float64 `json:"cpu_ewma"`
 }
 
 func printArm(a arm) {
@@ -311,25 +382,27 @@ func printArm(a arm) {
 		drain = fmt.Sprintf("%.1fs", a.DrainSeconds)
 	}
 	fmt.Printf("  -> admitted %d, refusals %d, completed %d, build CPU %.1f core-sec, "+
-		"run queue p50 %.2f p90 %.2f max %.2f, drain %s\n\n",
+		"run queue p50 %.2f p90 %.2f max %.2f, drain %s\n"+
+		"     cut condition on %.0f%% of busy ticks, climb condition on %.0f%%\n\n",
 		a.Admitted, a.Refusals, a.Completed, a.BuildTestCoreSec,
-		a.RunQueueP50, a.RunQueueP90, a.RunQueueMaxObserved, drain)
+		a.RunQueueP50, a.RunQueueP90, a.RunQueueMaxObserved, drain,
+		100*a.CutShare, 100*a.ClimbShare)
 }
 
 func printTable(r results) {
 	fmt.Printf("order: %s\n\n", r.Order)
-	fmt.Printf("%-18s %4s %8s %9s %12s %8s %8s %8s %8s %9s %9s\n",
+	fmt.Printf("%-18s %4s %8s %9s %12s %8s %8s %8s %8s %7s %7s %9s\n",
 		"arm", "pos", "canary s", "refusals", "build core-s",
-		"rq p50", "rq p90", "rq max", "cpu p50", "cpu>cut", "drain s")
+		"rq p50", "rq p90", "rq max", "cpu p50", "cut", "climb", "drain s")
 	for _, a := range r.Arms {
 		drain := "-"
 		if a.DrainSeconds >= 0 {
 			drain = fmt.Sprintf("%.1f", a.DrainSeconds)
 		}
-		fmt.Printf("%-18s %4d %8.1f %9d %12.1f %8.2f %8.2f %8.2f %8.2f %8.0f%% %9s\n",
+		fmt.Printf("%-18s %4d %8.1f %9d %12.1f %8.2f %8.2f %8.2f %8.2f %6.0f%% %6.0f%% %9s\n",
 			a.Name, a.Position, a.CanarySeconds, a.Refusals, a.BuildTestCoreSec,
 			a.RunQueueP50, a.RunQueueP90, a.RunQueueMaxObserved,
-			a.CPUP50, 100*a.CPUAboveCut, drain)
+			a.CPUP50, 100*a.CutShare, 100*a.ClimbShare, drain)
 	}
 }
 
@@ -490,6 +563,14 @@ func runArm(ctx context.Context, o options, work *workload, a arm) (arm, error) 
 	if len(rq.cpu) > 0 {
 		cpuShare = float64(above) / float64(len(rq.cpu))
 	}
+	smP50, _, _ := stats(rq.smoothed)
+	cutShare, climbShare, _ := rq.conditions(armRunQueueMax(a), armClimbRunQueue(a))
+	dropped := rq.dropped
+	ser := &series{
+		RunQueue: append([]float64(nil), rq.busy...),
+		CPU:      append([]float64(nil), rq.cpu...),
+		CPUEWMA:  append([]float64(nil), rq.smoothed...),
+	}
 	mu.Unlock()
 
 	a.Admitted = int(admitted.Load())
@@ -506,8 +587,33 @@ func runArm(ctx context.Context, o options, work *workload, a arm) (arm, error) 
 	a.WindowRunQueueP50, a.WindowRunQueueP90, a.WindowRunQueueMax = wp50, wp90, wmax
 	a.WindowRunQueueSamples = wn
 	a.CPUP50, a.CPUAboveCut = cpuP50, cpuShare
+	a.CPUEWMAP50, a.CutShare, a.ClimbShare = smP50, cutShare, climbShare
+	a.DroppedTicks = dropped
+	a.Series = ser
 	a.WindowSeconds = time.Since(start).Seconds()
 	return a, nil
+}
+
+// armRunQueueMax is the threshold this arm's condition shares are evaluated against.
+//
+// An ungoverned arm has no threshold of its own, and the shipped constant is used. The
+// question that answers — "what would the loop have done on this load" — is the only reading
+// of an ungoverned arm that says anything about the controller rather than about the machine.
+func armRunQueueMax(a arm) float64 {
+	if a.RunQueueMax > 0 {
+		return a.RunQueueMax
+	}
+	return budget.RunQueueMax
+}
+
+// armClimbRunQueue is the level this arm's loop climbs at: one band below where it cuts, which
+// is how internal/budget derives it so that sweeping the cut threshold moves both together.
+func armClimbRunQueue(a arm) float64 {
+	at := armRunQueueMax(a) - budget.RunQueueBand
+	if at <= 0 {
+		at = armRunQueueMax(a) / 2
+	}
+	return at
 }
 
 // runBuild runs one build request's command in one module, to completion or to the window's
@@ -754,6 +860,21 @@ type runQueue struct {
 	// not have decided anything — and every arm of a build fan-out is that arm. Measuring
 	// only the quantity under test would have left that invisible.
 	cpu []float64
+	// smoothed is the same tick's CPU after the 5 s EWMA the daemon applies before the loop
+	// ever sees it (section 5.1: signals.EWMA owns the window, and it is set in one place).
+	//
+	// IT IS THE SERIES THE CONDITION SHARES ARE COMPUTED ON, and `cpu` is kept beside it
+	// only for continuity with pass1 and pass2, which reported raw. The distinction did not
+	// matter for the CUT, because a fan-out pegs both at 1.00. It matters for the CLIMB,
+	// which is the condition GOV-32 exists to measure: the climb needs CPU below 0.65, and a
+	// raw series dips there on brief scheduling gaps that a 5 s average absorbs. Measuring
+	// the climb on raw CPU would therefore report a loop climbing on ticks the real loop
+	// never climbs on, which is the exact direction that would have made this story's answer
+	// wrong in the reassuring direction.
+	smoothed []float64
+	ewma     *signals.EWMA
+	// dropped counts busy ticks discarded because host CPU would not read. See sample.
+	dropped int
 }
 
 func (r *runQueue) sample(outstanding bool) {
@@ -762,12 +883,55 @@ func (r *runQueue) sample(outstanding bool) {
 		return
 	}
 	r.all = append(r.all, v)
-	if outstanding {
-		r.busy = append(r.busy, v)
-		if c := hostCPU(); c >= 0 {
-			r.cpu = append(r.cpu, c)
+	if !outstanding {
+		return
+	}
+	c := hostCPU()
+	if c < 0 {
+		// A tick whose CPU will not read is dropped from BOTH busy series rather than from
+		// one of them. The cut and climb conditions are JOINT over CPU and the run queue, so
+		// an unpaired append would silently shift one series against the other from that
+		// tick on, and every joint share computed afterwards would be pairing readings taken
+		// at different moments. The previous version appended to `busy` unconditionally and
+		// to `cpu` only on success, which was harmless while nothing read the two together.
+		r.dropped++
+		return
+	}
+	if r.ewma == nil {
+		r.ewma = signals.NewEWMA(signals.DefaultCPUWindow)
+	}
+	r.busy = append(r.busy, v)
+	r.cpu = append(r.cpu, c)
+	r.smoothed = append(r.smoothed, r.ewma.Update(c, time.Now()))
+}
+
+// conditions evaluates the loop's OWN predicates over the paired busy series.
+//
+// It calls budget.Cutting and budget.Climbing rather than restating them, so that a change to
+// the loop cannot leave this harness measuring the previous policy and reporting it as the
+// current one. That is not hypothetical: this file already carried a hand-copied cut
+// condition, and it was evaluated against a different CPU series than the loop uses.
+// THE TWO THRESHOLDS ARE PASSED SEPARATELY BECAUSE THEY ARE NOT THE SAME NUMBER. The loop cuts
+// above runQueueMax and climbs at or below runQueueMax-RunQueueBand, and a first version of
+// this function handed runQueueMax to both. That reported the climb firing on every tick with
+// a queue under 2.0 when the loop only climbs under 1.5 — an over-count, in the direction that
+// would have made the fix look better than it is.
+func (r *runQueue) conditions(runQueueMax, climbAt float64) (cut, climb float64, n int) {
+	n = len(r.smoothed)
+	if n == 0 {
+		return 0, 0, 0
+	}
+	cuts, climbs := 0, 0
+	for i := 0; i < n; i++ {
+		rd := budget.Reading{CPU: r.smoothed[i], RunQueue: r.busy[i]}
+		if budget.Cutting(rd, runQueueMax) {
+			cuts++
+		}
+		if budget.Climbing(rd, climbAt) {
+			climbs++
 		}
 	}
+	return float64(cuts) / float64(n), float64(climbs) / float64(n), n
 }
 
 func stats(in []float64) (p50, p90, max float64) {
@@ -1045,6 +1209,14 @@ func runCurve(ctx context.Context, o options, work *workload, res *results) erro
 			share = float64(above) / float64(len(rq.cpu))
 		}
 		samples := len(rq.busy)
+		smP50, _, _ := stats(rq.smoothed)
+		cutShare, climbShare, _ := rq.conditions(budget.RunQueueMax, budget.RunQueueMax-budget.RunQueueBand)
+		dropped := rq.dropped
+		ser := &series{
+			RunQueue: append([]float64(nil), rq.busy...),
+			CPU:      append([]float64(nil), rq.cpu...),
+			CPUEWMA:  append([]float64(nil), rq.smoothed...),
+		}
 		mu.Unlock()
 
 		// Every build ran: there is no gate in this mode, so admitted and completed are the
@@ -1055,11 +1227,16 @@ func runCurve(ctx context.Context, o options, work *workload, res *results) erro
 		a.RunQueueP50, a.RunQueueP90, a.RunQueueMaxObserved = p50, p90, max
 		a.RunQueueSamples = samples
 		a.CPUP50, a.CPUAboveCut = cpuP50, share
+		a.CPUEWMAP50, a.CutShare, a.ClimbShare = smP50, cutShare, climbShare
+		a.DroppedTicks = dropped
+		a.Series = ser
 		a.DrainSeconds = elapsed.Seconds()
 		a.WindowSeconds = elapsed.Seconds()
 		fmt.Printf("  -> run queue p50 %.2f p90 %.2f max %.2f, cpu p50 %.2f (max %.2f, %.0f%% above cut), "+
+			"loop would cut on %.0f%% of ticks and climb on %.0f%%, "+
 			"build CPU %.1f core-sec, wall %.1fs\n\n",
-			p50, p90, max, cpuP50, cpuMax, 100*share, a.BuildTestCoreSec, elapsed.Seconds())
+			p50, p90, max, cpuP50, cpuMax, 100*share, 100*cutShare, 100*climbShare,
+			a.BuildTestCoreSec, elapsed.Seconds())
 		res.Arms = append(res.Arms, a)
 	}
 
@@ -1086,4 +1263,187 @@ func printCurve(r results) {
 			a.Name, a.RunQueueP50, a.RunQueueP90, a.RunQueueMaxObserved,
 			a.CPUP50, 100*a.CPUAboveCut, a.BuildTestCoreSec, a.DrainSeconds)
 	}
+}
+
+// ---------------------------------------------------------------------------
+// Recovery: can the budget climb back while a build is running?
+// ---------------------------------------------------------------------------
+
+// runRecovery holds a fixed build load on the machine and records what the daemon's budget
+// does, once per second, for the whole window.
+//
+// WHY THE FAN-OUT ARMS COULD NOT ANSWER THIS, WHICH IS THE REASON THIS MODE EXISTS. GOV-32
+// measured the shipped loop and a candidate loop under the same ten-way fan-out and got
+// IDENTICAL budget trajectories: every logged value in both arms was the floor. The arms were
+// not discriminating between two controllers, they were both reporting that ten concurrent
+// builds oversubscribe an eight-core laptop — which is true, and which both loops are supposed
+// to say. The batch is admitted at B_max, six builds start at once, and `loadavg1` is a
+// one-minute average, so the run queue stays above any plausible cut threshold for the whole
+// 150-second window and no controller gets to demonstrate anything else.
+//
+// That is the same shape of trap GOV-31 hit and named: a measurement whose answer is fixed by
+// something upstream of the quantity under test. There it was the CPU disjunct deciding before
+// the run-queue threshold was consulted; here it is the initial burst deciding before the loop
+// is consulted.
+//
+// SO THIS MEASURES THE OTHER REGIME, WHICH IS THE ONE THE STORY IS ACTUALLY ABOUT: a machine
+// with builds running on it continuously but NOT oversubscribed. One `go build -a` alone holds
+// host CPU at 0.77-1.00 and the run queue at about 1.22 per core. A loop that cuts on
+// utilisation must floor there and stay floored; a loop that cuts on saturation must not.
+//
+// THE LOAD IS OPEN-LOOP AND DELIBERATELY DOES NOT GO THROUGH THE GATE. The question is what
+// the CONTROLLER does given a load, not what the gate admits, and routing the load through the
+// budget would make the load a function of the answer. So the builds run regardless of what
+// the budget says, the budget is read from `governor status`, and the two are independent.
+func runRecovery(ctx context.Context, o options, work *workload, res *results) error {
+	a := arm{Name: fmt.Sprintf("recovery, %d build(s) held", o.recovery), Governed: true, Position: 1}
+	fmt.Printf("== %s ==\n", a.Name)
+
+	settled, err := settle(ctx, o)
+	if err != nil {
+		return err
+	}
+	a.SettleSeconds = settled.Seconds()
+
+	if o.canary && len(work.modules) > 0 {
+		t0 := time.Now()
+		runBuild(ctx, o, work.canary)
+		a.CanarySeconds = time.Since(t0).Seconds()
+		fmt.Printf("  canary build %.1fs\n", a.CanarySeconds)
+	}
+	if err := work.cleanCache(ctx); err != nil {
+		return err
+	}
+
+	// THE THRESHOLD IS A PARAMETER HERE TOO, and it is the difference between an experiment
+	// that isolates the change and one that is swamped by the machine it runs on. Measured on
+	// this host, holding ONE build produces a run queue of 2.91 per core rather than the 1.22
+	// the concurrency curve records for a build alone, because the developer's own session is
+	// on the box. 2.91 is over the shipped cut of 2.0, so both loops cut and the arm answers
+	// nothing — the ambient load, not the controller, decides.
+	//
+	// Passing -thresholds moves the cut out of the way of the ambient load, which leaves the
+	// CPU disjunct as the only thing the two binaries disagree about. That is the quantity
+	// under test, so isolating it is the point rather than a convenience.
+	threshold := budget.RunQueueMax
+	if len(o.thresholds) > 0 {
+		threshold = o.thresholds[0]
+	}
+	a.RunQueueMax = threshold
+	dm, err := startDaemon(ctx, o.governor, threshold)
+	if err != nil {
+		return err
+	}
+
+	wctx, cancel := context.WithTimeout(ctx, o.window)
+	defer cancel()
+
+	// The load: o.recovery builds, each relaunched as soon as it finishes, so the machine
+	// carries the same concurrency for the whole window rather than tailing off.
+	var load sync.WaitGroup
+	for i := 0; i < o.recovery; i++ {
+		load.Add(1)
+		go func(i int) {
+			defer load.Done()
+			for wctx.Err() == nil {
+				runBuild(wctx, o, work.modules[i%len(work.modules)])
+			}
+		}(i)
+	}
+
+	var mu sync.Mutex
+	rq := &runQueue{}
+	var budgets []int
+	sampling := make(chan struct{})
+	go func() {
+		defer close(sampling)
+		t := time.NewTicker(time.Second)
+		defer t.Stop()
+		for {
+			select {
+			case <-wctx.Done():
+				return
+			case <-t.C:
+				b := readBudget(ctx, dm)
+				mu.Lock()
+				rq.sample(true)
+				if b > 0 {
+					budgets = append(budgets, b)
+				}
+				mu.Unlock()
+			}
+		}
+	}()
+
+	<-wctx.Done()
+	load.Wait()
+	<-sampling
+	a.DaemonLog = dm.stop()
+
+	mu.Lock()
+	p50, p90, max := stats(rq.busy)
+	cpuP50, _, _ := stats(rq.smoothed)
+	cutShare, climbShare, _ := rq.conditions(armRunQueueMax(a), armClimbRunQueue(a))
+	ser := &series{
+		RunQueue: append([]float64(nil), rq.busy...),
+		CPU:      append([]float64(nil), rq.cpu...),
+		CPUEWMA:  append([]float64(nil), rq.smoothed...),
+	}
+	trace := append([]int(nil), budgets...)
+	mu.Unlock()
+
+	a.RunQueueP50, a.RunQueueP90, a.RunQueueMaxObserved = p50, p90, max
+	a.RunQueueSamples = len(ser.RunQueue)
+	a.CPUEWMAP50, a.CutShare, a.ClimbShare = cpuP50, cutShare, climbShare
+	a.Series = ser
+	a.Budgets = trace
+	a.WindowSeconds = o.window.Seconds()
+
+	lo, hi, final := budgetSpan(trace)
+	a.BudgetMin, a.BudgetMax, a.BudgetFinal = lo, hi, final
+	fmt.Printf("  -> budget over %d ticks: min %d, max %d, final %d\n", len(trace), lo, hi, final)
+	fmt.Printf("     run queue p50 %.2f p90 %.2f max %.2f, smoothed cpu p50 %.2f\n",
+		p50, p90, max, cpuP50)
+	fmt.Printf("     cut condition on %.0f%% of ticks, climb condition on %.0f%%\n\n",
+		100*cutShare, 100*climbShare)
+
+	res.Arms = append(res.Arms, a)
+	return writeResults(o, *res)
+}
+
+// readBudget asks the daemon what the budget is, through the same `governor status` a user
+// would run. It returns 0 if the answer cannot be read, and the caller drops that tick rather
+// than recording a zero that would look like a floor.
+func readBudget(ctx context.Context, dm *daemon) int {
+	out, err := dm.hook(ctx, "status", nil)
+	if err != nil {
+		return 0
+	}
+	for _, line := range strings.Split(string(out), "\n") {
+		if !strings.HasPrefix(line, "budget ") {
+			continue
+		}
+		n, err := strconv.Atoi(strings.TrimSpace(strings.TrimPrefix(line, "budget")))
+		if err != nil {
+			return 0
+		}
+		return n
+	}
+	return 0
+}
+
+func budgetSpan(b []int) (lo, hi, final int) {
+	if len(b) == 0 {
+		return 0, 0, 0
+	}
+	lo, hi = b[0], b[0]
+	for _, v := range b {
+		if v < lo {
+			lo = v
+		}
+		if v > hi {
+			hi = v
+		}
+	}
+	return lo, hi, b[len(b)-1]
 }

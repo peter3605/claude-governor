@@ -534,8 +534,8 @@ suite again, recursively. That is the same shape as the trap GOV-21 hit when `do
 
 | Signal | Source (macOS, no privileges) | Use |
 |---|---|---|
-| CPU utilisation | `gopsutil/cpu`, 5 s EWMA | primary setpoint input |
-| Run-queue depth | `loadavg1 / ncpu` | catches contention CPU% misses |
+| CPU utilisation | `gopsutil/cpu`, 5 s EWMA | traced and reported; **not** a control input (§5.2) |
+| Run-queue depth | `loadavg1 / ncpu` | **the setpoint the loop controls on**, both directions |
 | Thermal pressure | `ProcessInfo.thermalState` | hard cut trigger |
 | Memory pressure | free pages + swap-in rate | secondary cut trigger |
 | Per-agent cost | CPU across the `claude` process tree ÷ confirmed leases | Phase 2 refinement |
@@ -617,32 +617,47 @@ figure — the same answer a non-cgroup machine gives.
 
 ### 5.2 AIMD
 
-> **`B` is no longer a count of agents.** Phase 0 measured agent cost to be small and
-> near-constant while build cost is zero almost always and occasionally enormous, so the
-> quantity this loop rations moved to build and test concurrency (docs/phase-0-findings.md §7,
-> and §5.5 below for what now takes a lease). **The mechanism in this section is unchanged and
-> is inherited wholesale** — additive increase, multiplicative decrease, the thermal floor and
-> the `demand_waiting` guard all survive the pivot untouched; only the variable moved. Re-aiming
-> the loop and re-deriving its constants is GOV-15's work, and the constants below have not yet
-> been re-derived against build slots.
+> **`B` is a count of build slots, and the loop controls on the run queue.** Two things moved
+> since this section was first written, and both are measured rather than preferred.
+> **What `B` counts** changed in GOV-15: Phase 0 found agent cost small and near-constant while
+> build cost is zero almost always and occasionally enormous, so the rationed quantity became
+> build and test concurrency (docs/phase-0-findings.md §7, §5.5 for what takes a lease).
+> **What the loop reads** changed in GOV-32: host utilisation was the primary input and is now
+> not an input at all, because it saturates at 1.0 under exactly the load this governor exists
+> for and cannot distinguish two builds from eight ([climb-condition.md](climb-condition.md)).
+> Additive increase, multiplicative decrease, the thermal floor and the `demand_waiting` guard
+> all survive both changes untouched. The constants below are derived against build slots and
+> the reasoning lives at each constant in `internal/budget/aimd.go`.
 
 Borrowed from TCP congestion control, and the right shape for the same reason: reclaim
 headroom cautiously, give it back immediately.
 
 ```
 # every tick, after sampling
-headroom = setpoint - util_ewma            # setpoint 0.75
-queue_ok = loadavg1 / usable_cores < 2.0
+run_queue = loadavg1 / usable_cores
 
 if thermal is serious or critical:    B = B_min                # hard floor
-elif util_ewma > setpoint + 0.05 or not queue_ok:
-                                      B = max(B_min, B // 2)   # multiplicative decrease
-elif headroom > 0.10 and queue_ok and demand_waiting:
+elif run_queue > 2.0:                 B = max(B_min, B // 2)   # multiplicative decrease
+elif run_queue <= 1.5 and demand_waiting:
                                       B = min(B_max, B + 1)    # additive increase
+else:                                 B = B                    # busy and coping: hold
 
 B_min = 1
 B_max = floor(usable_cores / 1.2)          # slots, one slot = one Medium build
 ```
+
+**The loop controls on saturation, not on utilisation, and `util_ewma` is not an input to it.**
+That is the one structural change since GOV-15 and it was made in GOV-32 against measurement —
+[climb-condition.md](climb-condition.md). The reasoning is below under "the setpoint is a
+run-queue setpoint"; the short form is that CPU% saturates at 1.0 from two concurrent builds
+onward and therefore cannot tell the states this loop exists to distinguish apart, while a run
+queue moving 1.53 → 2.85 → 24.98 across the same states can.
+
+**There are four outcomes and the fourth is a hold.** `2.0` is where the budget is cut and
+`1.5` is where it climbs, so between them is a band in which the loop does nothing. That is
+where it is meant to sit under build load: the machine busy, the queue shallow, the budget
+steady. The two thresholds are one constant and a band — `RunQueueMax` and `RunQueueBand` — so
+that moving the cut moves the climb with it and the gap keeps its width.
 
 `demand_waiting` gates the increase: do not climb the budget when nobody is asking for a
 slot, or the first fan-out after an idle period arrives with an unearned budget.
@@ -651,26 +666,50 @@ slot, or the first fan-out after an idle period arrives with an unearned budget.
 312,515-sample Phase 0 trace and the reasoning is written at the constant, not here. Four
 things changed against the text above, and each is a finding rather than a preference.
 
-**The setpoint is 0.75 and the measurement's contribution was to show it barely matters.**
-The instruction was to tune it against the traces, which assumed the choice was sensitive. It
-is not, because host CPU on this machine is **bimodal**: p50 0.185, p90 0.425, then p95 0.728
-and p99 1.000. The machine is quiet or pegged, with little in between, so the share of time
-above a candidate setpoint moves by 1.5 points across the whole plausible range —
-5.93% at 0.60, 4.89% at 0.75, 4.46% at 0.85. The design's 0.75 is therefore **kept**, and
-kept for a reason. Retuning it to 0.71 would have been inventing a precision the distribution
-does not carry.
+**The setpoint is a run-queue setpoint. Utilisation is not a control input.** This is the
+loop's shape, so it is stated normatively rather than as a change log: **`B` is cut when
+`loadavg1 / usable_cores` exceeds 2.0, climbed when it is at or under 1.5, and held between
+them. Host CPU is sampled, traced and reported, and the controller does not read it.**
 
-**The run queue does more of the work than the setpoint in ordinary use, and none of it under
-build load — GOV-31 measured both.** Over the trace the run queue is p50 0.352, p90 0.813,
-p95 2.664, p99 **24.584**, max **49.620**, and a threshold there fires on more of the trace
-than the setpoint does (5.62% at 2.0 against the setpoint's 4.27%). CPU% saturates at 1.0 and
-stops carrying information while a run queue of 25 per core does not, which is the property
-§5.1 wants from it. **But under a build fan-out CPU is pegged at p50 1.00 and is over
-`setpoint + 0.05` on 72–99% of ticks, so the CPU disjunct decides every cut and the run-queue
-threshold decides none of them.** Five values of the threshold from 1.2 to 6.0, measured twice
-under the same ten-way fan-out, produced no difference the experiment could detect. Both
-statements are kept because the loop meets both kinds of load; see
-[run-queue-sweep.md](run-queue-sweep.md).
+Three measurements took utilisation out, in the order they were made.
+
+- **It decided everything under the load that matters.** Over the Phase 0 trace, ordinary use
+  is above a 0.75 setpoint on 4.27% of samples and above a 2.0 run-queue threshold on 5.62% —
+  the run queue does more of the work. Under a build fan-out it inverts completely: host CPU
+  sits at p50 1.00 and is over `setpoint + 0.05` on 72–99% of ticks, so the CPU disjunct
+  decided every cut and the run-queue threshold decided none of them. Five values of the
+  threshold from 1.2 to 6.0, measured twice under the same ten-way fan-out, produced no
+  difference the experiment could detect, because none of them were ever consulted
+  ([run-queue-sweep.md](run-queue-sweep.md)).
+- **The increase branch could not fire at all.** The climb required CPU below
+  `setpoint − 0.10` = 0.65. Counted rather than inferred: **0%** of an ungoverned ten-way
+  fan-out's busy ticks, 4% of a governed arm's, and 0 of the replay trace's 471 ticks at
+  CPU ≥ 0.99. `B_max` was unreachable whenever any real build was running.
+- **The operating point it drove to was not a full machine.** At one build — where the loop
+  floored and stayed — this host measures host CPU **0.77** and run queue **1.22 per core**.
+  Saturation begins at two. The machine sat 23% idle with nine build requests waiting, which
+  makes "the machine is full and one at a time is correct" false here rather than arguable.
+
+Note where 0.77 landed: between the climb at 0.65 and the cut at 0.80. **The loop had converged
+on its setpoint** and was behaving exactly as an AIMD controller with a utilisation setpoint of
+0.75 is specified to. The defect was never in the mechanism — it was that a utilisation
+setpoint of 0.75 asks for a machine three-quarters busy, and asking that of a *build* governor
+is asking it to leave a quarter of the machine unused while work is queued.
+
+**Why the run queue can carry both directions when CPU cannot.** CPU% saturates at 1.0 and
+stops carrying information; a run queue does not. Across the states this loop must tell apart —
+two builds, four builds, eight builds — CPU reads 1.00, 1.00, 1.00 while the run queue reads
+1.53, 2.85, 24.98. That is §5.1's argument for the signal, applied to the increase branch and
+not only to the cut. The cost is that `loadavg1` is a one-minute decaying average, so the loop
+is slower to react to a rising edge than a 5 s EWMA of CPU would be; §5.2's own invariant 5 is
+what makes that affordable, since a cut never revokes running work and therefore only ever
+affects the *next* admission. [climb-condition.md](climb-condition.md) carries the experiment.
+
+**The CPU constants that survive are reporting thresholds, not control.** `Setpoint` and
+`SetpointBand` remain in `internal/budget` because `tools/sweep` draws its CPU column against
+them and because the bimodal distribution they were measured from — p50 0.185, p90 0.425, p95
+0.728, p99 1.000 — is the reason the loop can afford to ignore utilisation at all. `Headroom`
+was read only by the removed climb condition and was deleted rather than left to look live.
 
 **`B_max` could not be carried over, because it counted agents.** `min(2 × performance_cores,
 12)` was a statement about how many mostly-idle, I/O-bound things fit beside each other. A
@@ -712,9 +751,30 @@ per tick from the floor would throttle an idle machine for several seconds for n
 Starting high and cutting fast is the same asymmetry AIMD is built on.
 
 Replayed against 3,000 contiguous real samples — the window of the trace with the most
-setpoint crossings, run queue peaking at 49.6 per core — the budget took 6 distinct values,
-reversed direction on 1.4% of ticks, and spent 76% of that saturated window at the floor
-without becoming stuck there (`internal/budget/aimd_replay_test.go`).
+setpoint crossings, run queue peaking at 49.6 per core — the budget takes 6 distinct values,
+reverses direction on **0.3%** of ticks, and spends **67.7%** of that saturated window at the
+floor without becoming stuck there (`internal/budget/aimd_replay_test.go`).
+
+Both figures are re-derived rather than adjusted, and the two changes that moved them are kept
+apart — GOV-31 raised the run-queue threshold from 1.2 to 2.0 without re-running this test, so
+the figures this section used to carry were two changes out of date, not one.
+
+| | before GOV-31 | at 2.0 (GOV-31) | now |
+|---|---|---|---|
+| distinct values | 6 | 6 | 6 |
+| direction reversals | 1.4% | **2.7%** (81 ticks) | **0.3%** (9 ticks) |
+| share at the floor | 76% | 66.8% | 67.7% |
+
+**Reversals rose when the threshold rose and then fell by an order of magnitude here**, and both
+movements have the same cause. At 1.2 the run-queue test fired on nearly everything the CPU
+test did, so the two agreed; at 2.0 a band of ticks opened up where CPU cut and the run queue
+did not, and the budget alternated across it. Removing utilisation closes that band: the loop is
+no longer cut by a signal crossing its threshold on one-second transients while the run queue
+has not moved at all.
+
+The floor figure holding still is the result to want. **This change was not meant to make the
+loop cut less on a genuinely oversubscribed trace, and it did not.** What it changed is that
+the budget can leave the floor while builds are still running.
 
 **`in_use` and the budget stopped being the same unit, and the status line says so.** A lease
 count and a quantity of budget are different numbers once a subagent weighs 0.08 slots and a
@@ -748,11 +808,27 @@ things came out of it that belong here:
   eight seconds, so this signal cannot see a short build at all — a limit of the instrument
   that no choice of number fixes. [run-queue-sweep.md](run-queue-sweep.md) carries the
   experiment, the daemon logs and the curve.
-- **The open question GOV-31 leaves behind is the loop's shape, not its constants.** Under
-  build load the budget cannot climb back at all, because the increase branch requires CPU
-  below `setpoint - 0.10` = 0.65 and a build never leaves CPU that low. A fan-out therefore
-  floors the budget and pins it there until the load drains. Whether that is control or
-  over-control is a question about `setpoint` and the headroom together, and it is not settled.
+- **That threshold is now load-bearing for the first time, and it was chosen while it was
+  not.** GOV-31 settled on 2.0 from the ordinary-use distribution and the concurrency curve,
+  explicitly because its sweep could detect no difference between 1.2 and 6.0 under build
+  load — and the reason it could detect none is that the CPU test decided every cut before the
+  threshold was consulted. Removing the CPU test removes that shadow. `RunQueueMax` and
+  `RunQueueBand` together now set the operating point under exactly the load the sweep could
+  not see them under, so the sweep that found nothing is worth re-running against this loop,
+  and it would this time be measuring a live constant. The value is unchanged pending that.
+- **GOV-31 left the loop's shape open, and GOV-32 closed it: it was over-control.** Under
+  build load the budget could not climb back at all, because the increase branch required CPU
+  below `setpoint − 0.10` = 0.65 and a build never leaves CPU that low, so a fan-out floored
+  the budget and pinned it there until the load drained. What settles it is not a throughput
+  argument — those are inside this harness's run-to-run variance — but a utilisation one: at
+  the floor this host reads CPU **0.77** and run queue **1.22 per core**, so the machine the
+  loop had decided was full was 23% idle with work queued. The answer was to control on
+  saturation instead, which is what the pseudocode above now specifies.
+  [climb-condition.md](climb-condition.md) is the experiment, and it corrects one thing in the
+  table above on its way past: `build_test_core_sec` comes from a 1 Hz walk of the process
+  tree, and `go build` spawns many short-lived `compile` processes, so it undercounts — and
+  undercounts *more* at low concurrency. The wall-clock and host-CPU columns are unaffected,
+  and every conclusion drawn here rests on those.
 
 ### 5.3 Thermal
 
