@@ -1181,9 +1181,17 @@ per connection. Deliberately boring — this is a hot path.
 {"v":1,"op":"status"}
 {"v":1,"budget":6,"in_use":4,"waiting":1,"cpu":0.61,"thermal":"nominal",
  "binary_version":"1.2.0","sources":[{"name":"local","budget":6}],"sessions":[...]}
-// -> advise (MCP request_agents)
-{"v":1,"op":"advise","session":"abc123","wanted":5}
-{"v":1,"granted":3,"wait_hint_ms":0,"reason":"..."}
+// -> advise (MCP request_build, section 8). READ-ONLY: it takes no lease, holds nothing
+//    and changes no state, so a session may ask as often as it likes. The gate's own
+//    acquire is the only thing that consumes budget.
+{"v":1,"op":"advise","session":"abc123","kind":"build","class":"heavy","slots":2.5}
+// <- the answer. `granted` is a BOOLEAN, not a count: the question is about one specific
+//    command, so "3 of the 5 you wanted" has nothing to be the answer to.
+{"v":1,"granted":false,"wait_hint_ms":20000,"reason":"capacity","budget":6,"in_use":6}
+// <- from a daemon that PREDATES this operation. It is the ordinary unknown-op ack, in a
+//    version the client speaks, and the client MUST read it as "no answer" rather than as
+//    "no" — see the closed set of honoured reasons in section 8.
+{"v":1,"ok":false,"reason":"unknown_op","in_use":4}
 ```
 
 `source` and `sources` are plural because the budget is modelled as a *set* of sources
@@ -1217,21 +1225,65 @@ never takes down the broker.
 
 ## 8. Advisory channel
 
-The enforcement hook alone produces a bad experience: the model launches eight agents, gets
-five refusals, and burns tokens learning what it could have been told. So the plugin also
-ships a stdio MCP server with one tool:
+The enforcement hook alone produces a bad experience: the model starts a build, gets refused,
+and burns tokens learning what it could have been told. So the plugin also ships a stdio MCP
+server with one tool:
 
 ```
-governor__request_agents(wanted: int, why: string)
-  → { granted: int, wait_hint_ms: int, reason: string }
+governor__request_build(command: string, why: string)
+  → { granted: bool, wait_hint_ms: int, reason: string }
 ```
 
-plus a `SessionStart` `additionalContext` line and a bundled skill telling the session to
-call it before any fan-out.
+**The ask is per COMMAND, not per batch, and that is not a cosmetic change from the original
+`request_agents(wanted)`.** Phase 0 moved the controlled variable from agent count to build
+concurrency (§5.5), and the two questions have different answers in shape, not just in value.
+"How many agents may I run" is answered by a smaller number. "May I run `cargo build
+--release`" cannot be: there is no fractional build, so the useful answer is usually *not
+now, in about twenty seconds*. `wait_hint_ms` carries that and is the field a model can
+actually act on.
+
+**One classifier, one answer.** The tool classifies with `internal/classify` — the same pure
+function the gate calls, in the same process image — so a command the tool calls cheap is a
+command the gate will not lease, by construction rather than by agreement. A session told
+"go ahead" and then parked by the gate would be worse than no advice at all, because it
+would teach the model to stop asking.
+
+**A cheap command costs no round trip.** 81.6% of `Bash` calls are not build-shaped (§5.5),
+and the classifier answers those with no socket, exactly as the gate does. A tool that is
+slow on `ls` is a tool that gets worked around.
+
+**It degrades open, for the gate's reason.** With the daemon unreachable — no socket, no
+listener, a listener that never answers, a reply this binary cannot read, a protocol version
+it does not speak — the tool answers `granted: true`. Invariant 1 is not weaker here than on
+the hot path: advice that fails closed would stall a session that was trying to cooperate.
+
+**The set of refusals it honours is closed**, exactly as the gate's is (§4.2), and for a
+failure that is not hypothetical: a daemon from before this operation existed answers
+`{"ok":false,"reason":"unknown_op"}` — healthy, in protocol v1, and indistinguishable from a
+refusal to anything that does not check the reason. Read as a "no" it refuses *every* build
+for the length of an upgrade, silently, while the machine is in fact idle. So only `capacity`
+and `depth` become a refusal; every other reason is treated as an unreachable daemon. This
+was caught by pointing the finished server at the daemon actually running on the development
+machine, which is why it is written here rather than discovered by a user mid-upgrade.
 
 **Advice steers; the hook enforces.** The advisory channel exists to make the common case
 pleasant, not to be trusted — a model that *can* ask will sometimes forget, so the budget is
-enforced underneath it regardless.
+enforced underneath it regardless. Note that the server is a stdio child of the session and
+is therefore inside `claude_cpu`, unlike the servers measured in phase-0-findings.md §5, and
+that it is started at session start whether or not it is ever called
+(hook-surface.md §20.4). It stays cheap: no sampler, no polling, no goroutine that outlives
+a call.
+
+The name a session actually sees is
+`mcp__plugin_claude-governor_governor__governor__request_build` — Claude Code prefixes
+`mcp__plugin_<plugin>_<server>__` onto the tool's own name rather than replacing it, so
+`governor` appears three times. That is measured, not composed (hook-surface.md §20.5); the
+obvious guess is wrong and produces a permission denial that reads like a broken server.
+
+The `SessionStart` `additionalContext` line and the bundled skill that tell a session to call
+this before a heavy build are **not** part of GOV-16 and have not shipped. Until they do, the
+tool is available to a session that looks for it and invisible to one that does not, so the
+success metric below cannot yet be read as a measure of whether the advice works.
 
 Success metric: denials per hour, before and after Phase 3. If advice is landing, denials
 approach zero without the budget changing.
@@ -1289,9 +1341,12 @@ The binary lives **inside** the plugin. One copy, so there is nothing for an upg
 skewed, and `${CLAUDE_PLUGIN_ROOT}/bin/governor` is one string on every platform — the release
 artefacts are `governor-darwin-arm64` and friends and are renamed on the way in.
 
-`.mcp.json` is not written yet: `governor mcp` is still a stub, and a plugin file registering
-an MCP server that does nothing would be a broken server in the user's session rather than an
-absent one. It arrives with the advisory channel (section 8).
+`.mcp.json` sits at the plugin root and registers `governor mcp` as a stdio server (section
+8). That a **skills-dir** plugin loads it at all was measured for GOV-16 rather than assumed
+— hook-surface.md §20 — because a plugin's MCP registration is a different component from its
+hooks, and §15 had only ever measured hooks. The server it names is
+`${CLAUDE_PLUGIN_ROOT}/bin/governor mcp`: the same one binary, which is what makes a server
+started at every session start (§20.4) affordable.
 
 `governor trace` is Phase 0 (GOV-02) and is deliberately not part of the surface above it.
 It is `trace agent` (the `SubagentStart`/`SubagentStop` hook body), `trace sample` (the 1 Hz
@@ -1754,6 +1809,7 @@ Uninstall is only verifiable if this list is exhaustive, so it is normative.
 |---|---|---|
 | `~/.claude/skills/claude-governor/.claude-plugin/plugin.json` | install | uninstall |
 | `~/.claude/skills/claude-governor/hooks/hooks.json` (the six hooks) | install | uninstall |
+| `~/.claude/skills/claude-governor/.mcp.json` (the advisory server, section 8) | install | uninstall |
 | `~/.claude/skills/claude-governor/bin/governor` | install, copied from the running binary | uninstall |
 | `~/.claude/skills/` | install, only if absent | uninstall, only if it empties |
 | `~/.claude/settings.json` (`statusLine` key only) | install, merged | uninstall, previous value restored from backup |

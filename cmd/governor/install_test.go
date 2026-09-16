@@ -1396,3 +1396,83 @@ func TestUninstallEmptiesTheStateDirectory(t *testing.T) {
 			e.Name(), p.state)
 	}
 }
+
+// TestInstallRegistersTheAdvisoryServer is GOV-16's first clause, on the install side.
+//
+// The three things asserted here are the three ways this file can be present and useless:
+// the wrong command (a server that fails to start, reported to the user as a red cross in
+// `claude mcp list` and nothing else), the wrong server key (which silently renames the tool,
+// so every allowlist and every mention of it in prose stops matching — hook-surface.md
+// section 20.2), and the wrong location (a plugin component Claude Code does not read).
+func TestInstallRegistersTheAdvisoryServer(t *testing.T) {
+	p := stagedHome(t)
+	installOK(t)
+
+	if p.mcp != filepath.Join(p.plugin, ".mcp.json") {
+		t.Fatalf(".mcp.json is at %s, want it at the plugin root: a plugin's MCP registration "+
+			"is read from there and nowhere else", p.mcp)
+	}
+
+	mcp := readJSON(t, p.mcp)
+	servers, ok := mcp["mcpServers"].(map[string]any)
+	if !ok {
+		t.Fatalf(".mcp.json has no mcpServers object: %v", mcp)
+	}
+	if len(servers) != 1 {
+		t.Errorf("registered %d servers, want exactly 1: %v", len(servers), keysOf(servers))
+	}
+
+	// The key is what names the tool in a session. Changing it renames
+	// mcp__plugin_claude-governor_governor__governor__request_build, which fails silently.
+	server, ok := servers["governor"].(map[string]any)
+	if !ok {
+		t.Fatalf("no server keyed `governor`; the tool's name in a session is composed from "+
+			"this key, so renaming it renames the tool: %v", keysOf(servers))
+	}
+
+	wantCommand := "${CLAUDE_PLUGIN_ROOT}/bin/" + installedBinaryName
+	if server["command"] != wantCommand {
+		t.Errorf("command = %v, want %q", server["command"], wantCommand)
+	}
+	args, _ := server["args"].([]any)
+	if len(args) != 1 || args[0] != "mcp" {
+		t.Errorf("args = %v, want [mcp]", args)
+	}
+}
+
+// TestTheRegisteredServerCommandIsARealSubcommand closes the loop between the file install
+// writes and the binary it names.
+//
+// A `.mcp.json` pointing at a subcommand that does not exist would install cleanly, show up
+// in `claude plugin list`, and fail only as a connection error in a place nobody looks. This
+// is the same argument doctor's matcher check makes about hooks, at the one point where it
+// can be checked without a running harness.
+func TestTheRegisteredServerCommandIsARealSubcommand(t *testing.T) {
+	p := stagedHome(t)
+	installOK(t)
+
+	mcp := readJSON(t, p.mcp)
+	servers := mcp["mcpServers"].(map[string]any)
+	server := servers["governor"].(map[string]any)
+	args, _ := server["args"].([]any)
+	if len(args) == 0 {
+		t.Fatal("no args to check")
+	}
+	name, _ := args[0].(string)
+
+	for _, c := range commands {
+		if c.name == name {
+			return
+		}
+	}
+	t.Errorf(".mcp.json runs `governor %s`, which is not a subcommand this binary has: %v",
+		name, commandNames())
+}
+
+func commandNames() []string {
+	names := make([]string, 0, len(commands))
+	for _, c := range commands {
+		names = append(names, c.name)
+	}
+	return names
+}

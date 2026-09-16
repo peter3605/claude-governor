@@ -188,6 +188,28 @@ type waitingReply struct {
 	InUse  int    `json:"in_use"`
 }
 
+// adviseReply answers the advisory channel's advise operation (design.md sections 7 and 8).
+//
+// IT IS THE ONLY REPLY IN THIS FILE THAT IS NOT ABOUT A LEASE, and its shape says so.
+// `granted` is a bool rather than the count the withdrawn request_agents returned, because
+// the question is about ONE specific command: there is no fractional `cargo build`, so a
+// smaller number has nothing to be the answer to. What a refused model can act on instead is
+// WaitHintMS — "not now, in about twenty seconds" — which is why that field carries the
+// weight here that a count carried there.
+type adviseReply struct {
+	V       int  `json:"v"`
+	Granted bool `json:"granted"`
+	// WaitHintMS is how long the caller should expect to wait, and it is the gate's real
+	// parking behaviour rather than a guess: a refused build that retries goes into the same
+	// queue and is held for up to this long before it is refused for capacity. Zero on a
+	// grant.
+	WaitHintMS int     `json:"wait_hint_ms"`
+	Reason     string  `json:"reason"`
+	Budget     int     `json:"budget"`
+	InUse      int     `json:"in_use"`
+	Slots      float64 `json:"slots"`
+}
+
 // versionReply answers a request in a protocol version this binary does not speak.
 type versionReply struct {
 	V         int    `json:"v"`
@@ -1018,6 +1040,8 @@ func (d *daemon) dispatch(req request) any {
 		return d.session(req)
 	case "status":
 		return d.status()
+	case "advise":
+		return d.advise(req)
 	default:
 		return ackReply{V: d.speaks, Reason: "unknown_op", InUse: d.table.InUse()}
 	}
@@ -1141,6 +1165,43 @@ func (d *daemon) acquire(req request) any {
 			}
 		},
 	}
+}
+
+// advise answers "would the gate grant this command right now" WITHOUT taking a lease,
+// counting a denial, parking anything, or touching the surface ledger (design.md section 8).
+//
+// EVERY ONE OF THOSE OMISSIONS IS DELIBERATE, because this operation is called speculatively
+// and an advisory question that changed state would be a second, invisible way to consume the
+// budget. In particular it must not record a denial: the gate escalates its refusal text on
+// that count, and a model that asked politely three times would find itself being shouted at
+// by a gate it had not yet reached.
+//
+// The answer comes from lease.Table.Fits, which IS Acquire's admission rule rather than a
+// copy of it. That is what makes GOV-16's fourth clause structural: the tool cannot say yes
+// to something the gate would refuse, because both questions are resolved by the same
+// arithmetic over the same table under the same lock.
+//
+// The depth rule is checked first and for the same reason acquire checks it first — a nested
+// caller is not short of a slot, it is not allowed one, and no amount of waiting changes that.
+func (d *daemon) advise(req request) adviseReply {
+	limit, _ := budget.Min(context.Background(), d.sources)
+	reply := adviseReply{V: d.speaks, Budget: limit, InUse: d.table.InUse(), Slots: d.table.Slots()}
+
+	if req.Depth > maxFanOutDepth {
+		reply.Reason = "depth"
+		return reply
+	}
+	if d.table.Fits(leaseRequestFor(req), limit) {
+		reply.Granted = true
+		reply.Reason = "capacity"
+		return reply
+	}
+	// Not "you will wait exactly this long": it is the ceiling the gate would park a retry
+	// for before refusing it, which is the honest thing to tell a caller deciding whether to
+	// wait or to do something else.
+	reply.WaitHintMS = int(maxParkedWait / time.Millisecond)
+	reply.Reason = "capacity"
+	return reply
 }
 
 // granted builds the reply for a lease that has been taken, however it was taken.
