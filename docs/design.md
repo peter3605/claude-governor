@@ -1308,6 +1308,27 @@ metric below cannot yet be read as a measure of whether the advice works.
 Success metric: denials per hour, before and after Phase 3. If advice is landing, denials
 approach zero without the budget changing.
 
+**And a counter-metric, which is not optional.** Denials per hour falls to zero if sessions
+stop building at all, and that is a worse machine, not a better one — the metric above would
+report it as a complete success. So the gate records every gated build and what became of it
+(`trace.Build`, record schema v3), including the ones that RAN, which `daemon.log` deliberately
+does not: it writes only when the budget moves or binds, and a session that quietly stops
+running its tests moves nothing. Test-suite runs are counted from the build records and a drop
+in them falsifies the story regardless of what denials do.
+
+The instrument, its known defects and the reading rule fixed in advance are in
+[advice.md](advice.md). The rule is written before the window opens, for the reason
+[dogfooding.md](dogfooding.md) gives: a week of impressions is not the evidence this repo
+accepts anywhere else.
+
+**The instrument is strictly downstream of enforcement.** The build record is written after any
+refusal has reached stdout, never before, because `trace.Append` opens a file and an open can
+block — and a write ordered ahead of the deny would turn a wedged disk into a governor that
+silently grants everything. The accepted cost of that ordering is that a gate whose budget
+expires mid-write loses the line, so a window's build count is a floor rather than an exact
+figure. Measured cost of the write: 29.5 us, against a 100 ms budget, on the 18.4% of `Bash`
+calls that are gated and already pay a round trip.
+
 ---
 
 ## 9. Package
@@ -1318,7 +1339,7 @@ claude-governor/                  the repo
 ├── cmd/governor/                 one static binary
 │   ├── daemon gate confirm release session status mcp statusline
 │   ├── install uninstall doctor calibrate version
-│   └── trace                     Phase 0 only — removed when the gate ships
+│   └── trace                     the measurement log: Phase 0 traces, and GOV-17's builds
 ├── internal/
 │   ├── transport/                endpoint URL → net.Conn. unix:// in v1, tcp:// later
 │   ├── budget/                   Source interface; LocalSource in v1; reduced by min()
@@ -1960,7 +1981,7 @@ listed is a path uninstall silently stops covering. All of them go when Phase 1 
 |---|---|---|
 | `~/.claude/settings.json` (five `trace` hooks) | `trace install`, merged after backup | `trace uninstall`, surgically |
 | `~/.claude/settings.json.governor-trace-backup-<ts>` | `trace install` | `trace uninstall` |
-| `~/.claude/governor/samples.jsonl` | `trace agent`, `trace sample` | by hand — it is the measurement, and deleting it on uninstall would throw away the phase |
+| `~/.claude/governor/samples.jsonl` | `trace agent`, `trace sample`, and the gate's build records (section 8) | by hand — it is the measurement, and deleting it on uninstall would throw away the phase |
 | `~/.claude/governor/sampler.lock` | `trace sample` | by hand |
 | `~/.claude/governor/sampler.log` | `trace sample` | by hand |
 | `bin/governor` in the repo, staged by hand in Phase 0 | by hand | by hand — GOV-21's `governor install` supersedes it, and installs into the plugin instead |
