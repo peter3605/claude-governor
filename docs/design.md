@@ -1280,10 +1280,30 @@ The name a session actually sees is
 `governor` appears three times. That is measured, not composed (hook-surface.md §20.5); the
 obvious guess is wrong and produces a permission denial that reads like a broken server.
 
-The `SessionStart` `additionalContext` line and the bundled skill that tell a session to call
-this before a heavy build are **not** part of GOV-16 and have not shipped. Until they do, the
-tool is available to a session that looks for it and invisible to one that does not, so the
-success metric below cannot yet be read as a measure of whether the advice works.
+**Three channels carry the advice, and they are not interchangeable.** The tool above is
+useless to a session that does not know it exists, and what a session knows *before* it decides
+to run a build is not the same as what it can go and read afterwards. Measured in
+[hook-surface.md](hook-surface.md) §16.1 and §21.2:
+
+| Channel | When the model sees it | What belongs there |
+|---|---|---|
+| `SessionStart` `additionalContext` | every session, unconditionally | the standing instruction: call the tool before an expensive build, and **not** before ordinary shell work |
+| the bundled skill's `description` | resident, from session start | one line saying the skill exists and when to reach for it |
+| the bundled skill's **body** | only after the skill is invoked | the detail — how to read `wait_hint_ms`, what to do on a refusal |
+
+**A standing instruction cannot live in the skill body.** §21.2 measured progressive
+disclosure directly: a marker in the frontmatter description was in context with no tools
+available, and a marker in the body was invisible until the model invoked the skill. A model
+that has to invoke a skill to learn it should have asked has already run the build.
+
+The skill's name as a session sees it is `claude-governor:heavy-build` — colon-separated, and
+prefixed with the **manifest `name`** rather than the directory name, which is a different rule
+from the MCP tool's underscores above (§21.2, answer 4). Neither name can be composed from the
+other; both are measured.
+
+These three are **not** part of GOV-16 and have not shipped. Until they do, the tool is
+available to a session that looks for it and invisible to one that does not, so the success
+metric below cannot yet be read as a measure of whether the advice works.
 
 Success metric: denials per hour, before and after Phase 3. If advice is landing, denials
 approach zero without the budget changing.
@@ -1305,12 +1325,14 @@ claude-governor/                  the repo
 │   ├── lease/                    table, TTL, Liveness interface (PID+starttime in v1)
 │   ├── signals/                  Sampler interface; sampler_darwin.go, sampler_linux.go
 │   └── config/                   versioned schema, migration, atomic write
-├── skills/fleet-budget/SKILL.md  "ask before you fan out"
+├── skills/heavy-build/SKILL.md   "ask before you launch a heavy build" (section 8)
 └── commands/governor.md          /governor status | limit N | pause | boost
 
 ~/.claude/skills/claude-governor/ the installed plugin, written by `governor install`
 ├── .claude-plugin/plugin.json    name, version, description
 ├── hooks/hooks.json              the six hooks in section 4.1
+├── .mcp.json                     the advisory server in section 8
+├── skills/heavy-build/SKILL.md   the advice a session loads on demand (section 8)
 └── bin/governor                  the binary those hooks run
 
 state  → ~/.claude/governor/      sock, daemon.pid, daemon.log, daemon.start, statusline.json,
@@ -1549,6 +1571,13 @@ Named so they are not mistaken for settled:
   lease leak path if it does. Every probe in `hook-surface.md` §19 ran `bypassPermissions`.
 - Whether the `backgroundTaskId` discriminator of §19.3 holds for tools other than `Bash`.
 - Linux: every measurement above is macOS. Re-run the probe on Linux before trusting §10 there.
+
+**No longer on this list, measured 2026-09-16 on 2.1.273 for GOV-17** (`hook-surface.md` §21):
+a skills-dir plugin's bundled `SKILL.md` **is** surfaced to the model; its frontmatter
+`description` is resident in context from session start while its **body** loads only on
+invocation; and the name a session sees is `<manifest name>:<skill name>`, colon-separated and
+taken from `.claude-plugin/plugin.json`'s `name` rather than from the directory. §8's channel
+table is the consequence.
 
 **No longer on this list, measured 2026-09-14 on 2.1.270 for GOV-15** (`hook-surface.md` §19):
 `PostToolUse` on `Bash` carries the same `tool_use_id` as its `PreToolUse`; it does **not** fire
@@ -1810,6 +1839,7 @@ Uninstall is only verifiable if this list is exhaustive, so it is normative.
 | `~/.claude/skills/claude-governor/.claude-plugin/plugin.json` | install | uninstall |
 | `~/.claude/skills/claude-governor/hooks/hooks.json` (the six hooks) | install | uninstall |
 | `~/.claude/skills/claude-governor/.mcp.json` (the advisory server, section 8) | install | uninstall |
+| `~/.claude/skills/claude-governor/skills/heavy-build/SKILL.md` (the advice, section 8) | install | uninstall |
 | `~/.claude/skills/claude-governor/bin/governor` | install, copied from the running binary | uninstall |
 | `~/.claude/skills/` | install, only if absent | uninstall, only if it empties |
 | `~/.claude/settings.json` (`statusLine` key only) | install, merged | uninstall, previous value restored from backup |
