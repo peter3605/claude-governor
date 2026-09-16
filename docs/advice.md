@@ -7,7 +7,7 @@ It is written in two halves — **the method and the reading rule first, the res
 — because the question is the kind that is easy to answer by feel. `docs/dogfooding.md` is the
 same shape for the same reason, and this file inherits its discipline and one of its scars.
 
-**Status: NOT STARTED. The instrument shipped 2026-09-16; the baseline window has not opened.**
+**Status: INSTALLED 2026-09-16, WINDOW NOT YET OPEN — six live sessions are still ungoverned.**
 The Results section is empty on purpose and is filled in at the end, not as it goes.
 
 ---
@@ -169,6 +169,51 @@ cannot be scored against it. Two things have to be true before the baseline wind
    for everything here. If a few days of ordinary use do not produce enough gated builds to
    make a rate meaningful, **say so and do not start the week.** An empty window reported as a
    null result is worse than no window, because it reads as evidence that advice does not help.
+
+---
+
+## Day zero, 2026-09-16
+
+Recorded now so that the window's provenance is a fact rather than a memory.
+
+| | |
+|---|---|
+| Installed | `governor install` from `455df4a`, not by hand |
+| Claude Code | 2.1.273 |
+| Host | macOS 25.4.0, darwin/arm64, 8 cores (4P + 4E), 16.0 GiB |
+| Budget | `b_max` 4, unchanged — clause 2 requires it to stay unchanged across both windows |
+| Run-queue cut | 5.11 per core, from `governor calibrate` at 21:27:22Z: ambient 0.81 + 4.30 headroom |
+| Build records so far | **0** — the instrument shipped today and has recorded nothing |
+| `samples.jsonl` | 1,477 `agent` and 537,159 `sample` records from Phase 0, and no `build` records |
+
+**`governor doctor`: 11 ok, 1 unknown, 1 FAIL.** The failure is the point, not a defect:
+
+```
+FAIL  sessions  6 of 6 live session(s) are ungoverned: launch-control, budgetr,
+                muncheez, nightcrew, claude-governor, concertFinder
+                (each started before the hooks were installed)
+```
+
+**The window does not open until that check passes.** This is GOV-29's finding, and ignoring it
+is precisely how this project lost a window before: hooks are bound at session start, so a
+session open when `install` ran never loads the gate and contributes nothing — while every
+instrument reports healthy. A window measured across those six would not merely be thin, it
+would be *actively misleading*, because "few builds gated" would be indistinguishable from
+"sessions are behaving well".
+
+The `unknown` on the `spawn` check is expected and is not a blocker: no subagent has been
+spawned yet on 2.1.273 since the install, so nothing has yet re-confirmed the matcher on this
+version (design.md §10.4). It resolves itself with ordinary use.
+
+### What has to happen before the clock starts
+
+1. **Restart the six sessions**, then `governor doctor` until `sessions` is ok.
+2. **Let a few days of ordinary use accumulate**, then re-check the rate from `samples.jsonl`
+   — not from `daemon.log`, because the build count is the denominator for everything here.
+3. **Only then** open the baseline week, and record its start date in this file.
+
+If step 2 does not produce enough gated builds to make a rate meaningful, **say so and do not
+start the week.** An empty window reported as a null result is worse than no window at all.
 
 ---
 
