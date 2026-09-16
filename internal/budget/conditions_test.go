@@ -110,8 +110,8 @@ func TestASaturatedMachineWithAShallowQueueIsNotTrouble(t *testing.T) {
 	// Fully utilised, nothing queued: the friendliest saturated state there is.
 	r := Reading{CPU: 1.0, RunQueue: 0.0, DemandWaiting: true}
 	if Cutting(r, RunQueueMax) {
-		t.Errorf("the cut condition fires at CPU 1.00 with an empty run queue; utilisation is "+
-			"deciding again, and a loop that cuts here has no operating point above the floor "+
+		t.Errorf("the cut condition fires at CPU 1.00 with an empty run queue; utilisation is " +
+			"deciding again, and a loop that cuts here has no operating point above the floor " +
 			"while any build runs")
 	}
 	if !Climbing(r, climbAt) {
