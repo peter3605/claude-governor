@@ -167,6 +167,21 @@ type refuseReply struct {
 	// the gate because each gate is a separate process that remembers nothing, and this is
 	// the only place that can see a session's refusals across all of them.
 	Denials int `json:"denials"`
+	// Cause distinguishes WHICH half of the admission rule refused (GOV-18): "capacity" when
+	// the machine itself is full, "share" when it had room that belongs to another session.
+	//
+	// The `reason` stays "capacity" deliberately. It is the closed set the gate honours
+	// (section 4.2), and a new reason value would be one an older gate cannot interpret —
+	// which it must then treat as an unreachable daemon and fail open, silently ungoverning
+	// every share refusal for the length of an upgrade. This is additive instead: an older
+	// gate ignores it and prints what it always printed.
+	//
+	// IT IS NOT CALLED `share`, AND THAT IS NOT A STYLE CHOICE. grantReply already sends
+	// `"share": 2` as an integer, and the gate decodes grants and refusals into ONE
+	// acquireResponse struct — so a bool named `share` makes every GRANT fail to unmarshal
+	// and the gate fail open on all traffic, which is the silent ungoverning this project
+	// exists to avoid. A name is only free if nothing else on the wire already uses it.
+	Cause string `json:"cause,omitempty"`
 }
 
 // waitingReply is the interim answer to an acquire the daemon has decided to park
@@ -1098,8 +1113,20 @@ func (d *daemon) acquire(req request) any {
 		}
 	}
 
-	if l, ok := d.table.Acquire(leaseRequestFor(req), limit); ok {
-		return d.granted(l, limit, src)
+	// THE FAST PATH IS CLOSED WHILE ANYONE IS WAITING (GOV-18). Taking a slot here when the
+	// queue is non-empty is the same starvation design.md section 6.2 forbids the pump's walk
+	// from causing, arriving by the other door: the pump stops at the first waiter it cannot
+	// satisfy, so a queue that is non-empty is one whose head does NOT fit, and a fresh caller
+	// asking for less — an agent at 0.08 slots behind a Heavy build at 3.75 — would sail past
+	// it every time. A session spawning in a tight loop would then overtake a session that has
+	// been waiting, which is exactly what the strict FIFO exists to prevent.
+	//
+	// The cost is one mutex-guarded length read on the hot path, and only the CONTENDED path
+	// pays anything more: an empty queue is the uncontended case and falls straight through.
+	if d.waits.len() == 0 {
+		if l, ok := d.table.Acquire(leaseRequestFor(req), limit); ok {
+			return d.granted(l, limit, src)
+		}
 	}
 
 	wait := time.Duration(req.WaitMS) * time.Millisecond
@@ -1111,7 +1138,7 @@ func (d *daemon) acquire(req request) any {
 	// a place in the FIFO on every attempt and hold it for the whole of wait_max, crowding
 	// out sessions that asked once and are waiting properly.
 	if wait <= 0 || d.denials.throttled(req.Session) {
-		return d.refuseForCapacity(req.Session, limit, src)
+		return d.refuseForCapacity(req, limit, src)
 	}
 
 	d.event("park session=%s slots=%.2f/%d wait=%v", req.Session, d.table.Slots(), limit, wait)
@@ -1154,7 +1181,7 @@ func (d *daemon) acquire(req request) any {
 					// already holds a slot.
 					return d.granted(l, limit, src)
 				}
-				return d.refuseForCapacity(req.Session, limit, src)
+				return d.refuseForCapacity(req, limit, src)
 			}
 		},
 		cancel: func() {
@@ -1227,17 +1254,18 @@ func (d *daemon) granted(l lease.Lease, limit int, src string) grantReply {
 // refusal, rather than anywhere the request merely passed through — a parked acquire that
 // ends in a grant must not count as a denial, or a session that waited patiently would be
 // shouted at on its next refusal.
-func (d *daemon) refuseForCapacity(session string, limit int, src string) refuseReply {
+func (d *daemon) refuseForCapacity(req request, limit int, src string) refuseReply {
 	r := refuseReply{
 		V: d.speaks, Reason: "capacity",
 		Budget: limit, InUse: d.table.InUse(), Slots: d.table.Slots(), Source: src,
 		CPU: nil, Thermal: d.thermal(),
-		Denials: d.denials.record(session),
+		Denials: d.denials.record(req.Session),
+		Cause:   d.table.Refusal(leaseRequestFor(req), limit),
 	}
 	// Logged here rather than at each call site so that a refusal added later cannot be one
 	// the log does not know about. This is the event that costs the model something, and it
 	// is the one a week of dogfooding is read for.
-	d.event("deny session=%s reason=capacity slots=%.2f/%d denials=%d", session, r.Slots, r.Budget, r.Denials)
+	d.event("deny session=%s reason=capacity cause=%s slots=%.2f/%d denials=%d", req.Session, r.Cause, r.Slots, r.Budget, r.Denials)
 	return r
 }
 

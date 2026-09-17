@@ -296,6 +296,12 @@ round numbers are:
 | **Medium** | `go`, `pytest` | 0.9–1.2 cores |
 | **Light** | everything ungated | 0.43 cores |
 
+**These classes predict cost, not time.** GOV-18 asked whether they could order a wait queue by
+how long a slot would be held, and measured that they cannot do it well: Heavy's p90 *hold time*
+is 4.1x Medium's, but the spread within each class is 33–54x and 18.5% of Medium commands outlast
+the median Heavy. The full table is in design.md §5.6a, and `TestClassDurations` in
+`internal/classify` reproduces it from a corpus. A class is a size, and a size is not a duration.
+
 **`ruff` and `black` were removed from the gated set on this evidence.** Where `ruff` ran as
 the only gated tool in a command — 20 calls, the only ones whose cost is attributable to it
 alone — its median peak was 0.02 cores, p90 0.05, and none was expensive. It is a linter

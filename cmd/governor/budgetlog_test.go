@@ -74,8 +74,12 @@ func TestTheLogRecordsARefusalWithWhatItCost(t *testing.T) {
 	}
 
 	got := strings.Join(logLines(&buf), "\n")
-	if !strings.Contains(got, "deny session=second reason=capacity slots=1.00/1 denials=1") {
-		t.Errorf("log = %q, want a capacity deny naming the session, the count and the pressure", got)
+	// `cause` (GOV-18) separates a machine that is genuinely full from a session that has
+	// reached its fair share on a machine that is not. Both are `reason=capacity` on the wire
+	// — see design.md section 7 for why that stays — so the log line is the only place the
+	// dogfooding read can tell the two findings apart.
+	if !strings.Contains(got, "deny session=second reason=capacity cause=capacity slots=1.00/1 denials=1") {
+		t.Errorf("log = %q, want a capacity deny naming the session, the cause, the count and the pressure", got)
 	}
 }
 

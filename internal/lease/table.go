@@ -2,6 +2,7 @@ package lease
 
 import (
 	"fmt"
+	"math"
 	"sort"
 	"sync"
 	"time"
@@ -48,6 +49,21 @@ const (
 	DefaultConfirmedTTL = 30 * time.Minute
 )
 
+// demandWindow is how long a refusal keeps a session counted as contending for fair share
+// (design.md section 6.1), once it is no longer the one asking.
+//
+// It matches maxParkedWait, which is the longest the daemon will hold a caller before
+// refusing it: a session that was refused less than a full parked wait ago is either still
+// parked or about to ask again, and in both cases it genuinely wants a slot. Longer would let
+// a session that has given up go on depressing everyone else's share; shorter would let an
+// incumbent recapture the slot it freed in the gap between a waiter being refused and being
+// served, which is the starvation this window exists to close.
+//
+// It is deliberately a decay rather than a flag cleared on success: a session that just took
+// a slot in a build loop still wants the next one, and clearing on success would make its
+// demand flicker in and out of view once per acquire.
+const demandWindow = 30 * time.Second
+
 // DefaultBuildTTL is how long a Build lease lives without a PostToolUse to return it.
 //
 // IT IS NOT A BACKSTOP, AND THAT IS THE WHOLE POINT. For an agent the TTL catches a lost
@@ -87,10 +103,11 @@ type Session struct {
 	PID int
 	// PIDStarted disambiguates a recycled PID.
 	PIDStarted time.Time
-	// Weight is the session's share for max-min fair allocation (design.md section 6.1).
-	// It is recorded here and not yet acted on: allocation is a later story, and a weight
-	// that arrives after the wire format has shipped is far more expensive than one
-	// carried from the start.
+	// Weight is the session's share for max-min fair allocation (design.md section 6.1),
+	// acted on by shareLocked since GOV-18. Zero and negative are read as the default 1.
+	//
+	// GOV-B02's focus boost is the only thing that should ever move it; a second weighting
+	// mechanism alongside this one is explicitly not wanted.
 	Weight int
 	// StartedAt is when the session registered.
 	StartedAt time.Time
@@ -123,7 +140,10 @@ type Table struct {
 	byTool   map[string]string   // tool_use_id -> lease ID, Build leases only
 	pending  map[string][]string // session -> FIFO of tentative lease IDs
 	sessions map[string]Session
-	seq      uint64
+	// demanding remembers when a session was last refused, which is how a session that is
+	// not the current caller still counts as contending for fair share. Swept by Reap.
+	demanding map[string]time.Time
+	seq       uint64
 	// weight is the sum of every held lease's Weight, maintained incrementally so that
 	// admission does not walk the table. It is the authority on what is held; len(byID) is
 	// only ever a count of entries.
@@ -146,12 +166,13 @@ func NewTable(opt Options) *Table {
 		opt.Now = time.Now
 	}
 	return &Table{
-		byID:     map[string]*Lease{},
-		byAgent:  map[string]string{},
-		byTool:   map[string]string{},
-		pending:  map[string][]string{},
-		sessions: map[string]Session{},
-		opt:      opt,
+		byID:      map[string]*Lease{},
+		byAgent:   map[string]string{},
+		byTool:    map[string]string{},
+		pending:   map[string][]string{},
+		sessions:  map[string]Session{},
+		demanding: map[string]time.Time{},
+		opt:       opt,
 	}
 }
 
@@ -197,7 +218,32 @@ type Request struct {
 func (t *Table) Fits(r Request, limit int) bool {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	return t.fitsLocked(normalWeight(r.Weight), limit)
+	ok, _ := t.fitsLocked(r.Session, normalWeight(r.Weight), limit)
+	return ok
+}
+
+// Refusal names WHICH half of the admission rule would refuse this request: "" when it would
+// be admitted, "capacity" when the machine itself has no room, "share" when the machine has
+// room but this session has reached its fair share.
+//
+// It exists so the refusal text can stop saying "Machine at capacity" when the machine is not
+// at capacity. Since GOV-18 a session can be refused at 4 of 6 slots because the other two
+// belong to somebody else, and design.md section 4.2 is explicit that a reason clause stating
+// a fact the daemon did not send is a fabrication. It shares fitsLocked rather than
+// re-deriving anything, for the same reason Fits does.
+func (t *Table) Refusal(r Request, limit int) string {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	ok, byShare := t.fitsLocked(r.Session, normalWeight(r.Weight), limit)
+	switch {
+	case ok:
+		return ""
+	case byShare:
+		return "share"
+	default:
+		return "capacity"
+	}
 }
 
 // fitsLocked is THE ADMISSION RULE, and it is WORK-CONSERVING because it has to be. The
@@ -207,8 +253,167 @@ func (t *Table) Fits(r Request, limit int) bool {
 // only work it had. So a request that does not fit an EMPTY table is admitted anyway and
 // simply runs alone. That is what invariant 4 means by "still makes progress, one at a time"
 // once slots stopped being interchangeable.
-func (t *Table) fitsLocked(weight float64, limit int) bool {
-	return len(t.byID) == 0 || t.weight+weight <= float64(limit)
+//
+// GOV-18 ADDED THE SECOND HALF. Global capacity says whether the MACHINE has room; fair share
+// says whether THIS SESSION may have it. Both must pass. The order matters only for cost:
+// capacity is one comparison and share is a walk over sessions, so capacity is asked first
+// and the walk is skipped entirely whenever the machine is full.
+//
+// It reports, second, whether it was FAIR SHARE that refused rather than capacity — the two
+// are a different message to the caller, and Refusal is what turns that into one.
+func (t *Table) fitsLocked(session string, weight float64, limit int) (ok, byShare bool) {
+	if len(t.byID) == 0 {
+		// Work-conserving, and it precedes fair share deliberately: an empty table means
+		// nobody is being deprived of anything, so there is no share to enforce and the
+		// deadlock this escape exists to prevent is the only live concern.
+		return true, false
+	}
+	if t.weight+weight > float64(limit) {
+		return false, false
+	}
+	if weight+t.heldLocked(session) > t.shareLocked(session, weight, limit) {
+		return false, true
+	}
+	return true, false
+}
+
+// heldLocked is how much budget one session already holds, in slots.
+//
+// It walks the leases rather than keeping a per-session running total. That is a deliberate
+// choice about where to pay: a running total would have to be maintained in dropLocked and in
+// Acquire, and dropLocked's comment is emphatic that being the ONLY removal path is what keeps
+// the global weight honest. A second incrementally-maintained sum is a second thing that can
+// silently disagree with the table, and the table is small — this is a walk over held leases,
+// not over history. See TestFairShareIsCheapOnTheHotPath for what it actually costs.
+func (t *Table) heldLocked(session string) float64 {
+	var w float64
+	for _, l := range t.byID {
+		if l.Session == session {
+			w += l.Weight
+		}
+	}
+	return w
+}
+
+// shareLocked is this session's max-min fair entitlement, in slots (design.md section 6.1).
+//
+// MAX-MIN BY PROGRESSIVE FILLING. Every session with revealed demand gets an equal share of
+// the budget per unit of its weight; a session whose demand is SMALLER than that share takes
+// only what it wants and the remainder is redistributed among the rest, repeatedly, until
+// either nothing is left over or every remaining session is capped. That redistribution is
+// the second sentence of section 6.1 and it is why this is not simply limit/n.
+//
+// DEMAND IS REVEALED, NOT DECLARED. Nothing states a demand up front, so it is read off the
+// table: a session's demand is what it HOLDS, except for a session that is asking or was
+// refused recently, which demands MORE than it holds and is therefore unbounded (see the two
+// comments in the body — both are load-bearing, and the rule decides nothing without them).
+// A session that holds nothing, is not asking and has not been refused is not a contender at
+// all: it consumes no share and cannot deprive anyone. That is what makes the common
+// single-session case free — one contender's share is the whole budget, so the rule never
+// binds until a second session actually wants something.
+//
+// WHY NOT RESERVE FOR REGISTERED-BUT-IDLE SESSIONS. Six registered sessions of which one is
+// building would otherwise cap that one at a sixth of the machine while five-sixths sat idle,
+// which is the opposite of what a governor is for. The guarantee in section 6.1 — every live
+// session gets one slot before any gets a second — is a guarantee about sessions that ASK,
+// and it is delivered by the arithmetic below rather than by holding capacity empty: a
+// contender's cap is level*weight, which is at least one whole slot whenever the budget can
+// seat one slot per contender, so a session reaching for its first is admitted while a
+// session reaching past its share is not.
+func (t *Table) shareLocked(session string, asking float64, limit int) float64 {
+	// demand per contending session, and the weight each contends with.
+	demand := map[string]float64{}
+	for _, l := range t.byID {
+		demand[l.Session] += l.Weight
+	}
+	// A SESSION THAT IS ASKING DEMANDS MORE THAN IT HOLDS, and saying so is what makes this
+	// rule bind at all. Reading the asker's demand as "what it holds plus this one request"
+	// puts total demand at sum(held)+w, which reaches the budget at exactly the moment the
+	// capacity check above already refuses — so the share cap would sit permanently in the
+	// shadow of capacity and never once decide anything. The first draft of this function did
+	// that, and its clause 3 test passed with fair share entirely removed.
+	//
+	// Unbounded is also the honest reading: a session mid-fan-out has revealed that it wants
+	// another slot and has told us nothing about where it would stop.
+	demand[session] = math.Inf(1)
+	// A session refused recently is STILL demanding even though it is not the caller now.
+	// Without this the table only ever sees the demand of whoever happens to be calling, so a
+	// session that frees a slot and immediately asks again recaptures it before the session
+	// it was freed for is ever woken — starvation with a fair-share rule bolted to the side.
+	for id, at := range t.demanding {
+		if t.opt.Now().Sub(at) <= demandWindow {
+			demand[id] = math.Inf(1)
+		}
+	}
+
+	if len(demand) == 1 {
+		// The only contender. Its share is the whole budget, which is what makes the
+		// uncontended hot path a map of one entry and no filling loop at all.
+		return float64(limit)
+	}
+
+	type contender struct {
+		id     string
+		d      float64
+		w      float64
+		capped bool
+	}
+	cs := make([]contender, 0, len(demand))
+	for id, d := range demand {
+		cs = append(cs, contender{id: id, d: d, w: t.weightOfLocked(id)})
+	}
+
+	// Progressive filling. Each round hands every uncapped contender an equal share per unit
+	// weight; any whose demand is under that share is satisfied, capped at its demand, and
+	// its leftover returned to the pool for the next round. It terminates because every round
+	// either caps at least one contender or settles.
+	remaining := float64(limit)
+	for {
+		var totalW float64
+		for _, c := range cs {
+			if !c.capped {
+				totalW += c.w
+			}
+		}
+		if totalW <= 0 {
+			break
+		}
+		level := remaining / totalW
+		progressed := false
+		for i := range cs {
+			if cs[i].capped || cs[i].d > level*cs[i].w {
+				continue
+			}
+			cs[i].capped = true
+			remaining -= cs[i].d
+			progressed = true
+		}
+		if !progressed {
+			// Nobody else is satisfied below the level, so this level is the answer for
+			// every contender still uncapped.
+			for _, c := range cs {
+				if c.id == session && !c.capped {
+					return level * c.w
+				}
+			}
+			break
+		}
+	}
+	// Everyone was satisfied inside the budget, this session included: it may have what it
+	// asked for.
+	return demand[session]
+}
+
+// weightOfLocked is a session's registered share weight, defaulting to 1.
+//
+// A session holding leases without having registered gets the default rather than zero. Zero
+// would make its entitlement zero and deny it forever, and the leases prove it is real; the
+// registration is what is missing, not the session.
+func (t *Table) weightOfLocked(id string) float64 {
+	if s, ok := t.sessions[id]; ok && s.Weight > 0 {
+		return float64(s.Weight)
+	}
+	return 1
 }
 
 // normalWeight is how a request's weight is read before anything compares it. A request that
@@ -227,9 +432,17 @@ func (t *Table) Acquire(r Request, limit int) (Lease, bool) {
 	defer t.mu.Unlock()
 
 	w := normalWeight(r.Weight)
-	if !t.fitsLocked(w, limit) {
+	if ok, _ := t.fitsLocked(r.Session, w, limit); !ok {
+		// A refusal is the only way a session's unmet demand becomes visible to anyone but
+		// itself, so it is recorded here and nowhere else. Fits MUST NOT record it: the
+		// advisory channel is called speculatively and would otherwise let a model inflate
+		// its own share by asking questions (design.md section 8).
+		t.demanding[r.Session] = t.opt.Now()
 		return Lease{}, false
 	}
+	// Satisfied for now. The mark is left to decay rather than cleared, because a session
+	// that just took a slot in a build loop still wants the next one, and clearing here would
+	// make its demand flicker in and out of view once per acquire.
 
 	now := t.opt.Now()
 	t.seq++
@@ -483,6 +696,14 @@ func (t *Table) Reap() int {
 	for id := range dead {
 		delete(t.sessions, id)
 		delete(t.pending, id)
+		delete(t.demanding, id)
+	}
+	// Expired demand marks, for the same reason denyLog is swept from the reaper: otherwise
+	// this map grows with every session that was ever refused and never shrinks.
+	for id, at := range t.demanding {
+		if now.Sub(at) > demandWindow {
+			delete(t.demanding, id)
+		}
 	}
 	return dropped
 }

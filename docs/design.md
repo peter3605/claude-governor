@@ -1088,6 +1088,37 @@ minute TTL on a session that has been killed would hold slots for five minutes; 
 rule in §4.3 is what collects those in two seconds instead, and it applies to `Bash` leases
 exactly as it does to tentative agent ones.
 
+### 5.6a Does the cost class predict how long a slot is held?
+
+**Only weakly, and that is why §6.2's queue does not schedule on it.** GOV-18 clause 4 required
+this question to be answered from measurement rather than assumed either way. Re-collected over
+22,820 `Bash` calls from 561 transcripts, classified by the shipped `internal/classify` (never
+by a script — the reason is in `bash-corpus.md`), hold time by class:
+
+| | n | p50 | p90 | p99 | max |
+|---|---|---|---|---|---|
+| ungated | 18,732 | 1.38 s | 5.05 s | 148.74 s | 1,898.95 s |
+| **gated** | **4,081** | **5.58 s** | **55.85 s** | **326.75 s** | 1,240.38 s |
+| gated, Medium | 3,243 | 4.48 s | 35.68 s | 239.88 s | 1,124.57 s |
+| gated, Heavy | 838 | 17.82 s | 145.43 s | 602.22 s | 1,240.38 s |
+
+`Light` is by definition everything *not* gated, so it has no row among gated calls.
+
+The class does separate: Heavy's p90 hold is **4.1x** Medium's, in the same order as their
+expected peak cores. But the separation is small against the spread *within* each class —
+**53.6x** for Medium and **33.8x** for Heavy, p99 over p50 — and **18.5%** of Medium commands
+outlast the *median* Heavy. A queue ordered on this would be ordering on a 4x signal buried in
+30–50x noise, and would be wrong on nearly a fifth of the simplest comparison it could be asked
+to make.
+
+**The operational number, and the one §6.2 quotes as the cost:** **16.8%** of gated commands run
+longer than a full 30 s parked wait — 11.4% of Medium, **37.6%** of Heavy. A session queued
+behind one of those is refused rather than served, whatever order the queue is in.
+
+Reproduced by `TestClassDurations` in `internal/classify`, which is skipped unless
+`GOVERNOR_CORPUS` points at a corpus; the checked-in fixture carries no runtimes, so these rows
+cannot be re-derived in CI and are recorded here instead.
+
 ---
 
 ## 6. Allocation
@@ -1097,6 +1128,42 @@ exactly as it does to tentative agent ones.
 Sessions register on `SessionStart` with a weight, default 1. Allocation is max-min fair:
 every live session is guaranteed one slot before any gets a second, and unclaimed share is
 redistributed to sessions actually asking.
+
+**Built in GOV-18**, in `lease.Table.shareLocked`, as the second half of the admission rule.
+Global capacity says whether the *machine* has room; fair share says whether *this session*
+may have it. Both must pass, capacity first — capacity is one comparison and share is a walk,
+so the walk is skipped whenever the machine is already full.
+
+**Demand is revealed, not declared.** A session's demand is what it holds, and a session that
+is *asking* demands more than it holds — unbounded. That second clause is load-bearing rather
+than a nicety: reading the asker's demand as "what it holds plus this one request" puts total
+demand at `sum(held) + w`, which reaches the budget at exactly the moment the capacity check
+already refuses, so the share cap sits permanently in capacity's shadow and never decides
+anything. The first implementation did that and its clause-3 test passed with fair share
+entirely removed from the table.
+
+A session **refused** within `demandWindow` (30 s, matching `maxParkedWait`) still counts as
+contending once it is no longer the caller. Without that, the table only ever sees the demand
+of whoever happens to be calling, and a session that frees a slot and immediately asks again
+recaptures it before the session it was freed for is ever woken — starvation with a fair-share
+rule bolted to the side. The mark decays rather than being cleared on success, because a
+session taking slots in a build loop still wants the next one. `Fits` must **never** record
+demand: the advisory channel (§8) is called speculatively, and if asking the question counted
+as demand a model could inflate its own share just by asking.
+
+**Admission is not preemption, and the guarantee is bounded accordingly.** A session asking
+while the machine is idle is entitled to all of it — that *is* the redistribution sentence
+above, not a loophole — and nothing claws those slots back when a second session appears. What
+is guaranteed is that a session cannot **grow** past its share while another contends, so the
+incumbent drains and the newcomer is served from freed slots. Starvation is therefore bounded
+by the length of the builds already running, which is what §6.2's clause on duration has to put
+a number on.
+
+**Weight governs who refills, not who arrives first.** Two sessions ramping in lockstep from an
+idle machine simply fill it first-come until capacity binds; neither has been refused, so
+neither has revealed demand beyond what it holds, and there is nothing for a weighted cap to
+act on. Weight starts deciding once somebody has been refused. Per §12.2, GOV-B02's focus boost
+is the only thing that should ever move a session's weight.
 
 ### 6.2 Wait queue
 
@@ -1108,8 +1175,30 @@ strict: it stops at the first waiter it cannot satisfy rather than skipping to o
 because skipping is how a session asking in a tight loop overtakes a session that has been
 waiting. Waiters are woken on release, on session end, and on the reaper tick — the last
 unconditionally, as a backstop, so a lost wake-up costs latency rather than a full `wait_max`
-spent beside a free slot. The queue decides *order*; max-min fair share (§6.1) will decide
-who may join it, and does not exist yet.
+spent beside a free slot. The queue decides *order*; max-min fair share (§6.1) decides who may
+join it.
+
+**A fresh acquire may not jump the queue (GOV-18).** Because the pump stops at the first waiter
+it cannot satisfy, a non-empty queue is always one whose *head does not fit* — so a caller
+asking for less than the head would be granted immediately every time. An agent at 0.08 slots
+would sail past a Heavy build at 3.75 on every attempt. That is the same starvation the strict
+walk exists to prevent, arriving by the other door, so the fast path is closed whenever the
+queue is non-empty. The uncontended case — an empty queue — falls straight through and pays
+one mutex-guarded length read.
+
+**The queue does not model duration, deliberately.** GOV-18 clause 4 offered the choice of
+scheduling on GOV-14's cost classes or saying plainly that it does not. It does not, because
+the classes predict *cost*, not *time*, and measuring them against the corpus says they predict
+time only weakly — see §5.6a. Ordering a queue on a 4.1x signal buried in 33–54x within-class
+noise would trade away the strict FIFO, which provably prevents starvation, for a guess that is
+wrong on 18.5% of the simplest comparison.
+
+**What that costs a starved session, measured:** 16.8% of gated commands run longer than a full
+30 s parked wait (37.6% of Heavy ones). A session queued behind one of those is refused for
+capacity rather than served, and retries under the deny cooloff. The exposure is bounded by
+`maxParkedWait` and by nothing else. That is acceptable only because §6.1 caps what the
+long-building session can hold in the first place: a long build occupies its own session's
+share, not the machine.
 
 A waiter that times out at the same instant as the pump grants it a lease keeps the lease
 rather than being refused beside it — the removal and the hand-over happen under one lock, so
@@ -1161,9 +1250,12 @@ per connection. Deliberately boring — this is a hot path.
 // <- waiting (GOV-08: interim, sent immediately when the daemon parks the request;
 //    exactly one grant or refusal then follows on the same connection)
 {"v":1,"ok":false,"reason":"waiting","wait_ms":20000,"budget":6,"in_use":6}
-// <- refused
+// <- refused, machine genuinely full
 {"v":1,"ok":false,"reason":"capacity","budget":6,"in_use":6,"cpu":0.94,
- "thermal":"fair","source":"local","denials":1}
+ "thermal":"fair","source":"local","denials":1,"cause":"capacity"}
+// <- refused by FAIR SHARE (§6.1): the machine had room, it belongs to another session
+{"v":1,"ok":false,"reason":"capacity","budget":6,"in_use":3,"slots":3,"cpu":0.51,
+ "thermal":"nominal","source":"local","denials":1,"cause":"share"}
 // <- refused, nested fan-out (§6.3); never preceded by a "waiting" line
 {"v":1,"ok":false,"reason":"depth","budget":6,"in_use":4,"cpu":null,
  "thermal":"nominal","source":"local"}
@@ -1216,6 +1308,20 @@ be extended indefinitely one line at a time.
 `denials` is how many times that session has been refused inside a 60 s window, counting the
 current refusal. It is counted at the daemon because every gate is a separate process that
 remembers nothing.
+
+`cause` (GOV-18) says which half of the admission rule refused: `capacity` when the machine is
+full, `share` when it had room belonging to another session. The `reason` stays `capacity` in
+both cases **on purpose** — it is the closed set the gate honours (§4.2), and a new `reason`
+value would be one an older gate must treat as an unreachable daemon and fail open, silently
+ungoverning every share refusal for the length of an upgrade. Additive, so an older gate
+ignores it and prints the sentence it always printed; a current one stops saying "Machine at
+capacity" on a machine that is half empty.
+
+**It is deliberately not called `share`.** The grant reply already sends `"share": 2` as an
+*integer*, and the gate decodes grants and refusals into one struct — a boolean of the same
+name makes every **grant** fail to decode, and a gate that cannot decode a reply fails open.
+This is the same trap the acquire's `slots` key documents against `weight`. A key is only free
+if no other message on this connection already uses it with a different type.
 
 
 The daemon MUST tolerate a malformed line by closing that connection only. One bad client
