@@ -161,6 +161,12 @@ type acquireResponse struct {
 	// Denials is how many times this session has been refused inside the daemon's window,
 	// counting this one. It is what the reason text escalates on.
 	Denials int `json:"denials"`
+	// Cause says which half of the admission rule refused (GOV-18): "share" when the machine
+	// had room that belongs to another session, "capacity" when it was genuinely full. It is
+	// deliberately NOT named `share` — a grant sends `"share": 2` as an integer into this
+	// same struct, and a bool of that name would make every grant fail to decode. Absent from
+	// an older daemon, which decodes as "" and prints the sentence it always printed.
+	Cause string `json:"cause"`
 }
 
 // hookPayload is the PreToolUse payload, measured in GOV-01 and recorded in
@@ -604,10 +610,20 @@ func denyReason(resp acquireResponse, in intent) string {
 	}
 
 	var b strings.Builder
+	// WHICH SENTENCE IS TRUE DEPENDS ON WHICH RULE REFUSED (GOV-18). Since fair share landed,
+	// a session can be refused while the machine still has free slots — they belong to another
+	// session — and saying "Machine at capacity (4/6)" there is a fabrication of exactly the
+	// kind section 4.2 forbids, as well as being visibly self-contradicting to the reader.
+	// An older daemon does not send the field, which decodes as "", which is the text that
+	// binary has always printed.
+	head := "Machine at capacity"
+	if resp.Cause == "share" {
+		head = "This session is at its fair share"
+	}
 	// formatSlots rather than %.1f so a machine holding four whole builds says "4/6" and not
 	// "4.0/6": the decimal is there to stop a machine holding only agents rounding to a
 	// reassuring zero, not to decorate the common case.
-	fmt.Fprintf(&b, "Machine at capacity (%s/%d build slots", formatSlots(resp.Slots), resp.Budget)
+	fmt.Fprintf(&b, "%s (%s/%d build slots", head, formatSlots(resp.Slots), resp.Budget)
 	if resp.CPU != nil {
 		fmt.Fprintf(&b, ", CPU %.0f%%", *resp.CPU*100)
 	}
@@ -616,7 +632,7 @@ func denyReason(resp acquireResponse, in intent) string {
 	}
 	b.WriteString("). ")
 	if in.kind == "build" {
-		b.WriteString(buildEscalation(resp.Denials))
+		b.WriteString(buildEscalation(resp.Denials, resp.Cause))
 	} else {
 		b.WriteString(escalation(resp.Denials))
 	}
@@ -638,20 +654,39 @@ func denyReason(resp acquireResponse, in intent) string {
 // CORRECT response here and the queue is what makes it cheap: the gate parks a build for up to
 // wait_max before ever refusing it, so a refusal already means the machine stayed full for
 // twenty seconds. What escalation adds is honesty about how long that has been going on.
-func buildEscalation(denials int) string {
+// THE INSTRUCTION IS THE SAME FOR BOTH CAUSES; ONLY THE FACT DIFFERS (GOV-18). "Every slot is
+// taken" and "this session has reached its share of them" call for the identical response —
+// wait, then run the same command again — but only one of them is true at a time, and a
+// refusal that misstates why is one a reader stops believing. So the cause swaps the clause
+// that asserts something about the machine and leaves the instruction untouched.
+func buildEscalation(denials int, cause string) string {
+	share := cause == "share"
 	switch {
 	case denials <= 1:
-		return "This command was not run. Other builds on this machine are using every " +
-			"slot. Wait a few seconds and run exactly the same command again; do not look " +
-			"for a different way to build, and do not treat this as a build failure."
+		why := "Other builds on this machine are using every slot."
+		if share {
+			why = "This session is already using its fair share of the build slots, and " +
+				"other sessions are using theirs."
+		}
+		return "This command was not run. " + why + " Wait a few seconds and run exactly " +
+			"the same command again; do not look for a different way to build, and do not " +
+			"treat this as a build failure."
 	case denials == 2:
-		return "This command was not run, for the 2nd time. The machine has been saturated " +
-			"for a while. Wait longer before retrying the same command, and do not start " +
-			"any further builds or test runs in the meantime."
+		why := "The machine has been saturated for a while."
+		if share {
+			why = "This session has been at its share for a while."
+		}
+		return "This command was not run, for the 2nd time. " + why + " Wait longer before " +
+			"retrying the same command, and do not start any further builds or test runs " +
+			"in the meantime."
 	default:
-		return fmt.Sprintf("This command was not run, for the %dth time. Something on this "+
-			"machine is holding every build slot. Stop starting builds, tell the user the "+
-			"machine is saturated, and let them decide — do not keep retrying.", denials)
+		why := "Something on this machine is holding every build slot."
+		if share {
+			why = "Other sessions have been holding their share of the build slots."
+		}
+		return fmt.Sprintf("This command was not run, for the %dth time. %s Stop starting "+
+			"builds, tell the user the machine is contended, and let them decide — do not "+
+			"keep retrying.", denials, why)
 	}
 }
 
