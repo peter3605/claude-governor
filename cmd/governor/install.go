@@ -148,6 +148,24 @@ func resolvePaths() (paths, error) {
 var stateFiles = []string{"sock", "statusline.json", daemonPIDFile, daemonLogFile, daemonStartFile, onboardMarker,
 	surfaceFile, surfaceTempFile, config.File}
 
+// stateGlobs are patterns rather than names, for the residue whose name is not known in
+// advance. They are matched inside the state directory only, and never recursively.
+//
+// GOV-33 ADDED THIS AND THE REASON IT IS A SEPARATE MECHANISM MATTERS. stateFiles is a list
+// of exact names, so every file whose name carries a random component was invisible to
+// uninstall by construction — and os.Remove on the directory then refuses, because a
+// directory holding 133 statusline.json.<random> files is not empty. That is the same defect
+// GOV-25 hit with config.json, arriving by a different road: there the path was simply
+// forgotten, here no fixed path could have covered it.
+//
+// This sweep is kept EVEN THOUGH GOV-33 also stopped the statusline creating those files in
+// the first place, and the redundancy is deliberate. Uninstall is the promise that makes
+// running a hook on every subagent spawn a reasonable thing to ask of a stranger, and it
+// should not rest on every writer on the machine having been perfect for the life of the
+// install. A machine that already accumulated residue under the old code still has to come
+// clean under the new.
+var stateGlobs = []string{"statusline.json.*"}
+
 // ---------------------------------------------------------------------------
 // the plugin's files
 // ---------------------------------------------------------------------------
@@ -1124,8 +1142,11 @@ func (un *installer) removeTree(path string) {
 // design.md section 13.3 is explicit that samples.jsonl goes by hand and not on uninstall —
 // it is the trace the setpoint is derived from, and an uninstall that deleted it would
 // throw away the phase. So the files are named and the directory goes only if it empties.
+//
+// Named, or matched: stateGlobs covers the residue whose name is not fixed. Both lists are
+// normative in design.md section 13.3, and a path in neither is a path uninstall leaves.
 func (un *installer) removeStateFiles() {
-	for _, name := range stateFiles {
+	for _, name := range un.stateEntries() {
 		path := filepath.Join(un.p.state, name)
 		if _, err := os.Lstat(path); err != nil {
 			continue
@@ -1141,6 +1162,28 @@ func (un *installer) removeStateFiles() {
 	if err := os.Remove(un.p.state); err == nil {
 		un.record(un.p.state, "removed", "")
 	}
+}
+
+// stateEntries is every name in the state directory this uninstall should remove: the fixed
+// list, plus whatever the patterns match right now.
+//
+// The state directory is never created to look inside it — a Glob against a directory that
+// is not there matches nothing and returns no error, which is the behaviour wanted. A
+// malformed pattern is the only error Glob reports, and that is a bug in stateGlobs rather
+// than a condition on this machine, so it is ignored here and caught by the test that walks
+// the patterns.
+func (un *installer) stateEntries() []string {
+	names := append([]string(nil), stateFiles...)
+	for _, pattern := range stateGlobs {
+		matches, err := filepath.Glob(filepath.Join(un.p.state, pattern))
+		if err != nil {
+			continue
+		}
+		for _, m := range matches {
+			names = append(names, filepath.Base(m))
+		}
+	}
+	return names
 }
 
 // stopDaemon signals the running daemon and waits for it to let go of the socket.

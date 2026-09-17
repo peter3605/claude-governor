@@ -229,6 +229,66 @@ func TestUninstallLeavesTheMachineByteIdentical(t *testing.T) {
 	}
 }
 
+// TestUninstallRemovesResidueWhoseNameIsNotFixed is GOV-33's uninstall half.
+//
+// TestUninstallLeavesTheMachineByteIdentical could not catch this and still cannot: it walks
+// the staged HOME, and the state directory is staged outside it. More to the point, nothing
+// in that test ever produces a file whose name was not known in advance, so it passes
+// against an uninstall that can only remove names it was told about — which is exactly the
+// uninstall that left 133 statusline.json.<random> files on a real machine and, with them, a
+// directory os.Remove would not take because it was not empty.
+//
+// The residue is PLANTED rather than provoked. Reproducing the leak for real would mean
+// killing a statusline process inside a few microseconds of os.CreateTemp; the fix for that
+// is tested next door, on the writer. What is under test here is the sweep, and the sweep's
+// job is to clean up after a writer that has ALREADY failed — including one that failed
+// under a version of this binary that has since been replaced. Planting is the honest way to
+// put it in that position.
+func TestUninstallRemovesResidueWhoseNameIsNotFixed(t *testing.T) {
+	p := stagedHome(t)
+	installOK(t)
+
+	// Both stages the real leak was caught at: a temp file created and never written, and
+	// one written and never renamed.
+	mkdirAll(t, p.state)
+	planted := []string{
+		filepath.Join(p.state, "statusline.json.1041508460"),
+		filepath.Join(p.state, "statusline.json.109149393"),
+		filepath.Join(p.state, "statusline.json.1982782874"),
+	}
+	writeFileT(t, planted[0], "")
+	writeFileT(t, planted[1], `{"at":"2026-09-17T05:25:38`)
+	writeFileT(t, planted[2], `{"at":"2026-09-17T05:25:38.081038-04:00","down":false}`)
+
+	uninstallOK(t)
+
+	for _, path := range planted {
+		if _, err := os.Lstat(path); !os.IsNotExist(err) {
+			t.Errorf("uninstall left %s behind; err = %v", path, err)
+		}
+	}
+	// The consequence, and the reason this is a launch blocker rather than untidiness: a
+	// state directory that will not empty is residue in a directory the user was told
+	// would be gone.
+	if _, err := os.Lstat(p.state); !os.IsNotExist(err) {
+		t.Errorf("state directory %s survived uninstall; err = %v", p.state, err)
+	}
+}
+
+// TestEveryStateGlobIsAValidPattern catches the one error filepath.Glob reports.
+//
+// removeStateFiles ignores that error, because on a real machine it cannot happen — a
+// malformed pattern is a typo in stateGlobs, not a condition on disk. Ignoring it there is
+// only safe if something checks it here, otherwise a bad pattern silently matches nothing
+// and uninstall quietly stops sweeping.
+func TestEveryStateGlobIsAValidPattern(t *testing.T) {
+	for _, pattern := range stateGlobs {
+		if _, err := filepath.Match(pattern, "probe"); err != nil {
+			t.Errorf("stateGlobs entry %q is not a valid pattern: %v", pattern, err)
+		}
+	}
+}
+
 // The settings file specifically, byte for byte.
 //
 // Separated from the walk above because it is the file a person would notice, and because

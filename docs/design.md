@@ -1357,8 +1357,8 @@ claude-governor/                  the repo
 └── bin/governor                  the binary those hooks run
 
 state  → ~/.claude/governor/      sock, daemon.pid, daemon.log, daemon.start, statusline.json,
-                                  onboarded, surface.json, surface.json.tmp, config.json,
-                                  samples.jsonl, sampler.lock, sampler.log
+                                  statusline.json.*, onboarded, surface.json, surface.json.tmp,
+                                  config.json, samples.jsonl, sampler.lock, sampler.log
 config → ${CLAUDE_PLUGIN_DATA}/config.json, falling back to the state directory
 ```
 
@@ -1870,6 +1870,7 @@ Uninstall is only verifiable if this list is exhaustive, so it is normative.
 | `~/.claude/governor/daemon.pid` | daemon | uninstall |
 | `~/.claude/governor/daemon.log` | install, when it starts the daemon | uninstall |
 | `~/.claude/governor/statusline.json` | `statusline`, when the directory already exists | uninstall |
+| `~/.claude/governor/statusline.json.*` | `statusline`, staging the file above before the rename | uninstall, **by pattern** — see below |
 | `~/.claude/governor/daemon.start` | the gate, when it lazily starts a daemon and the directory already exists | uninstall |
 | `~/.claude/governor/onboarded` | `session start`, only in the fallback below, and only when the directory already exists | uninstall |
 | `~/.claude/governor/surface.json` | daemon, when it first sees a spawn tool name it has not recorded for that Claude Code version (GOV-30) | uninstall |
@@ -1896,6 +1897,19 @@ it added" and "removes things it did not":
   residue that keeps `~/.claude/governor/` from emptying, which is the one difference between
   "removes everything it added" and "removes most of it". Safe only because the ledger
   serialises its writers; see `surfaceLedger.writeMu`.
+- **`statusline.json.*` IS that residue, and it happened.** The bullet above describes the
+  hazard in the abstract; the statusline walked into it. `writeCache` staged through
+  `os.CreateTemp`, and because the statusline enforces its budget by *abandoning* its worker
+  goroutine, a process could exit between `CreateTemp` and `Rename` — at which point the
+  `defer os.Remove` in that goroutine never runs. One machine accumulated **133** of them over
+  six days, and `~/.claude/governor/` could not empty for as long as they sat there. GOV-33
+  fixed the cause by moving the write off the abandonable path (§9), and added `stateGlobs`
+  so uninstall sweeps by pattern as well as by name. **Both halves ship, deliberately.**
+  Uninstall is the promise that makes running a hook on every subagent spawn a reasonable ask,
+  and it must not rest on every writer having been correct for the life of the install — a
+  machine that accrued residue under the old binary still has to come clean under the new one.
+  A new random-suffixed path therefore goes in `stateGlobs` and in this table, not in
+  `stateFiles`.
 - **`samples.jsonl` survives a plain uninstall**, per the Phase 0 table below. It is the
   measurement the setpoint is derived from and it is not reconstructable.
 - **The `statusLine` value is restored, not deleted.** There is only one status line, so
@@ -1963,6 +1977,20 @@ well, so without it the busiest thing the governor does is answering its own sta
 is written only when the state directory already exists — the statusline never creates it —
 because a command that ran on every message and recreated the directory would put a file back
 moments after uninstall removed it.
+
+**It is written after the line is printed, not while it is being rendered, and that ordering
+is load-bearing (GOV-33).** The budget in this section is enforced by returning while the
+worker goroutine is still running; the process then exits, and a goroutine abandoned that way
+never runs its deferred cleanup. Staging a temp file inside it therefore leaked one file per
+cut-off invocation — 133 on one machine in six days, each of them a reason
+`~/.claude/governor/` could not empty on uninstall. So the renderer now touches no file at
+all: it returns the reply to cache, and the command writes it once the line is out. The
+invariant to preserve is not "clean up the temp file" but **nothing on the abandonable path
+opens a file**, because only that holds no matter which line the process is killed on. It
+also puts the disk after the reader, the same ordering `trace.Append` takes on the gate's hot
+path and for the same reason: a wedged disk must not delay the thing the user is waiting for.
+The cost is that the cache write is outside the budget, which is acceptable precisely because
+the render is already finished when it starts.
 
 What the cache actually buys was measured for GOV-B07 and is narrower than the paragraph above
 assumed. A cache hit costs 5.1 ms at p50 and a miss 5.7 ms, so it saves 0.6 ms of a 5.7 ms
