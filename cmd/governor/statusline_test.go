@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"path/filepath"
@@ -101,15 +102,20 @@ func statusDaemon(t *testing.T, reply any) (string, *atomic.Int64, func() []byte
 
 // runStatusline drives the command end to end and holds it to the contract every case
 // shares: a non-empty single line, inside the ceiling.
+//
+// It drives statuslineCommand rather than statusline because since GOV-33 the cache is
+// written by the command and not by the renderer. Calling the inner function here would
+// leave every caching test asserting against a cache nothing ever writes — passing, and
+// measuring nothing. The ceiling still covers the write, which is where it was before.
 func runStatuslineFor(t *testing.T, endpoint, payload string, width int) string {
 	t.Helper()
 	t.Setenv(transport.EndpointEnv, endpoint)
 
-	var stderr bytes.Buffer
-	var line string
+	var stdout, stderr bytes.Buffer
 	took := timed(func() {
-		line = statusline(strings.NewReader(payload), &stderr, transport.Dial{}, statuslineBudget, width)
+		statuslineCommand(strings.NewReader(payload), &stdout, &stderr, transport.Dial{}, statuslineBudget, width)
 	})
+	line := strings.TrimSuffix(stdout.String(), "\n")
 
 	if took.exceeds(statuslineCeiling) {
 		t.Errorf("took %v, want under %v (stderr: %s)", took, statuslineCeiling, stderr.String())
@@ -343,6 +349,111 @@ func TestStatuslineCaches(t *testing.T) {
 	})
 }
 
+// strays returns the statusline temp files left in dir.
+func strays(t *testing.T, dir string) []string {
+	t.Helper()
+	found, err := filepath.Glob(filepath.Join(dir, statuslineCacheFile+".*"))
+	if err != nil {
+		t.Fatalf("glob %s: %v", dir, err)
+	}
+	return found
+}
+
+// TestStatuslineRendersWithoutTouchingTheDisk is GOV-33's root invariant, and it is stated
+// about the renderer rather than about the temp file on purpose.
+//
+// The leak was never a missing cleanup. writeCache's `defer os.Remove(tmp.Name())` was
+// correct and present the whole time. It was that the work ran in a goroutine the budget is
+// enforced by ABANDONING — statusline returns on its timer, the command prints, the process
+// exits, and a deferred function in an abandoned goroutine does not run at exit. Anything
+// holding an unrenamed temp file at that moment leaks it, and over six days on one machine
+// that came to 133 files: 9 of them zero bytes, caught between os.CreateTemp and the first
+// write, the rest caught between the write and the rename.
+//
+// So the durable guard is not "no temp file is left behind" — that is the symptom, and a
+// test for it passes for any number of fragile implementations. It is that THE ABANDONABLE
+// FUNCTION TOUCHES NO FILE AT ALL. Hold that, and there is nothing for an abandoned
+// goroutine to be holding, whichever line it is abandoned on. The statusline is allowed to
+// run to completion here precisely so the assertion is about what it writes rather than
+// about how far it got.
+func TestStatuslineRendersWithoutTouchingTheDisk(t *testing.T) {
+	dir := isolateState(t)
+	endpoint, _, _ := statusDaemon(t, statusReply{V: protocolVersion, Budget: 4, InUse: 1, Slots: 1, Thermal: "nominal"})
+	t.Setenv(transport.EndpointEnv, endpoint)
+
+	var stderr bytes.Buffer
+	line, pending := statusline(strings.NewReader(sampleStatusLinePayload), &stderr, transport.Dial{}, statuslineBudget, 0)
+
+	if line == "" {
+		t.Fatal("rendered nothing; the case is only meaningful if the render succeeded")
+	}
+	// The reply is carried out to be cached, not cached here. Without this the test would
+	// also pass for a statusline that had simply stopped working.
+	if pending == nil {
+		t.Fatal("statusline returned nothing to cache after a live daemon answered it")
+	}
+
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("read state dir: %v", err)
+	}
+	for _, e := range entries {
+		t.Errorf("statusline created %s; the renderer must touch no file, or an abandoned "+
+			"run can leave one behind", e.Name())
+	}
+}
+
+// TestStatuslineLeavesNoTempFileBehind is the symptom, checked on every path that reaches
+// the disk.
+//
+// IT DOES NOT REPRODUCE THE ORIGINAL LEAK AND CANNOT, which is worth writing down here so
+// that nobody later reads a green run as proof the bug is caught. This test was run against
+// the pre-GOV-33 code and PASSED. The orphan needed the PROCESS to exit while the worker
+// goroutine was between os.CreateTemp and os.Rename; in-process that goroutine always runs
+// to completion and renames the file into place, so there is nothing left to find. Only
+// killing a real process inside a window of a few microseconds would show it, and a test
+// built on that timing would fail for reasons unrelated to the bug more often than for it.
+//
+// The cause is guarded next door by TestStatuslineRendersWithoutTouchingTheDisk, which does
+// fail against the old code. What THIS test buys is forward cover, and it is cheap: if some
+// later change starts writing a temp file from a path that leaves one lying around under
+// ordinary operation, this notices. The budget case is included for that reason rather than
+// as a reproduction.
+func TestStatuslineLeavesNoTempFileBehind(t *testing.T) {
+	tests := []struct {
+		name  string
+		stdin func() io.Reader
+		down  bool
+	}{
+		{name: "an ordinary render", stdin: func() io.Reader { return strings.NewReader(sampleStatusLinePayload) }},
+		{name: "the budget expires mid-flight", stdin: func() io.Reader { return blockingReader{} }},
+		{name: "the daemon is unreachable", stdin: func() io.Reader { return strings.NewReader(sampleStatusLinePayload) }, down: true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := isolateState(t)
+			if tc.down {
+				t.Setenv(transport.EndpointEnv, "unix://"+filepath.Join(sockDir(t), "absent"))
+			} else {
+				endpoint, _, _ := statusDaemon(t, statusReply{V: protocolVersion, Budget: 4, InUse: 1, Slots: 1, Thermal: "nominal"})
+				t.Setenv(transport.EndpointEnv, endpoint)
+			}
+
+			var stdout, stderr bytes.Buffer
+			statuslineCommand(tc.stdin(), &stdout, &stderr, transport.Dial{}, statuslineBudget, 0)
+
+			// The abandoned goroutine is still running when the budget case returns, which
+			// is the entire mechanism. Give it room to do the damage it used to do, so a
+			// pass means the write is gone rather than merely not finished yet.
+			time.Sleep(50 * time.Millisecond)
+
+			if left := strays(t, dir); len(left) > 0 {
+				t.Errorf("left %d temp file(s) behind: %v", len(left), left)
+			}
+		})
+	}
+}
+
 // ageCache shifts the cache's timestamp by d.
 func ageCache(t *testing.T, dir string, d time.Duration) {
 	t.Helper()
@@ -377,8 +488,13 @@ func TestStatuslineNeverCreatesTheStateDirectory(t *testing.T) {
 	t.Setenv(transport.StateDirEnv, absent)
 	t.Setenv(transport.EndpointEnv, "unix://"+filepath.Join(sockDir(t), "absent"))
 
-	var stderr bytes.Buffer
-	line := statusline(strings.NewReader(sampleStatusLinePayload), &stderr, transport.Dial{}, statuslineBudget, 0)
+	// Through the command, not the renderer: writeCache is the only thing here that could
+	// create the directory, and since GOV-33 it runs in the command. Calling statusline
+	// alone would assert that a function which no longer touches the disk does not touch
+	// the disk.
+	var stdout, stderr bytes.Buffer
+	statuslineCommand(strings.NewReader(sampleStatusLinePayload), &stdout, &stderr, transport.Dial{}, statuslineBudget, 0)
+	line := strings.TrimSuffix(stdout.String(), "\n")
 
 	if !strings.Contains(line, "daemon not running") {
 		t.Errorf("line = %q, want it to report the daemon is down", line)
@@ -460,11 +576,11 @@ func TestStatuslineSurvivesAStdinThatNeverCloses(t *testing.T) {
 	endpoint, _, _ := statusDaemon(t, statusReply{V: protocolVersion, Budget: 4, InUse: 1, Slots: 1, Thermal: "nominal"})
 	t.Setenv(transport.EndpointEnv, endpoint)
 
-	var stderr bytes.Buffer
-	var line string
+	var stdout, stderr bytes.Buffer
 	took := timed(func() {
-		line = statusline(blockingReader{}, &stderr, transport.Dial{}, statuslineBudget, 0)
+		statuslineCommand(blockingReader{}, &stdout, &stderr, transport.Dial{}, statuslineBudget, 0)
 	})
+	line := strings.TrimSuffix(stdout.String(), "\n")
 
 	if took.exceeds(statuslineCeiling) {
 		t.Errorf("took %v, want under %v", took, statuslineCeiling)

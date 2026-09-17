@@ -136,13 +136,44 @@ type cachedStatus struct {
 }
 
 func runStatusline(_ []string, stdout, stderr io.Writer) int {
-	fmt.Fprintln(stdout, statusline(os.Stdin, stderr, transport.Dial{}, statuslineBudget, terminalWidth()))
+	return statuslineCommand(os.Stdin, stdout, stderr, transport.Dial{}, statuslineBudget, terminalWidth())
+}
+
+// statuslineCommand renders the line, prints it, and only then writes the cache.
+//
+// That order is the whole of GOV-33 and it is the same ordering argument trace.Append makes
+// on the gate's hot path: the disk is touched after the reader has what they came for, never
+// before. Two things follow from it, and both are the point.
+//
+// A write that happens here CANNOT BE ABANDONED. statusline's budget is enforced by returning
+// while its worker goroutine is still running, and this command exits as soon as it returns —
+// so a cache write inside that goroutine is a write the process can exit in the middle of.
+// Deferred functions in an abandoned goroutine do not run at exit, which is how writeCache's
+// `defer os.Remove(tmp.Name())` came to leave 133 statusline.json.<random> files in one
+// person's state directory over six days, and with them a directory uninstall could never
+// empty. Nothing here outlives the call, so nothing here can be left half-done.
+//
+// A wedged disk CANNOT DELAY THE LINE, which is what moving the write past the render buys
+// and why the budget not covering it is acceptable rather than merely tolerable. The budget
+// exists for the failures a socket deadline cannot see — a stdin that never closes, a daemon
+// that never answers — and both of those are behind us by the time the line is printed.
+func statuslineCommand(stdin io.Reader, stdout, stderr io.Writer, dialer transport.Dialer, budget time.Duration, width int) int {
+	line, pending := statusline(stdin, stderr, dialer, budget, width)
+	fmt.Fprintln(stdout, line)
+	if pending != nil {
+		writeCache(stderr, *pending)
+	}
 	return 0
 }
 
 // statusline renders the whole line. It never returns an error and never returns an empty
 // string: whatever happened, the reader gets a sentence about it.
-func statusline(stdin io.Reader, stderr io.Writer, dialer transport.Dialer, budget time.Duration, width int) string {
+//
+// It returns the reply to cache rather than caching it, and touches no file at all. This is
+// the function whose work can be abandoned mid-flight, so it is the function that must not
+// be holding a temp file when that happens — see statuslineCommand. A nil second return is
+// "nothing to cache": the cache was fresh, or the budget expired before an answer arrived.
+func statusline(stdin io.Reader, stderr io.Writer, dialer transport.Dialer, budget time.Duration, width int) (string, *cachedStatus) {
 	deadline := time.Now().Add(budget)
 
 	// Diagnostics go to stderr, which Claude Code captures into its debug log and never
@@ -151,13 +182,19 @@ func statusline(stdin io.Reader, stderr io.Writer, dialer transport.Dialer, budg
 	diag := &cutoffWriter{w: stderr}
 	defer diag.off()
 
-	type result struct{ line string }
+	type result struct {
+		line string
+		// pending is the reply the caller should cache, or nil if there is nothing to
+		// cache. It is carried out rather than written here on purpose; see the doc
+		// comment on statuslineCommand.
+		pending *cachedStatus
+	}
 	done := make(chan result, 1)
 	go func() {
 		defer func() {
 			if r := recover(); r != nil {
 				fmt.Fprintf(diag, "governor statusline: recovered: %v\n", r)
-				done <- result{render(statusView{}, width)}
+				done <- result{line: render(statusView{}, width)}
 			}
 		}()
 		var p statusLinePayload
@@ -166,19 +203,24 @@ func statusline(stdin io.Reader, stderr io.Writer, dialer transport.Dialer, budg
 		if !decodePayload(stdin, diag, &p) {
 			fmt.Fprintf(diag, "governor statusline: continuing without a session id\n")
 		}
-		done <- result{render(fetch(diag, dialer, deadline, p.SessionID), width)}
+		v, pending := fetch(diag, dialer, deadline, p.SessionID)
+		done <- result{line: render(v, width), pending: pending}
 	}()
 
 	timer := time.NewTimer(time.Until(deadline))
 	defer timer.Stop()
 	select {
 	case r := <-done:
-		return r.line
+		return r.line, r.pending
 	case <-timer.C:
 		// The backstop, for the failures no socket deadline can see — chiefly a stdin that
 		// is never closed, which happens before there is a socket to put a deadline on.
+		//
+		// Nothing is cached on this path. The answer either never arrived or arrived too
+		// late to be worth a second of every session's status line, and the goroutine that
+		// might still be carrying one is about to be abandoned.
 		fmt.Fprintf(diag, "governor statusline: budget of %v expired\n", budget)
-		return render(statusView{}, width)
+		return render(statusView{}, width), nil
 	}
 }
 
@@ -214,13 +256,17 @@ type statusView struct {
 
 // fetch resolves the current status for the statusline, from the cache if it is fresh and
 // from the daemon if it is not.
-func fetch(diag io.Writer, dialer transport.Dialer, deadline time.Time, session string) statusView {
+//
+// It returns the reply to cache alongside the view, and does not cache it itself: a cache
+// hit has nothing to write, and a fresh answer is written by the caller after the line has
+// been rendered. Reading is safe here — a read holds no temp file and cannot leave residue
+// if it is abandoned partway.
+func fetch(diag io.Writer, dialer transport.Dialer, deadline time.Time, session string) (statusView, *cachedStatus) {
 	if c, ok := readCache(time.Now()); ok {
-		return view(c, session)
+		return view(c, session), nil
 	}
 	c := query(diag, dialer, deadline)
-	writeCache(diag, c)
-	return view(c, session)
+	return view(c, session), &c
 }
 
 // query asks the daemon, once, with no cache on either side of it.
