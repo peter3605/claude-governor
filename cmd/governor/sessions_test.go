@@ -253,14 +253,14 @@ func TestDoctorSaysSoWhenItCannotSeeTheSessions(t *testing.T) {
 func TestStatusDistinguishesAnUnreadableRegistryFromAnEmptyOne(t *testing.T) {
 	t.Run("unreadable", func(t *testing.T) {
 		d := newDaemon(4, nil)
-		if got := d.status(); got.SessionsKnown {
+		if got := d.status(request{}); got.SessionsKnown {
 			t.Errorf("SessionsKnown = true with no registry to read")
 		}
 	})
 	t.Run("readable and empty", func(t *testing.T) {
 		d := newDaemon(4, nil)
 		d.liveSessions = func() ([]signals.LiveSession, error) { return nil, nil }
-		got := d.status()
+		got := d.status(request{})
 		if !got.SessionsKnown {
 			t.Errorf("SessionsKnown = false for a registry that read cleanly")
 		}

@@ -14,6 +14,7 @@ import (
 
 	"github.com/peter3605/claude-governor/internal/budget"
 	"github.com/peter3605/claude-governor/internal/classify"
+	"github.com/peter3605/claude-governor/internal/identity"
 	"github.com/peter3605/claude-governor/internal/signals"
 	"github.com/peter3605/claude-governor/internal/transport"
 )
@@ -90,15 +91,19 @@ const maxPayload = 1 << 20
 // is a hang, and the read deadline alone would not stop it from filling memory first.
 const maxResponse = 64 << 10
 
-// principal identifies who is asking. It is single-user in v1 and nothing reads it.
+// principal identifies who is asking. It is single-user in v1 and the local budget ignores
+// it, but it is no longer true that nothing reads it: it is handed to every budget source,
+// because a source governing an account's tokens or spend cannot answer without it (GOV-26).
 //
-// It is carried anyway because retrofitting identity into an already-shipped wire format is
+// It is carried on the wire because retrofitting identity into an already-shipped format is
 // far more expensive than carrying a field nobody uses, and this is the cheapest moment it
 // will ever cost (design.md section 7).
-type principal struct {
-	User string  `json:"user"`
-	Team *string `json:"team"`
-}
+//
+// An ALIAS, not a declaration: internal/budget names this type in the Source interface, and
+// internal/identity is where it lives so that a package below cmd/governor can name it too.
+// Aliasing rather than converting at the boundary means there is one definition of the wire
+// shape and no conversion function to forget to update.
+type principal = identity.Principal
 
 // acquireRequest is the acquire message of design.md section 7.
 type acquireRequest struct {

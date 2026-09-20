@@ -7,7 +7,11 @@
 // hot path.
 package budget
 
-import "context"
+import (
+	"context"
+
+	"github.com/peter3605/claude-governor/internal/identity"
+)
 
 // Quota is one source's answer: how much concurrency it will allow right now, in slots.
 type Quota struct {
@@ -24,7 +28,15 @@ type Quota struct {
 //
 // Quota MUST NOT block indefinitely: a source that cannot answer within the caller's
 // deadline is skipped, never waited on, because a stalled budget lookup on the hot path is
-// a stalled session.
+// a stalled session. A caller that passes a context with no deadline is therefore asking
+// for a stall, and Min refuses to do it — see there.
+//
+// WHO IS ASKING IS A PARAMETER BECAUSE TIER TWO CANNOT WORK WITHOUT IT (GOV-26). The local
+// source ignores it: one machine's CPU is not divided by who wants it. A remote source
+// governing tokens or spend is asking a question that has no answer without a principal,
+// and before this the interface had no way to be told. The field had been carried on the
+// wire since v1 and read by nothing, which is exactly the shape of seam the story existed
+// to find: present, plausible, and not actually connected to anything.
 type Source interface {
-	Quota(ctx context.Context) (Quota, error)
+	Quota(ctx context.Context, who identity.Principal) (Quota, error)
 }
