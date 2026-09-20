@@ -49,7 +49,7 @@ func TestSignalsAreAbsentUntilATickLands(t *testing.T) {
 	d := newDaemon(4, io.Discard)
 	d.sampler = &stubSampler{make: func(int) signals.Sample { return signals.Sample{} }}
 
-	got := d.status()
+	got := d.status(request{})
 
 	if got.CPU != nil {
 		t.Errorf("cpu = %v before any tick, want null", *got.CPU)
@@ -107,7 +107,7 @@ func TestTheFirstSampleIsPrimedAwayAndTheSecondIsPublished(t *testing.T) {
 		t.Fatalf("sampler was called %d time(s); the prime plus one tick is two", n)
 	}
 
-	got := d.status()
+	got := d.status(request{})
 	if got.CPUInstant == nil {
 		t.Fatal("cpu_instant is null after a tick landed")
 	}
@@ -156,7 +156,7 @@ func TestReportedCPUIsTheAverageNotTheLatestSpike(t *testing.T) {
 	d.latest = signals.Sample{CPU: 1.0}
 	d.latestOK = true
 
-	got := d.status()
+	got := d.status(request{})
 	if got.CPU == nil || got.CPUInstant == nil {
 		t.Fatal("cpu or cpu_instant is null after a reading")
 	}
@@ -179,7 +179,7 @@ func TestReportedCPUIsTheAverageNotTheLatestSpike(t *testing.T) {
 // If this test ever needs changing, the story it belongs to is GOV-14, not this one.
 func TestSamplingDoesNotMoveTheBudget(t *testing.T) {
 	d := newDaemon(4, io.Discard)
-	before := d.status()
+	before := d.status(request{})
 
 	d.signalsMu.Lock()
 	d.latest = signals.Sample{
@@ -192,7 +192,7 @@ func TestSamplingDoesNotMoveTheBudget(t *testing.T) {
 	d.cpuAvg.Update(1.0, time.Now())
 	d.signalsMu.Unlock()
 
-	after := d.status()
+	after := d.status(request{})
 
 	if after.Budget != before.Budget {
 		t.Errorf("budget moved from %d to %d on a pinned, critically hot machine; GOV-12 is observation only",
@@ -226,7 +226,7 @@ func TestAFailedTickKeepsThePreviousReading(t *testing.T) {
 	cancel()
 	<-done
 
-	got := d.status()
+	got := d.status(request{})
 	if got.CPUInstant == nil || *got.CPUInstant != 0.4 {
 		t.Errorf("cpu_instant = %v after a failed tick, want the previous 0.4 to stand", got.CPUInstant)
 	}

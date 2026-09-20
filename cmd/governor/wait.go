@@ -34,6 +34,11 @@ const denyCooloff = 5 * time.Second
 type waiter struct {
 	session string
 	depth   int
+	// who asked. Carried for the same reason req is: the pump asks the budget sources on
+	// behalf of the waiter at the head of the queue, and a source governing an account's
+	// spend rather than this host's CPU needs to be told whose spend (GOV-26). v1's local
+	// source ignores it.
+	who principal
 	// req is the acquire this waiter is still asking for, carried whole so that the pump
 	// re-offers the SAME request — same kind, same weight — rather than a default one. A
 	// pump that rebuilt the request would hand a Heavy build an agent-sized lease.

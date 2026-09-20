@@ -1241,6 +1241,9 @@ per connection. Deliberately boring — this is a hot path.
 // Every message carries "v" (protocol major) and, on requests, "principal".
 // principal is single-user in v1 and always resolves locally - it exists so that a
 // second tier never has to retrofit identity into an already-shipped wire format.
+// It is no longer merely carried: GOV-26 plumbed it from the gate through the daemon
+// into every budget source, because a source governing an account rather than a host
+// has no answer without it. The local source ignores it, as it should.
 
 // -> acquire
 {"v":1,"op":"acquire","principal":{"user":"peter","team":null},
@@ -1791,7 +1794,7 @@ type signature, not a subsystem.
 | Seam | v1 | Tier two | Lives in |
 |---|---|---|---|
 | Transport | `unix://` endpoint URL | `tcp://` + TLS | `internal/transport` |
-| Identity | `principal{user, team:null}`, carried and unused | resolved against an account | protocol field, present from v1 |
+| Identity | `principal{user, team:null}`, carried and handed to every budget source | resolved against an account | `internal/identity`, protocol field from v1 |
 | Budget source | one `LocalSource` | `min(local, remote)` over a slice | `internal/budget` |
 | Liveness | PID + process start time | heartbeat | `internal/lease.Liveness` |
 | Signals | `Sampler`, darwin + linux impls | unchanged | `internal/signals` |
@@ -1807,6 +1810,56 @@ The rule for a future session: **a change that only makes sense for tier two goe
 interface with one implementation. If it needs a second implementation to compile, it is
 premature.** GOV-26 exists to prove the seams hold, by pointing a real gate at a stub remote
 budget source — once, as a test, not as a shipped feature.
+
+### 12.3 What proving the seams found
+
+GOV-26 ran the experiment: `cmd/governor/tierseam_test.go` stands up a stub broker on
+`tcp://`, adds it to the daemon's source slice, and drives the whole path with a real gate.
+Everything in that file is behind the `_test.go` suffix, so the compiler is what keeps it
+out of the released binary rather than a reviewer's memory.
+
+**Two of the six seams did not hold.** Both were invisible while every source answered from
+memory, which is the case the rule in 12.2 is least able to protect against: an interface
+with one implementation abstracts whatever that implementation happens to do.
+
+1. **Identity was a field, not a path.** `principal` had been on the wire since v1 and
+   `gate.go` said outright that nothing read it. That was true the whole way down — the
+   daemon decoded `request.Principal` and never referred to it again, and `budget.Source`'s
+   only method took a context and nothing else, so there was no parameter a principal could
+   have travelled in. A remote source governing an account's tokens or spend cannot answer
+   "how much budget" without being told "for whom", so the seam was one type signature short
+   of useless. `Source.Quota` now takes the asking principal; the local source ignores it,
+   because this host's CPU is not divided by who wants it. The type moved to
+   `internal/identity` so a package below `cmd/governor` can name it, and `cmd/governor`
+   aliases it rather than converting — one definition of the wire shape, no conversion to
+   forget.
+
+2. **"A slow source is skipped, never waited on" rested on a deadline nobody set.**
+   `budget.Source`'s doc comment promised it; all four `budget.Min` call sites in the daemon
+   passed `context.Background()`, which carries no deadline at all. A broker that refuses a
+   connection was always survivable — `Min` skips an erroring source, and that path worked.
+   A broker that *accepts and then goes quiet* would have hung the daemon forever, on the
+   hot path, with no timeout anywhere between the gate's 100 ms budget and the heat death of
+   the universe. `Min` now imposes `budget.MaxWait` (50 ms) as a ceiling when the caller has
+   named no tighter deadline of its own. Defending inside `Min` rather than at four call
+   sites means a fifth call site added later cannot reintroduce it.
+
+   The worst instance was `pump`, which read the budget **inside** its walk over the wait
+   queue while holding that queue's lock — and every fresh acquire consults the same queue
+   (6.2). A silent remote would therefore have been dialled once per waiter, under the lock,
+   blocking admission for the whole machine in the one path whose job is to unblock it. The
+   budget is now read once per pump and outside the lock.
+
+**The other four held.** `transport.Dialer` is `(ctx, endpoint string) -> net.Conn` and a
+`tcp://` implementation drops straight in with nothing above it changing, which is the
+question that seam existed to answer. The budget slice, the `Liveness` interface, `Sampler`
+and the config schema all took the second source without alteration. Notably, adding the
+remote source really is the one line 12.1 promises: `d.sources = append(d.sources, ...)`.
+
+**What was NOT built, and must not be:** no config key for a remote endpoint, no `tcp://` in
+the shipped `transport.Dial`, no second `Dialer` outside a test. `TestTheStubShipsInNothing`
+asserts the first two directly. Tier two is not justified until the local governor has been
+in daily use and the token and spend problem is actually felt.
 
 ---
 

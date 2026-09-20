@@ -1054,7 +1054,7 @@ func (d *daemon) dispatch(req request) any {
 	case "session":
 		return d.session(req)
 	case "status":
-		return d.status()
+		return d.status(req)
 	case "advise":
 		return d.advise(req)
 	default:
@@ -1093,7 +1093,7 @@ func leaseRequestFor(req request) lease.Request {
 // acquire takes a tentative lease if the budget has room, and decides what to do when it
 // does not: refuse the caller outright, refuse it for capacity, or park it.
 func (d *daemon) acquire(req request) any {
-	limit, quotas := budget.Min(context.Background(), d.sources)
+	limit, quotas := budget.Min(context.Background(), d.sources, req.Principal)
 	src := sourceName(quotas)
 
 	// GOV-30. Recorded for every acquire, including the ones about to be denied: the ledger's
@@ -1144,7 +1144,7 @@ func (d *daemon) acquire(req request) any {
 	d.event("park session=%s slots=%.2f/%d wait=%v", req.Session, d.table.Slots(), limit, wait)
 	parked := time.Now()
 
-	w := &waiter{session: req.Session, depth: req.Depth, req: leaseRequestFor(req), granted: make(chan lease.Lease, 1)}
+	w := &waiter{session: req.Session, depth: req.Depth, who: req.Principal, req: leaseRequestFor(req), granted: make(chan lease.Lease, 1)}
 	d.waits.enqueue(w)
 	// A slot may have freed between the failed Acquire above and the enqueue. Pumping here
 	// closes that window without anything having to poll for it.
@@ -1211,7 +1211,7 @@ func (d *daemon) acquire(req request) any {
 // The depth rule is checked first and for the same reason acquire checks it first — a nested
 // caller is not short of a slot, it is not allowed one, and no amount of waiting changes that.
 func (d *daemon) advise(req request) adviseReply {
-	limit, _ := budget.Min(context.Background(), d.sources)
+	limit, _ := budget.Min(context.Background(), d.sources, req.Principal)
 	reply := adviseReply{V: d.speaks, Budget: limit, InUse: d.table.InUse(), Slots: d.table.Slots()}
 
 	if req.Depth > maxFanOutDepth {
@@ -1278,13 +1278,34 @@ func (d *daemon) refuseForCapacity(req request, limit int, src string) refuseRep
 //
 // It holds the queue lock across the acquire so that a slot cannot be taken by a fresh
 // acquire in between deciding a waiter can have it and handing it over.
+//
+// THE BUDGET IS READ ONCE, AND OUTSIDE THAT LOCK (GOV-26). It used to be read inside the
+// loop, so a source that went over the network was dialled once per waiter while the queue
+// was locked — and every fresh acquire consults that same queue (section 6.2), so a slow
+// remote source would have stalled admission for the whole machine, N times over, in the one
+// place that must not stall. With a LocalSource reading memory the cost was invisible, which
+// is exactly why the seam had to be exercised to find it.
+//
+// Reading it once also means a pump cycle sizes every waiter against one budget rather than a
+// number that may move between waiters. That is no loss: the controller steps at 1 Hz and a
+// pump is a handful of in-memory admissions, so the two readings were near enough always the
+// same. It is a gain in explicability — a pump either had room for a waiter or it did not.
 func (d *daemon) pump() {
+	// On behalf of the waiter at the head, because that is the one whose budget decides
+	// whether the walk moves at all. In v1 every principal on this machine is the same user,
+	// so asking per waiter would be asking one question N times; when that stops being true,
+	// the FIFO is still strict and the head is still what gates the queue.
+	who, ok := d.headPrincipal()
+	if !ok {
+		return
+	}
+	limit, _ := budget.Min(context.Background(), d.sources, who)
+
 	d.waits.mu.Lock()
 	defer d.waits.mu.Unlock()
 
 	for len(d.waits.q) > 0 {
 		w := d.waits.q[0]
-		limit, _ := budget.Min(context.Background(), d.sources)
 		l, ok := d.table.Acquire(w.req, limit)
 		if !ok {
 			return
@@ -1294,6 +1315,19 @@ func (d *daemon) pump() {
 		// same time as it is written to, so it is written to at most once.
 		w.granted <- l
 	}
+}
+
+// headPrincipal reports who is at the front of the wait queue, and whether anyone is.
+//
+// Separated out so that pump can read it under a lock it holds for nanoseconds, ask the
+// budget sources without holding anything, and only then take the lock for the walk.
+func (d *daemon) headPrincipal() (principal, bool) {
+	d.waits.mu.Lock()
+	defer d.waits.mu.Unlock()
+	if len(d.waits.q) == 0 {
+		return principal{}, false
+	}
+	return d.waits.q[0].who, true
 }
 
 // confirm binds a tentative lease to a live agent.
@@ -1375,8 +1409,8 @@ func (d *daemon) session(req request) any {
 }
 
 // status reports the budget and its holders, for the statusline, doctor and /governor.
-func (d *daemon) status() statusReply {
-	limit, quotas := budget.Min(context.Background(), d.sources)
+func (d *daemon) status(req request) statusReply {
+	limit, quotas := budget.Min(context.Background(), d.sources, req.Principal)
 	snap := d.table.Snapshot()
 
 	sources := make([]sourceStat, 0, len(quotas))
