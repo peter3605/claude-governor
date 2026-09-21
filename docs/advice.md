@@ -170,8 +170,8 @@ what they say.
 | Observed | Conclusion | What follows |
 |---|---|---|
 | test-suite runs per hour drop materially | **The instruction made sessions worse at their job.** | The story has failed. Withdraw or re-word the instruction; a lower peak bought this way is not a saving |
-| test-suite runs hold; parks and denials per hour fall; peak falls | **The advice is landing.** | Clause 2 and 3 are met. Record the numbers |
-| test-suite runs hold; nothing else moves | The instruction is being ignored, or the budget never bound in either window | Check the peak first. If the budget never bound, this window cannot answer the question and must be discarded rather than reported |
+| test-suite runs hold; parks and denials per hour fall; **`p99` child cores falls by more than 0.56 cores** | **The advice is landing.** | Clause 2 and 3 are met. Record the numbers |
+| test-suite runs hold; nothing else moves | The instruction is being ignored, or the budget never bound in either window | Check `p99` child cores first. If the budget never bound, this window cannot answer the question and must be discarded rather than reported |
 | `failed-open` is a large share of either window | The daemon was down for part of it | The window is measuring the wrong thing. Discard it and say so |
 | the two windows differ in build volume by more than ~2x | The workloads are not comparable | Rates do not fix a difference in *kind* of work. Say so rather than normalising it away |
 
@@ -253,9 +253,11 @@ version (design.md §10.4). It resolves itself with ordinary use.
    2026-09-21T03:26:26Z.** Built from `accf4a6` and installed; GOV-B13's new `doctor` check
    confirms the hooks run a binary byte-identical to that build. **This instant is now a seam
    in the series** — see the next section.
-4. **Give clause 2 a metric with a stable baseline**, or accept the peak as the scored quantity.
-   The halves test says denials per hour cannot carry the comparison on this machine.
-   **Re-opened 2026-09-21: the peak fails the same test.** See below.
+4. ~~**Give clause 2 a metric with a stable baseline**, or accept the peak as the scored
+   quantity.~~ **DECIDED 2026-09-21: the scored quantity is `p99` child cores**, with `p95` and
+   `max` reported descriptively beside it. Re-opened and closed in the same day: the peak failed
+   the same halves test that retired denials. See the next section for the measurement and
+   **the minimum detectable effect it pre-registers**.
 5. **Only then** open the baseline week, and record its start date in this file.
 
 If the rate does not make a meaningful denominator, **say so and do not start the week.** An empty
@@ -394,11 +396,16 @@ every sampled second"** this document reached for when it elected the peak. One 
 moves the max and moves nothing else. `p99` is the statistic that phrase actually describes: it
 is computed over the same 17,528 and 9,185 readings and is **more than twice as stable**.
 
-**Recommendation, recorded before the window rather than after it: score `p99` child cores, and
-report `p95` and `max` descriptively alongside it.** This is a refinement of clause 2(b) in the
-direction 2(b) was already arguing, not a retreat from it — the peak stays in the report, it
-just stops being the thing the story is judged on. Clause 2's metric is Peter's call and this is
-evidence for it, not a decision taken.
+**DECIDED 2026-09-21: the scored quantity is `p99` child cores, with `p95` and `max` reported
+descriptively alongside it.** This is a refinement of clause 2(b) in the direction 2(b) was
+already arguing, not a retreat from it — the peak stays in the report, it just stops being the
+thing the story is judged on. Clause 2(b) on the story is amended to match.
+
+**The minimum detectable effect is pre-registered here, before the window, at 0.56 cores.** That
+is the gap between the two baseline halves at `p99`, and this document's own rule is that a
+change smaller than it is noise. An after-window that moves `p99` by less than 0.56 cores is a
+null result and must be reported as one. Writing the bar down now is the whole point: the
+halves test exists so that the threshold cannot be chosen once the answer is visible.
 
 ### Two smaller things, neither blocking
 
