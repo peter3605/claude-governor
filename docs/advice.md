@@ -7,7 +7,9 @@ It is written in two halves — **the method and the reading rule first, the res
 — because the question is the kind that is easy to answer by feel. `docs/dogfooding.md` is the
 same shape for the same reason, and this file inherits its discipline and one of its scars.
 
-**Status: INSTALLED 2026-09-16, WINDOW NOT YET OPEN — six live sessions are still ungoverned.**
+**Status: INSTALLED 2026-09-16. WINDOW STILL NOT OPEN.** The two day-zero preconditions are now
+met — sessions are governed and the build rate is real — but the re-check found two new blockers
+and one broken query. See [The rate re-check, 2026-09-20](#the-rate-re-check-2026-09-20).
 The Results section is empty on purpose and is filled in at the end, not as it goes.
 
 ---
@@ -76,27 +78,44 @@ carries command text.
 the ungoverned ones; merging it into `denied` would count a build that ran as one that was
 stopped. Counting test-suite runs means counting the first three.
 
-Read it with:
+Read it with `tools/buildstats`, which reports every figure in this document's reading rule —
+per-day and total builds by outcome, test-suite runs, rates per awake hour, the shape breakdown,
+park waits, and the halves test:
 
 ```sh
-S=~/.claude/governor/samples.jsonl
-
-# builds per outcome
-jq -r 'select(.kind=="build")|.build.outcome' $S | sort | uniq -c
-
-# TEST-SUITE RUNS — clause 3. Builds that actually ran, whose shape is a test invocation.
-jq -r 'select(.kind=="build")
-       |select(.build.outcome!="denied")
-       |.build.shapes[]' $S | grep -E '(^|\s)(test|check|bench)$' | wc -l
-
-# the same, split by shape, which is what makes a drop legible
-jq -r 'select(.kind=="build")|select(.build.outcome!="denied")|.build.shapes[]' $S \
-  | sort | uniq -c | sort -rn
-
-# how long parking actually cost
-jq -r 'select(.kind=="build")|select(.build.outcome=="parked")|.build.waited_ms' $S \
-  | sort -n | tail -5
+go run ./tools/buildstats                      # whole log from the first build record
+go run ./tools/buildstats --since 2026-09-22   # one window
 ```
+
+**THE ONE-LINERS THIS SECTION USED TO CARRY ARE RETIRED, AND THE REASON IS A CORRECTION RATHER
+THAN A TIDY-UP.** The clause-3 count shipped here as:
+
+```sh
+... | grep -E '(^|\s)(test|check|bench)$' | wc -l      # DO NOT USE
+```
+
+On the first four days of real records it returned **93** where the window held **144**. It
+matched `go test` and silently missed **all 51 `pytest` invocations**, because `pytest` does not
+end in a separate `test` word. Clause 3 is the *first* gate in the reading rule below, so that
+query would have scored a go-test-only result as the whole answer — and it would have failed in
+the flattering direction, reporting test runs as stable while a third of them were invisible.
+
+The categorisation now lives in `internal/classify.ShapeRunKind`, next to the vocabulary it has
+to agree with, with `TestShapeRunKind` going from a real command line through `Classify` to a
+category. Three readings that looked obvious were wrong when probed and are now pinned by tests:
+`npx jest` does **not** unwrap to `jest`, `vitest run` and `coverage run` keep a subcommand, and
+`python -m unittest` is not gated at all.
+
+Shapes are reported in three buckets, never merged:
+
+| Bucket | Means | This window |
+|---|---|---|
+| `test-run` | can only be a test suite: `go test`, `pytest`, `cargo test`, `npm test`, `xcodebuild test`, `vitest run`, `tox` | `go test`, `pytest` |
+| `ambiguous` | may be one, and the shape cannot say | `npx` |
+| `not-test-run` | gated work that is not a suite: `go build`, `go` (i.e. `go vet`), `make`, `mypy` | `go build`, `go`, `mypy`, `go run` |
+
+Folding `ambiguous` into `test-run` inflates the denominator clause 3 is judged against; folding
+it into `not-test-run` hides a real drop. It stays its own column.
 
 ### `tools/childcpu` — peak child cores
 
@@ -121,6 +140,20 @@ Unchanged, and the source of clause 2's peak. `docs/phase-0-findings.md` §8 has
   bound at session start, so a session open before the install contributes nothing and is not
   distinguishable from a quiet one. `governor doctor` fails while any live session predates the
   hooks, which is what makes this checkable rather than assumed.
+- **`python -m unittest` is not gated at all**, so a unittest suite is invisible here — not
+  undercounted, absent. `TestUnittestIsInvisibleToClauseThree` pins it, and if it ever starts
+  being gated that test fails and this list has to change in the same commit.
+- **`npx` cannot be resolved, and it is a classifier quirk rather than a privacy choice.** `npx`
+  is registered as a `runner`, which unwraps `<runner> run <cmd>`, but npx takes its command as a
+  bare operand with no `run` keyword — the `dispatcher` shape it is *not* registered as. So
+  unwrapping never fires and `npx jest` and `npx some-local-bin` record identically as `npx`.
+  That is 14 of this window's 190 records. Fixing it would move the classifier's measured gated
+  share and error rates, so it belongs to a story of its own, not to this window.
+- **Wall-clock time is not the denominator.** The sampler writes one record per second
+  unconditionally, so a period's sample count *is* the seconds the machine was awake in it. On a
+  laptop that is shut most of the day the two differ by an order of magnitude, and reporting per
+  calendar day makes a closed lid look like a session that stopped building. `tools/buildstats`
+  reports per awake hour for this reason, and splits only the days that actually carry builds.
 
 ---
 
@@ -207,13 +240,97 @@ version (design.md §10.4). It resolves itself with ordinary use.
 
 ### What has to happen before the clock starts
 
-1. **Restart the six sessions**, then `governor doctor` until `sessions` is ok.
-2. **Let a few days of ordinary use accumulate**, then re-check the rate from `samples.jsonl`
-   — not from `daemon.log`, because the build count is the denominator for everything here.
-3. **Only then** open the baseline week, and record its start date in this file.
+1. ~~**Restart the six sessions**, then `governor doctor` until `sessions` is ok.~~ **DONE** —
+   `ok sessions  6 of 6 live session(s) registered with the daemon`, 2026-09-20.
+2. ~~**Let a few days of ordinary use accumulate**, then re-check the rate from
+   `samples.jsonl`~~ — **DONE 2026-09-20, and the rate is real.** See the next section.
+3. **Reinstall from current `main` first.** Added by the re-check. The installed binary is from
+   `455df4a` and is four merged PRs behind, one of which is GOV-18 — max-min fair build slots
+   and the queue's back door, i.e. *park and deny behaviour*, which is clause 2's metric.
+   **GOV-B13** exists so that the next stale install is caught by `doctor` rather than by a
+   window: today nothing reports it, because every dev build calls itself `0.0.0-dev`.
+4. **Give clause 2 a metric with a stable baseline**, or accept the peak as the scored quantity.
+   The halves test says denials per hour cannot carry the comparison on this machine.
+5. **Only then** open the baseline week, and record its start date in this file.
 
-If step 2 does not produce enough gated builds to make a rate meaningful, **say so and do not
-start the week.** An empty window reported as a null result is worse than no window at all.
+If the rate does not make a meaningful denominator, **say so and do not start the week.** An empty
+window reported as a null result is worse than no window at all.
+
+---
+
+## The rate re-check, 2026-09-20
+
+Day zero left two conditions. Both are now met, and the re-check that cleared them found three
+reasons not to start the clock anyway. **Figures are pinned to a `--until 2026-09-20` cutoff**,
+which excludes the session that ran the check: its own `go test` runs are in the log from
+2026-09-21 and would be the instrument measuring itself.
+
+```
+day           awake_h  builds     b/h  granted  parked  denied  f-open  testrun   ambig   other
+2026-09-17       4.87      88    18.1       73       4      11       0       70       1      29
+2026-09-18       0.88       0     0.0        0       0       0       0        0       0       0
+2026-09-19       0.80       0     0.0        0       0       0       0        0       0       0
+2026-09-20       2.55     102    40.0       97       5       0       0       74      13      37
+TOTAL            9.10     190    20.9      170       9      11       0      144      14      66
+```
+
+### The two day-zero conditions are met
+
+**Sessions are governed.** `governor doctor` reports `ok sessions — 6 of 6 live session(s)
+registered with the daemon`; 13 checks, 12 passing, and the one `unknown` is the expected `spawn`
+check. The day-zero FAIL is cleared.
+
+**The build rate is real, and this is the question day zero could not answer.** 190 gated builds
+in 9.10 awake hours: **20.9 builds and 1.21 denials per awake hour**, against the 0.021
+denials/hour from `daemon.log` that this document rejected as unscoreable. That is ~58x. Builds
+are indeed far more frequent than spawns, exactly as the story's traps predicted. `failed-open` is
+**0**, so the daemon was up for the whole period and the window is not measuring an absent gate.
+
+**Two of the four days recorded zero builds, and it is not the instrument.** That pattern is the
+GOV-03 scar, so it was chased before it was trusted. The sampler (pid 15117) had been alive **12
+days 8 hours** and never exited, writing records every hour throughout. The collapse is in
+`pmset`: **566 sleep/wake events on 09-18 and 430 on 09-19**. The lid was shut. Four calendar days
+bought 9.10 awake hours, which is the finding that changed the denominator for this whole document.
+
+### Three reasons the clock does not start
+
+**1. The halves test fails, and it was pre-registered.** The rule above says a change smaller than
+the gap between the two baseline halves is noise. Splitting the active days:
+
+| half | builds/h | denials/h | parks/h | test runs |
+|---|---|---|---|---|
+| 2026-09-17 | 18.1 | **2.26** | 0.82 | 70 |
+| 2026-09-20 | 40.0 | **0.00** | 1.96 | 74 |
+
+Build volume differs by **2.21x**, past this document's own ~2x incomparability threshold. Worse,
+**all 11 denials fall in one half and none in the other**. Clause 2's headline metric has no
+stable baseline at all, so there is nothing for an after-window to be materially better than.
+Test runs, by contrast, are steady at 70 against 74 — clause 3's quantity looks measurable even
+though clause 2's does not.
+
+**2. The clause-3 query was wrong, in the flattering direction.** The retired `grep` counted 93
+where the window holds 144, missing every `pytest` run. That defect is fixed above; it is recorded
+here because it would have produced a confident, published, wrong answer on the clause the traps
+field calls the one that matters.
+
+**3. The installed binary is four merged PRs behind `main`, and one of them is GOV-18.** The hook
+binary is dated 2026-09-16 17:27, built from `455df4a`. Merged since: GOV-33, GOV-18, GOV-26,
+GOV-B01. **GOV-18 is max-min fair build slots and closing the queue's back door — park and deny
+behaviour, which is precisely clause 2's metric.** Measure the baseline on this binary, upgrade
+for part 2, and the after-window differs by GOV-18 *as well as* by the advice, with no way to
+separate them afterwards. Corroborating evidence that the install is genuinely stale rather than
+merely older: the statusline temp-file leak GOV-33 fixed is still producing files — 67 orphans,
+newest 2026-09-20 19:33.
+
+### What this says about clause 2
+
+Clause 2 asks for parks and denials per hour *and* peak child cores, and requires the after figures
+to be materially better **on at least the peak**. The halves test says the first half of that is
+not scoreable on this machine: denials are a bursty count that swings from 2.26/h to 0.00/h
+between two adjacent active days, and no amount of waiting makes a count of eleven events stable.
+The peak is a distribution statistic over every sampled second and is the quantity with a real
+chance of carrying a comparison. The recommendation, recorded here before the window rather than
+after it, is that **parks and denials are reported as descriptive and the peak is what is scored**.
 
 ---
 
