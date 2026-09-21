@@ -351,3 +351,113 @@ evidence.
   with different command vocabularies. That collapse is *why* the shipped predicate is the
   toolchain table rather than a fitted feature set: the table's 100%-of-recognisable figure does
   not depend on which project runs next, and a fitted one demonstrably does.
+
+## 8. Can the cost class carry a live cost estimate? (GOV-B03, answered 2026-09-20)
+
+**No, and the story that proposed it was dropped on this evidence.** GOV-B03 proposed replacing
+the AIMD climb with `B = headroom / expected cost per build`, estimating cost per *cost class*
+because Phase 0 had already shown a single global mean to be meaningless (child cores 0.000 at
+the median, non-zero on 9.1% of ticks). The story's own notes pre-committed to the outcome: *if
+per-class variance also turns out to be large, plain AIMD is the better answer and this story
+should be dropped rather than forced.* It did, and it was.
+
+Measured over the same corpus this document describes, re-collected at 24,212 calls from 613
+transcripts against 580,895 host samples (2026-09-08T17:26Z .. 2026-09-21T03:41Z), 2,208 of them
+fittable and 801 of those gated. The cost variable is `attr_child_peak` — the same one §3 defines
+"expensive" against and the same one the classes in §5 were derived from. Reproduced by
+`TestClassCostVariance` in `internal/classify`, skipped unless `GOVERNOR_CORPUS` is set.
+
+### The premise survives; the design does not
+
+Classification genuinely does remove the problem Phase 0 named. The median cost of a *gated*
+call is not on the floor:
+
+| | n | p50 | p90 | p99 | max | mean | cv |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| all fittable | 2,208 | 0.075 | 0.967 | 4.614 | 7.412 | 0.419 | 2.12 |
+| **gated** | **801** | **0.524** | 1.281 | 4.697 | 7.412 | 0.753 | 1.25 |
+| medium | 762 | 0.518 | 1.086 | 4.142 | 7.412 | 0.689 | 1.22 |
+| heavy | 39 | 1.307 | 4.697 | 5.249 | 5.249 | 2.000 | 0.84 |
+
+A global p50 of 0.075 becomes a gated p50 of 0.524. So there *is* a non-zero cost for an
+estimator to track, which is the one result that would have killed the idea outright. Four
+further measurements killed it anyway.
+
+**1. The class explains 9% of the variance.** Eta-squared over the gated set is **0.090** —
+91% of the variance in build cost lies *within* a class rather than between the classes. As a
+predictor of what the next build will cost, the class is a label.
+
+**2. Within-class spread swamps between-class separation.** Heavy's p90 is 4.3x Medium's, but
+Medium's own p99/p50 is **8.0x** and its coefficient of variation is **1.22** — the standard
+deviation exceeds the mean. This is the same shape §5.6a of design.md found for *hold time*,
+now confirmed for **cost**, which is the quantity the classes were actually built to predict.
+
+**3. The per-class cost is non-stationary, and it is not a mix shift.** Across the corpus's two
+chronological halves, Medium's mean moves 0.543 → 0.875 (**5.1 sigma**) and Heavy's 1.181 →
+2.512 (2.8 sigma) — far outside sampling error. The obvious explanation is that the *mix* of
+shapes inside the class drifted rather than any build getting dearer, and it was checked
+directly. It is wrong:
+
+| shape | n (halves) | mean | | sigma | verdict |
+|---|---:|---:|---:|---:|---|
+| `go` | 54 → 46 | 0.544 → 1.410 | | 3.6 | **moved** |
+| `go test` | 101 → 95 | 0.658 → 1.239 | | 3.4 | **moved** |
+| `go build` | 75 → 62 | 0.491 → 0.831 | | 2.9 | **moved** |
+| `npx` | 16 → 5 | 0.295 → 0.586 | | 3.4 | **moved** |
+| `mypy` | 21 → 22 | 0.329 → 0.288 | | 0.5 | stable |
+| `pytest` | 157 → 87 | 0.581 → 0.561 | | 0.5 | stable |
+
+The mix *did* shift — `pytest` 36.8% → 26.0% of the class, `go test` 23.7% → 28.1% — in the
+direction that raises the mean. But it is the secondary term: the `go` family each got 1.7–2.6x
+more expensive on its own. **The drift is in the shapes, not only in their weights**, so a finer
+grain does not escape it.
+
+**4. Sized correctly, the live estimate reproduces the constant already shipped.** This is the
+decisive one. A loop protecting against saturation must size by the p90, not the mean (§5, and
+design.md §5.5). Medium's measured p90 is **1.086** against `budget.SlotCores` = **1.2**:
+
+| statistic | cores | B on 8 cores |
+|---|---:|---:|
+| shipped constant | 1.200 | 6 |
+| measured p90 | 1.086 | **7** |
+| measured mean | 0.689 | 11 |
+
+A 10% correction. The mean is the statistic that would make a live estimator look valuable, and
+it is the wrong one: eleven concurrent Medium builds at a p90 of 1.086 cores each is ~12 cores of
+expected peak demand on an 8-core machine, which is precisely the overshoot GOV-B03's own clause
+2 forbade. **The statistic that justifies the mechanism is the one that breaks it, and the
+statistic that is correct lands within 10% of a constant that is already there.**
+
+### What the measurement found that is worth keeping
+
+Grain matters, but not uniformly, and the useful shapes are not the ones that need help:
+
+| shape | n | p50 | p90 | max | cv |
+|---|---:|---:|---:|---:|---:|
+| `pytest` | 244 | 0.602 | 0.865 | 2.793 | **0.53** |
+| `xcodebuild test` | 9 | 1.569 | 2.575 | 2.575 | **0.40** |
+| `xcodebuild` | 8 | 3.929 | 5.144 | 5.144 | **0.55** |
+| `npx` | 21 | 0.342 | 0.672 | 0.738 | 0.64 |
+| `mypy` | 43 | 0.257 | 0.670 | 0.871 | 0.84 |
+| `go build` | 137 | 0.452 | 1.229 | 4.097 | 1.06 |
+| `go` | 100 | 0.502 | 3.287 | 4.142 | 1.26 |
+| `go test` | 196 | 0.541 | 1.889 | 7.412 | 1.30 |
+
+`pytest` at cv 0.53 is materially tighter than its class at 1.22, and it is also one of only two
+shapes confirmed *stationary*. `go test` is neither: it is the most common expensive shape, it
+carries the corpus's 7.4-core maximum, its cv of 1.30 is worse than its class's, and it moved
+3.4 sigma between halves. **So per-shape estimation is tractable exactly where it is least
+needed and intractable exactly where it would matter.** That is the finding the residue story
+carries, and it is a weaker result than "per-shape is the finer version of the same idea".
+
+### Limits of this section specifically
+
+- **`xcodebuild`'s stability is untested, not confirmed.** Its cv is attractive but n is 8 and 9
+  across the whole corpus, too few to split into halves. It is called tractable on spread alone.
+- **`npx` moved on n=5 in the second half.** Reported for completeness; five calls will not carry
+  a mean and the verdict should not be leaned on.
+- **Heavy rests on 39 calls.** Its 2.8-sigma shift is real but thin, and its p99 and max are the
+  same number because the tail is a handful of `xcodebuild` runs.
+- **Why the `go` family got dearer is not established here.** The second half of the window is
+  this project's own development, which runs `go test -race ./...` heavily; that is a plausible
+  cause and it is not a measured one. The finding is that the drift is real, not what caused it.

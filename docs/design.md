@@ -538,7 +538,7 @@ suite again, recursively. That is the same shape as the trap GOV-21 hit when `do
 | Run-queue depth | `loadavg1 / ncpu` | **the setpoint the loop controls on**, both directions |
 | Thermal pressure | `ProcessInfo.thermalState` | hard cut trigger |
 | Memory pressure | free pages + swap-in rate | secondary cut trigger |
-| Per-agent cost | CPU across the `claude` process tree ÷ confirmed leases | Phase 2 refinement |
+| Process-tree cost | CPU across the `claude` tree, roots and children separately | traced and reported; **not** a control input (§5.4) |
 
 **Identifying a session process: match `argv[0]`, not the executable name.** Measured in
 GOV-02, and it is the kind of mistake that produces a plausible-looking trace of nothing.
@@ -569,12 +569,11 @@ only, never values: the payload carries the agent's prompt.
 
 **The daemon samples the cheap signals every second and the process tree every fifth.**
 GOV-12. The walk is essentially the entire cost of a tick, so paying it at 1 Hz put the
-daemon over the 1%-of-a-core bar that story sets. Nothing the v1 loop reads is affected:
-per-agent tree cost is the "Phase 2 refinement" row of the table above, and CPU, run queue,
-thermal and memory — the signals §5.2 acts on — still tick every second. Samples carry
-`TreeFresh` so a consumer cannot mistake five carried-over copies for five readings. Phase 0's
-own sampler is unchanged and still walks every tick, because GOV-15 tunes the setpoint against
-traces collected at that cadence.
+daemon over the 1%-of-a-core bar that story sets. Nothing the loop reads is affected: tree cost
+is not a control input (§5.4), and CPU, run queue, thermal and memory — the signals §5.2 acts
+on — still tick every second. Samples carry `TreeFresh` so a consumer cannot mistake five
+carried-over copies for five readings. Phase 0's own sampler is unchanged and still walks
+every tick, because GOV-15 tunes the setpoint against traces collected at that cadence.
 
 **Measured sampler cost.** `GOVERNOR_MEASURE=1 go test ./internal/signals/ -run TestMeasureSamplerCost -v`,
 which reports CPU time from `getrusage` rather than wall clock — a percentage of a core is a
@@ -969,12 +968,52 @@ darwin output MUST NOT be shipped. The released darwin binaries are the ones CI 
 on a macOS runner with `CGO_ENABLED=1` (GOV-19). `governor status` is the check: on a Mac it
 must not say `unknown`.
 
-### 5.4 Attributed cost (Phase 2 refinement, not v1)
+### 5.4 Attributed cost — measured, and NOT built
 
-Raw host CPU% cannot tell a build from Chrome. Sum CPU across the `claude` process tree and
-its children, divide by the count of confirmed leases, and you have a live estimate of the
-marginal cost of one more agent — so `B = headroom / cost_per_agent` predicts instead of
-reacting. Build this only after Phase 0 shows the per-agent cost is real and measurable.
+**This section used to propose a predictive budget. It was measured in GOV-B03 and the
+proposal was dropped; what follows is the negative result, kept because a design that was
+tried and rejected is worth more written down than deleted.** The loop is AIMD over build
+slots, §5.2, and the cost per slot is the constant `budget.SlotCores`.
+
+The original text, withdrawn rather than edited, so the claim can be read as it was made:
+
+> **5.4 Attributed cost (Phase 2 refinement, not v1).** Raw host CPU% cannot tell a build from
+> Chrome. Sum CPU across the `claude` process tree and its children, divide by the count of
+> confirmed leases, and you have a live estimate of the marginal cost of one more agent — so
+> `B = headroom / cost_per_agent` predicts instead of reacting. Build this only after Phase 0
+> shows the per-agent cost is real and measurable.
+
+Two things happened to it. **Phase 0 withdrew its unit**: per-*agent* cost is not measurable on
+this instrument at all — the sampler is host-wide and the machine never ran fewer than three
+concurrent sessions (phase-0-findings.md §1). GOV-B03 re-scoped the section to cost per *build*,
+per cost class, which is measurable. **Then the measurement refused it.** The evidence is
+docs/bash-corpus.md §8; the four findings, shortest first:
+
+- **The cost class explains 9% of the variance** in gated build cost (eta-squared 0.090). 91%
+  lies within the class.
+- **Within-class spread swamps between-class separation**: Heavy's p90 is 4.3x Medium's, but
+  Medium's own p99/p50 is 8.0x and its cv is 1.22. The same shape §5.6a found for hold time,
+  now confirmed for the quantity the classes exist to predict.
+- **Per-class cost is non-stationary and it is not a mix shift.** Medium's mean moved 5.1 sigma
+  between halves of the corpus, and the `go` family each moved 1.7–2.6x *on its own*. A finer
+  grain does not escape it.
+- **Sized correctly it reproduces the constant.** A saturation-protecting loop must size by the
+  p90 (§5.5). Medium's measured p90 is 1.086 against `SlotCores` = 1.2 — B=7 against B=6 on
+  this host. Sizing by the *mean* instead gives B=11, which is ~12 cores of expected peak on
+  8 cores: the overshoot the proposal's own acceptance criteria forbade.
+
+**The general lesson, which outlives this section.** The statistic that makes a predictive
+budget look valuable is the mean, and a loop whose job is to avoid saturation cannot size by
+the mean. Once it sizes by the tail instead, the live estimate and a well-chosen constant are
+the same number, and the constant cannot oscillate. That is an argument against predictive
+sizing *for this controller*, not against attribution as an instrument — attribution is what
+produced these numbers.
+
+**What survives as a real, smaller question.** Estimation *per command shape* is tractable for
+`pytest` (cv 0.53) and, on spread alone, `xcodebuild` (0.40–0.55) — and intractable for
+`go test`, which is the most common expensive shape, carries the corpus's 7.4-core maximum, has
+a cv of 1.30 and drifted 3.4 sigma. So it is tractable where it is least needed. That is a
+per-host correction of `SlotCores`, not a change to the control law, and it is backlog.
 
 ### 5.5 Classification: which `Bash` is build-shaped
 
@@ -1018,6 +1057,13 @@ not the same cost in two repositories** — `uv run pytest` in one project here 
 the machine. A per-host table keyed on command shape, seeded from these classes and corrected
 from what the sampler observes, is the design this points at. The seed exists so the first
 decision is not random; it is not the last word.
+
+**That table is a correction to `SlotCores`, NOT a live estimate replacing the loop** — the
+difference is §5.4, where the live-estimate version was measured and rejected. GOV-B03 also
+bounded how much such a table can be worth: per-shape estimation is tractable for `pytest`
+(cv 0.53) and intractable for `go test` (cv 1.30, the corpus's 7.4-core maximum, 3.4 sigma of
+drift between its halves), which is the most common expensive shape. It is tractable where it
+is least needed. docs/bash-corpus.md §8 carries the numbers.
 
 **18.4% of calls taking a lease is a reduction, not cheapness.** It turns a 220× problem into
 roughly an 11× one. §4.4's performance budget was priced for a gate firing a few dozen times a
