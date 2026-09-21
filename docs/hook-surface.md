@@ -1907,3 +1907,174 @@ The probe plugin was removed afterwards.
 - **Whether the description has a length cap**, as §16.3's channels do. The probe's description
   was one line.
 - **Linux**, as everywhere else in this file.
+
+---
+
+## 22. A skills-dir plugin's `commands/` — does the slash command have a way in?
+
+design.md §9 has named `commands/governor.md` since the first draft, illustrated as `/governor
+status | limit N | pause | boost`. §15 established that a skills-dir plugin's **hooks** fire,
+§20 that its **`.mcp.json`** loads, §21 that its **`SKILL.md`** is surfaced. A plugin's
+*commands* are a fourth component, and GOV-B01 found §9 naming one on the strength of nothing —
+the same shape of claim §21 opened by noting about `skills/fleet-budget/SKILL.md`.
+
+It works. Two of the five answers below break the command as §9 illustrated it, and a third is
+a fabrication hazard on exactly the surface this project cares most about being truthful.
+
+### 22.0 Provenance
+
+| | |
+|---|---|
+| Claude Code | **2.1.278** |
+| Host | macOS 25.4.0, darwin/arm64, 8 logical cores |
+| Date | 2026-09-20 |
+| Model | default, `claude -p` |
+
+### 22.1 Method
+
+A throwaway skills-dir plugin carrying **no hooks, no `.mcp.json` and no skill** — the manifest,
+one command, and (for §22.5) one executable:
+
+```
+~/.claude/skills/govb01-probe/
+├── .claude-plugin/plugin.json      name: govb01-probe
+├── commands/probe.md
+└── bin/probebin                    #!/bin/sh; echo "GOVCMD-BIN-RAN-7C2D args=$*"
+```
+
+Ten `claude -p` runs against a rewritten `probe.md`, from a scratch cwd so that this repo's own
+`.claude/commands/` could not contribute. The probe plugin was removed afterwards.
+
+**THE EXPANSION IS READ OUT OF THE TRANSCRIPT, NOT OUT OF THE MODEL'S REPLY, and that is the
+whole reliability of this section.** Asking the model to echo its own prompt back is not a
+measurement: in two runs it reported values that the transcript shows it was never given —
+once inventing `ONE=[solo]` for a `$1` that had arrived as the literal string `$1`, and once
+answering `OUT=GOVCMD-NOALLOW-9A3C` for a line that had reached it as uninterpreted text. The
+harness writes the expanded prompt to `~/.claude/projects/<cwd-slug>/<session-id>.jsonl` as the
+first `user` message with `isMeta: true`; every claim below is read from there.
+
+**`--allowedTools ""` SUPPRESSES `!`-PRE-EXECUTION, and it confounded four runs before it was
+caught.** It was being passed to stop the model wandering off into tool calls, and it silently
+turned §22.4's feature off — producing four consecutive clean negatives that said absolute
+paths could not be executed. They could; the flag was the cause. A probe flag that alters the
+mechanism under test is worth more suspicion than the mechanism.
+
+### 22.2 The command registers, and its name is `<manifest name>:<file basename>`
+
+The `system`/`init` event of `--output-format stream-json --verbose` carries a
+`slash_commands` array, which is a mechanical listing rather than a report:
+
+```
+probe-related: ['govb01-probe:probe']
+```
+
+Colon-separated, from `.claude-plugin/plugin.json`'s `name` and the command file's basename.
+**Not** the bare `/probe`, and **not** §20.4's underscore mangling for MCP tool names. This is
+§21.2's rule for skills, and it carries §21's two traps with it: the prefix follows the
+manifest rather than the directory, so a plugin whose two names diverge advertises a command
+matching neither.
+
+**For the shipped plugin this makes the command `/claude-governor:governor`,** and §9's
+`/governor` is not a name that exists. That is not composed from the probe's result — the
+shipped `commands/governor.md` was staged into the installed plugin and the same `init` event
+read back:
+
+```
+governor-related slash commands: ['claude-governor:governor']
+```
+
+Composing "a plugin command is `<manifest>:<basename>`" with "the manifest says
+claude-governor" would have been an inference, and this file's whole discipline is that the
+surface is measured rather than reasoned about. It is not tunable without renaming the plugin, which
+would move the installed path, `${CLAUDE_PLUGIN_DATA}` and every §13.3 row.
+
+### 22.3 `$ARGUMENTS` is whole; `$N` is off by one and leaks when out of range
+
+Read from the transcript, `probe.md` containing `ARGS=[$ARGUMENTS] ONE=[$1] TWO=[$2] THREE=[$3]`:
+
+| invocation | `$ARGUMENTS` | `$1` | `$2` | `$3` |
+|---|---|---|---|---|
+| `…:probe alpha beta gamma` | `alpha beta gamma` | `beta` | `gamma` | literal `$3` |
+| `…:probe solo` | `solo` | literal `$1` | literal `$2` | literal `$3` |
+| `…:probe` | *(empty)* | literal `$1` | literal `$2` | literal `$3` |
+
+**`$N` resolves to the (N+1)th word.** `$1` is the *second*, consistent with a substituter
+indexing a zero-based array from 1. And an out-of-range `$N` is **left as the literal text
+`$N`** rather than emptied, so an under-supplied command ships the characters `$3` into the
+model's prompt.
+
+Both halves bite `/governor limit 8` directly: `$1` is `8`, and a body written to read the
+subcommand from `$1` and the number from `$2` gets the number and then the string `$2`.
+
+**Consequence: use `$ARGUMENTS` and parse it in the body. Never `$N`.**
+
+### 22.4 `` !`cmd` `` is pre-executed by the harness — but only at the start of a line
+
+A body line beginning `` !` `` is run before the model sees anything, and its **stdout is
+substituted in place**. Both forms below were in one probe; both executed:
+
+```
+!`echo GOVCMD-LINESTART-8B1C`
+
+!`${CLAUDE_PLUGIN_ROOT}/bin/probebin status`
+```
+
+reached the model as:
+
+```
+GOVCMD-LINESTART-8B1C
+
+GOVCMD-BIN-RAN-7C2D args=status
+```
+
+`${CLAUDE_PLUGIN_ROOT}` expands inside the backticks, so a plugin can run **its own installed
+binary** and put the real output in front of the model.
+
+**INLINE, IT DOES NOT FIRE, AND THAT IS A FABRICATION HAZARD RATHER THAN A LIMITATION.** The
+same construct written as `` OUT=!`echo GOVCMD-NOALLOW-9A3C` `` reached the model verbatim,
+backticks and all — and the model answered `OUT=GOVCMD-NOALLOW-9A3C`, reading the text of the
+command it was never given the output of and reporting it as the output. A `/governor status`
+written inline would print a budget nobody measured, which is precisely what §4.2's rule
+against fabricated refusal text and the status line's rule against unsent clauses exist to
+prevent. **The construct must start its line.**
+
+### 22.5 Pre-execution requires `allowed-tools`, and fails visibly without it
+
+With no `allowed-tools` key, the same line-start form is refused, and nothing is substituted:
+
+```
+<local-command-stderr>Shell command permission check failed for pattern
+"!`/Users/peterho/.claude/skills/govb01-probe/bin/probebin noallow`":
+This command requires approval</local-command-stderr>
+```
+
+Listing the binary — `allowed-tools: Bash(/abs/path/to/probebin:*)` — makes it run. **The
+failure shape is the good one:** the model is handed an error where the output would have been,
+so it has nothing to invent from, unlike §22.4's inline case which hands it something that
+looks exactly like an answer.
+
+### 22.6 Consequences folded into design.md
+
+- §9's `commands/governor.md` line is corrected to the name that exists,
+  `/claude-governor:governor`, and its illustration to `$ARGUMENTS`.
+- §13.2 gains the command surface row; §13.3 gains the installed
+  `commands/governor.md` path, without which `uninstall` would leave it behind.
+- §6.1's "GOV-B02's focus boost is the only thing that should ever move a session's weight" is
+  narrowed to what it means — one *mechanism*, two *triggers*.
+
+### 22.7 Still unmeasured
+
+- **Whether a command is picked up by a session already running.** §15.5, §20.7 and §21.4
+  record the same open question for hooks, MCP servers and skills. `install` makes the same
+  claim for all four, which is the safe one.
+- **Whether `!`-pre-execution prompts interactively.** Every run here was `claude -p`, where an
+  uncovered command is refused outright. What an interactive session does with one that
+  `allowed-tools` does not cover — prompt, or refuse the same way — is not measured, and the
+  shipped command covers its own binary so as not to depend on the answer.
+- **Whether `$N`'s off-by-one is a bug that will be fixed.** It is measured on one version. The
+  shipped command does not use `$N`, so a fix cannot break it — which is the reason to avoid it
+  beyond the off-by-one itself.
+- **What happens to two plugins whose command basenames collide** after the manifest prefix.
+- **`argument-hint` and `description`** are carried in the probe's frontmatter throughout and
+  neither was read back; only `allowed-tools` was tested for effect.
+- **Linux**, as everywhere else in this file.

@@ -1162,8 +1162,17 @@ a number on.
 **Weight governs who refills, not who arrives first.** Two sessions ramping in lockstep from an
 idle machine simply fill it first-come until capacity binds; neither has been refused, so
 neither has revealed demand beyond what it holds, and there is nothing for a weighted cap to
-act on. Weight starts deciding once somebody has been refused. Per §12.2, GOV-B02's focus boost
-is the only thing that should ever move a session's weight.
+act on. Weight starts deciding once somebody has been refused.
+
+**One weighting mechanism, more than one trigger.** This sentence used to read "GOV-B02's focus
+boost is the only thing that should ever move a session's weight", which GOV-B01 had to
+contradict to ship `boost` at all. What it was guarding is worth keeping and is narrower than
+what it said: there must be exactly one *mechanism*, `Session.Weight` as read by
+`shareLocked`, and no second scheme layered beside it. Triggers may be plural.
+`/claude-governor:governor boost` (GOV-B01) sets a weight because a person said so; GOV-B02's
+focus boost would set the same field because the window came forward. Neither is a second
+mechanism, and GOV-B02 is in any case still in Backlog and may be dropped — deferring the
+manual trigger to it would have meant deferring it to something that may never be built.
 
 ### 6.2 Wait queue
 
@@ -1275,7 +1284,24 @@ per connection. Deliberately boring — this is a hot path.
 // -> status (statusline, doctor, /governor)
 {"v":1,"op":"status"}
 {"v":1,"budget":6,"in_use":4,"waiting":1,"cpu":0.61,"thermal":"nominal",
- "binary_version":"1.2.0","sources":[{"name":"local","budget":6}],"sessions":[...]}
+ "binary_version":"1.2.0","sources":[{"name":"local","budget":6}],"sessions":[...],
+ "pinned":false,"paused":false}
+// -> control (the manual overrides of section 9.1). `control` and `limit` are NEW KEYS and
+//    had to be: this connection's decode struct already carries `action` (the session verb)
+//    and `slots` (the gate's lease weight, a FLOAT), so reusing either would have made every
+//    `limit` decode as something else entirely. Third instance of the trap below.
+{"v":1,"op":"control","principal":{"user":"peter","team":null},
+ "session":"abc123","control":"limit","limit":2,"for_ms":1800000}
+// <- the resulting state, not an acknowledgement: `resume` with nothing pinned and `limit`
+//    against a daemon already at that number both succeed, and only the state tells them apart.
+{"v":1,"ok":true,"budget":2,"source_budget":6,"pinned":true,
+ "pinned_until":"2026-09-20T23:53:17Z","in_use":0}
+// <- from a daemon that PREDATES this operation: the ordinary unknown-op ack. The client MUST
+//    read it as "no answer" and say so, never as a refusal — during an upgrade there is a
+//    daemon of one version and a command of another, and a person told "refused" goes looking
+//    for the policy that refused them instead of restarting the daemon.
+{"v":1,"ok":false,"reason":"unknown_op","in_use":4}
+
 // -> advise (MCP request_build, section 8). READ-ONLY: it takes no lease, holds nothing
 //    and changes no state, so a session may ask as often as it likes. The gate's own
 //    acquire is the only thing that consumes budget.
@@ -1325,6 +1351,14 @@ capacity" on a machine that is half empty.
 name makes every **grant** fail to decode, and a gate that cannot decode a reply fails open.
 This is the same trap the acquire's `slots` key documents against `weight`. A key is only free
 if no other message on this connection already uses it with a different type.
+
+**GOV-B01 is the third instance, and it is why `control` does not reuse `action` or `slots`.**
+The obvious names for "pin the budget to N" were `action: "limit"` and `slots: 2` — and the
+daemon decodes every operation on this connection into ONE struct, where `action` is already
+the session verb with a disjoint vocabulary and `slots` is already the gate's lease weight as a
+**float**. A `limit` sent that way decodes as a lease request for 2 slots, which is not an error
+anything reports. Three times now, so it is a rule rather than an anecdote: **a key is free only
+after checking every other message on this connection, and a new field is guilty until then.**
 
 
 The daemon MUST tolerate a malformed line by closing that connection only. One bad client
@@ -1456,13 +1490,14 @@ claude-governor/                  the repo
 │   ├── signals/                  Sampler interface; sampler_darwin.go, sampler_linux.go
 │   └── config/                   versioned schema, migration, atomic write
 ├── skills/heavy-build/SKILL.md   "ask before you launch a heavy build" (section 8)
-└── commands/governor.md          /governor status | limit N | pause | boost
+└── commands/governor.md          status | limit N | pause | resume | boost (section 9.1)
 
 ~/.claude/skills/claude-governor/ the installed plugin, written by `governor install`
 ├── .claude-plugin/plugin.json    name, version, description
 ├── hooks/hooks.json              the six hooks in section 4.1
 ├── .mcp.json                     the advisory server in section 8
 ├── skills/heavy-build/SKILL.md   the advice a session loads on demand (section 8)
+├── commands/governor.md          the slash command (section 9.1)
 └── bin/governor                  the binary those hooks run
 
 state  → ~/.claude/governor/      sock, daemon.pid, daemon.log, daemon.start, statusline.json,
@@ -1569,6 +1604,70 @@ span from this file and from README.md and requires that set to equal, exactly, 
 lines `render` produces for the views it enumerates. An illustration that stops rendering is
 red, an undocumented new one is red, and so is deleting them all — which is the failure a
 one-directional check would have passed.
+
+### 9.1 The slash command
+
+`/claude-governor:governor` is the manual override, and design.md carried it for a long time
+as `/governor status | limit N | pause | boost` without anything having been measured. GOV-B01
+measured it ([hook-surface.md](hook-surface.md) §22) and three of those words were wrong.
+
+**The name is `/claude-governor:governor`.** A plugin command is advertised as `<manifest
+name>:<file basename>`, so the bare `/governor` this document illustrated for months is not a
+name that exists. It is not a choice — shortening it means renaming the plugin, which moves the
+installed path, `${CLAUDE_PLUGIN_DATA}` and every §13.3 row for a cosmetic win.
+
+**It is a prompt, not an entry point.** A command file is expanded into the model's context; it
+cannot *be* the implementation. So every verb below is a real subcommand of the binary, and the
+command file's job is to run it and show the result. That division is what keeps the override
+usable from a script and from `governor` directly, not only from inside a session.
+
+| Verb | Subcommand | Does |
+|---|---|---|
+| `status` | `governor status` | budget, in use, waiting, CPU, thermal, per-session shares |
+| `limit N` | `governor limit N [for D]` | pin the budget at N slots until it expires or is released |
+| `pause` | `governor pause [for D]` | stop gating without stopping the daemon |
+| `resume` | `governor resume` | release a pin or a pause early |
+| `boost` | `governor boost [for D]` | double this session's weight (§6.1) |
+
+**Every override expires.** A pinned limit and a pause both carry a deadline, default one hour,
+and the status line says which is in force and how long is left. This is the whole of GOV-B01's
+trap and it is not a nicety: a manual override that silently outlives the reason it was set is
+how a governor stops being trusted, and the person who set it is by then in a different
+context and has no way to know it is still on. Nothing persists across a daemon restart either
+— the override lives in memory beside the lease table, for the reason §12.2 gives for the
+leases themselves.
+
+**The status line says so while an override holds,** and that is the half of this story that
+makes the other half safe. A pinned budget is otherwise indistinguishable from one the control
+loop chose — the same number in the same place — so the line gains a clause:
+
+`2/2 slots - pinned`
+
+a boosted session says so too, because it is the override that changes nothing anyone can see
+— only who wins when two sessions contend, which is invisible from inside either of them:
+
+`1/6 slots - boosted`
+
+and a pause replaces the slot count entirely, for GOV-29's reason and not a new one:
+
+`governor: gating paused`
+
+The count is what would be misread during a pause — it reads `2/4` on a machine that will admit
+a fifth and a hundredth — so the count is what goes. Both clauses carry the time remaining when
+there is one — the word pinned followed by how long is left — which is deliberately not quoted
+here, because a countdown is not a thing a document can illustrate without going stale on the
+next tick. `TestTheOverrideClausesNameWhenTheyEnd` holds that part instead.
+
+**The command body uses `$ARGUMENTS`, never `$N`, and its `!`-lines start at column zero.**
+Both are §22 findings rather than style: `$N` resolves to the (N+1)th word and leaks the
+literal text `$N` when out of range, and a `` !`…` `` that does not begin its line is passed to
+the model uninterpreted — which in one probe produced a model reporting the text of a command
+as that command's output. On a surface whose entire value is that its numbers are real, that is
+the failure worth engineering against, and it is why the command declares `allowed-tools`
+covering its own binary: an uncovered pre-execution is refused visibly and substitutes nothing,
+leaving the model with an error rather than with something shaped like an answer.
+
+---
 
 ---
 
@@ -1894,6 +1993,7 @@ being asked of them is to run a hook on every subagent spawn.
 | `governor doctor` | daemon reachable? hooks registered? matcher matches the real tool name? **are the sessions running right now actually governed?** binary and plugin versions agree? config schema current? each failure names its fix |
 | `governor calibrate` | measure cores, performance cores, RAM, this host's ambient run queue and a short load probe; write the run-queue cut threshold and B_max for *this* machine, with a provenance note |
 | `governor version` | binary version, protocol version, config schema version |
+| `governor limit N` / `pause` / `resume` / `boost` | the manual overrides of §9.1, each expiring on its own |
 
 GOV-20 shipped `doctor`, and it reports eleven findings rather than the six checks this table
 lists — `binary`, `protocol` and `config` are the three halves of "versions agree", split
@@ -2020,6 +2120,7 @@ Uninstall is only verifiable if this list is exhaustive, so it is normative.
 | `~/.claude/skills/claude-governor/hooks/hooks.json` (the six hooks) | install | uninstall |
 | `~/.claude/skills/claude-governor/.mcp.json` (the advisory server, section 8) | install | uninstall |
 | `~/.claude/skills/claude-governor/skills/heavy-build/SKILL.md` (the advice, section 8) | install | uninstall |
+| `~/.claude/skills/claude-governor/commands/governor.md` (the slash command, section 9.1) | install | uninstall |
 | `~/.claude/skills/claude-governor/bin/governor` | install, copied from the running binary | uninstall |
 | `~/.claude/skills/` | install, only if absent | uninstall, only if it empties |
 | `~/.claude/settings.json` (`statusLine` key only) | install, merged | uninstall, previous value restored from backup |

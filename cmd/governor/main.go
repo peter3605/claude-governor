@@ -53,6 +53,10 @@ var commands = []command{
 	{"finish", "PostToolUse hook: return a build lease when its command completes", runFinish},
 	{"session", "SessionStart/SessionEnd hook: register or drop a session", runSession},
 	{"status", "print the current budget and its holders", runStatus},
+	{"limit", "pin the budget until it expires or is released", runLimit},
+	{"pause", "stop gating without stopping the daemon", runPause},
+	{"resume", "release a pinned budget or a pause", runResume},
+	{"boost", "double this session's share weight", runBoost},
 	{"mcp", "serve the advisory MCP tool over stdio", runMCP},
 	{"statusline", "render the one-line status for a session", runStatusline},
 	{"trace", "Phase 0 instrumentation: record hook events and 1 Hz host samples", runTrace},
@@ -110,20 +114,75 @@ func stub(name string) func([]string, io.Writer, io.Writer) int {
 // either way — this process can read ProcessInfo.thermalState as well as the daemon can —
 // so an unreachable daemon costs the budget and the lease table, not every fact.
 func runStatus(_ []string, stdout, stderr io.Writer) int {
-	v := view(query(stderr, transport.Dial{}, time.Now().Add(statusBudget)), "")
+	printStatus(stdout, query(stderr, transport.Dial{}, time.Now().Add(statusBudget)))
+	return 0
+}
+
+// printStatus writes the report for one status reply.
+//
+// Split from runStatus so that what this command PRINTS can be tested without standing up a
+// daemon — the acceptance criteria for GOV-B01 are a list of facts that have to appear here,
+// and a test that could only check them through a socket would not have been written.
+func printStatus(stdout io.Writer, c cachedStatus) {
+	v := view(c, "")
 	if !v.OK {
 		fmt.Fprintf(stdout, "daemon not running\n")
 		fmt.Fprintf(stdout, "thermal %s\n", signals.ReadThermal())
-		return 0
+		return
 	}
 	fmt.Fprintf(stdout, "budget %d\n", v.Budget)
 	fmt.Fprintf(stdout, "in use %d\n", v.InUse)
 	fmt.Fprintf(stdout, "waiting %d\n", v.Waiting)
+	// The manual overrides (section 9.1), printed only when one is in force. This is the
+	// command a person runs after the status line has told them something is odd, so it is the
+	// place where "the budget is 2 because somebody pinned it" has to be legible — a pinned
+	// budget that reported only its number would send them to debug a control loop that is
+	// not running.
+	if v.Pinned {
+		fmt.Fprintf(stdout, "pinned yes%s\n", untilSuffix(v.PinnedUntil))
+	}
+	if v.Paused {
+		fmt.Fprintf(stdout, "paused yes%s\n", untilSuffix(v.PausedUntil))
+	}
 	if v.CPU != nil {
 		fmt.Fprintf(stdout, "cpu %.2f\n", *v.CPU)
 	}
 	fmt.Fprintf(stdout, "thermal %s\n", v.Thermal)
-	return 0
+	// THE PER-SESSION SHARES, which GOV-B01's acceptance criteria name and which this command
+	// did not print until it did. The machine-wide totals above answer "is the budget full";
+	// only this answers "full of whose work", which is the question somebody runs `status`
+	// to settle when their own session is the one being refused.
+	//
+	// One line per session, with the weight beside the counts because since GOV-18 the weight
+	// is what decides who refills a contended budget — and since this story a person can move
+	// it, so a session sitting at 2 is a fact the others need to be able to see.
+	for _, s := range c.Reply.Sessions {
+		fmt.Fprintf(stdout, "session %s weight %d tentative %d confirmed %d%s\n",
+			s.Session, sessionWeight(s.Weight), s.Tentative, s.Confirmed, liveSuffix(s))
+	}
+}
+
+// sessionWeight reads a weight the daemon may not have sent. Zero means the daemon recorded no
+// weight for this session, and the table reads that as the default 1 — so this prints 1 too,
+// rather than a 0 that would look like a session entitled to nothing.
+func sessionWeight(w int) int {
+	if w <= 0 {
+		return 1
+	}
+	return w
+}
+
+// liveSuffix marks a session that is running but has never registered with this daemon.
+//
+// It is the one thing on these lines that is not a number, and it is here because a session in
+// that state is holding no leases and looks identical to an idle governed one — which is the
+// exact misreading GOV-29 was filed about, in the place a person goes to check after the status
+// line has sent them.
+func liveSuffix(s sessionStat) string {
+	if s.Live && !s.Registered {
+		return " ungoverned"
+	}
+	return ""
 }
 
 // statusBudget is the allowance for `governor status`.
@@ -134,6 +193,16 @@ func runStatus(_ []string, stdout, stderr io.Writer) int {
 // because a command that hangs against a wedged daemon is a command that gets reported as
 // a hung terminal.
 const statusBudget = time.Second
+
+// untilSuffix renders " until <RFC3339>" for the key/value lines above, or nothing when the
+// deadline is absent. The wire format rather than a friendly one: this output is parsed by
+// doctor and by scripts, and a locale-dependent time is not something either can read.
+func untilSuffix(t time.Time) string {
+	if t.IsZero() {
+		return ""
+	}
+	return " until " + t.UTC().Format(time.RFC3339)
+}
 
 func runVersion(_ []string, stdout, _ io.Writer) int {
 	fmt.Fprintf(stdout, "governor %s\n", binaryVersion)

@@ -1536,3 +1536,69 @@ func commandNames() []string {
 	}
 	return names
 }
+
+// Install writes the slash command where the harness will find it (GOV-B01).
+//
+// THE PATH AND THE BASENAME ARE BOTH LOAD-BEARING, and neither fails loudly if it is wrong.
+// hook-surface.md §22 measured that a skills-dir plugin's commands are read from
+// <plugin>/commands/ and that the command's name is <manifest name>:<file basename> — so a file
+// written anywhere else registers nothing at all, and a file renamed registers a command under
+// a name nobody has been told. Both look exactly like a working install.
+func TestInstallWritesTheSlashCommand(t *testing.T) {
+	p := stagedHome(t)
+	installOK(t)
+
+	want := filepath.Join(p.plugin, "commands", "governor.md")
+	if p.command != want {
+		t.Fatalf("the command is at %s, want %s: §22.2 measured that a plugin's commands are "+
+			"read from <plugin>/commands/ and a file outside it registers nothing", p.command, want)
+	}
+	got, err := os.ReadFile(p.command)
+	if err != nil {
+		t.Fatalf("install did not write the command: %v", err)
+	}
+	if string(got) != string(pluginCommand()) {
+		t.Error("the installed command differs from the bytes this binary ships")
+	}
+	// The basename is half the command's name in a session.
+	if filepath.Base(p.command) != "governor.md" {
+		t.Errorf("basename %q makes the command /claude-governor:%s, which is not the name "+
+			"design.md §9.1 documents", filepath.Base(p.command),
+			strings.TrimSuffix(filepath.Base(p.command), ".md"))
+	}
+}
+
+// And uninstall takes it away again, so §13.3 stays exhaustive.
+func TestUninstallRemovesTheSlashCommand(t *testing.T) {
+	p := stagedHome(t)
+	installOK(t)
+	if _, err := os.Stat(p.command); err != nil {
+		t.Fatalf("nothing to remove: %v", err)
+	}
+
+	uninstallOK(t)
+	if _, err := os.Stat(p.command); !os.IsNotExist(err) {
+		t.Errorf("the command survived uninstall at %s (%v)", p.command, err)
+	}
+	if _, err := os.Stat(filepath.Dir(p.command)); !os.IsNotExist(err) {
+		t.Errorf("the commands/ directory survived uninstall at %s", filepath.Dir(p.command))
+	}
+}
+
+// design.md §13.3 names the command's installed path.
+//
+// §13.3 is normative — uninstall is only verifiable if that list is exhaustive — and a path
+// added to the installer without being added to the table is a path uninstall silently stops
+// being checked against. This holds the same claim for commands/governor.md that the table's
+// other rows already carry.
+func TestSectionThirteenThreeNamesTheSlashCommand(t *testing.T) {
+	b, err := os.ReadFile(filepath.Join("..", "..", "docs", "design.md"))
+	if err != nil {
+		t.Fatalf("read design.md: %v", err)
+	}
+	if !strings.Contains(string(b), "commands/governor.md") {
+		t.Error("design.md does not name commands/governor.md; §13.3 is the normative list " +
+			"of what touches the user's machine, and uninstall is only verifiable while it " +
+			"is exhaustive")
+	}
+}

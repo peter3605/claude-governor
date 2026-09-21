@@ -897,6 +897,19 @@ func TestTheDocsIllustrateTheStatusLineThatActuallyRenders(t *testing.T) {
 		"section 13, a budget filled by leases that outlived their agents": {
 			OK: true, InUse: 4, Slots: 4, Budget: 4,
 		},
+		// GOV-B01's two override states. Both are deadline-free here on purpose: a rendered
+		// "42m left" is a moving target no document could illustrate, so the clause that
+		// names the remaining time is covered by TestTheOverrideClausesNameWhenTheyEnd and
+		// this guard holds the shape of the line itself.
+		"section 9.1, a session whose budget a person has pinned": {
+			OK: true, InUse: 2, Slots: 2, Budget: 2, Pinned: true,
+		},
+		"section 9.1, a session whose gating a person has paused": {
+			OK: true, Paused: true,
+		},
+		"section 9.1, a session whose weight a person has boosted": {
+			OK: true, InUse: 1, Slots: 1, Budget: 6, Boosted: true,
+		},
 	} {
 		renders[render(v, 0)] = name
 	}
@@ -905,7 +918,7 @@ func TestTheDocsIllustrateTheStatusLineThatActuallyRenders(t *testing.T) {
 	// added. Matched anywhere in the span rather than anchored, because the illustration this
 	// story deleted opened with a glyph and would have slipped an anchored pattern — the one
 	// thing the guard exists to catch must be a thing it can see.
-	shaped := regexp.MustCompile(`\d+/\d+ slots|\bcpu \d+%|\bthermal (ok|fair|serious|critical)\b|\d+ waiting|governor: (ungoverned|daemon not running)`)
+	shaped := regexp.MustCompile(`\d+/\d+ slots|\bcpu \d+%|\bthermal (ok|fair|serious|critical)\b|\d+ waiting|governor: (ungoverned|daemon not running|gating paused)|\bpinned\b|\bboosted\b`)
 	span := regexp.MustCompile("`([^`]*)`")
 
 	illustrated := map[string]string{} // span -> file:line
@@ -995,5 +1008,46 @@ func TestSectionNineNamesEveryStateFile(t *testing.T) {
 			t.Errorf("section 9's summary names %s, which §13.3's table does not — so either "+
 				"the summary invented it or uninstall does not know about it", f)
 		}
+	}
+}
+
+// The override clauses say how long is left, and say nothing when there is nothing to say.
+//
+// TestTheDocsIllustrateTheStatusLineThatActuallyRenders covers the SHAPE of these two lines but
+// cannot cover this: a rendered countdown changes every second, so a document that quoted one
+// would be wrong by the next tick and the guard would be holding the docs to a moving target.
+// This is the other half — that the deadline appears at all, which is the whole of GOV-B01's
+// trap, and that an absent one produces no clause rather than a fabricated deadline.
+func TestTheOverrideClausesNameWhenTheyEnd(t *testing.T) {
+	in42 := time.Now().Add(42 * time.Minute)
+
+	pinned := render(statusView{OK: true, InUse: 2, Slots: 2, Budget: 2, Pinned: true, PinnedUntil: in42}, 0)
+	if !strings.Contains(pinned, "pinned") {
+		t.Fatalf("a pinned budget does not say so: %q", pinned)
+	}
+	if !strings.Contains(pinned, "left") {
+		t.Errorf("a pinned budget does not say when it ends: %q — an override whose expiry "+
+			"is invisible is one nobody can reason about later, which is when it does harm", pinned)
+	}
+
+	paused := render(statusView{OK: true, Paused: true, PausedUntil: in42}, 0)
+	if !strings.Contains(paused, "paused") || !strings.Contains(paused, "left") {
+		t.Errorf("a paused line does not say what it is or when it ends: %q", paused)
+	}
+
+	// No deadline, no clause. A surface that printed "pinned until unknown" would be stating
+	// a fact the daemon did not send, which is the rule every other clause on this line follows.
+	noDeadline := render(statusView{OK: true, InUse: 2, Slots: 2, Budget: 2, Pinned: true}, 0)
+	if strings.Contains(noDeadline, "left") || strings.Contains(noDeadline, "until") {
+		t.Errorf("invented a deadline the daemon never sent: %q", noDeadline)
+	}
+
+	// An already-passed deadline is not rendered as a negative countdown either.
+	stale := render(statusView{
+		OK: true, InUse: 2, Slots: 2, Budget: 2,
+		Pinned: true, PinnedUntil: time.Now().Add(-time.Minute),
+	}, 0)
+	if strings.Contains(stale, "-") && strings.Contains(stale, "left") {
+		t.Errorf("rendered a deadline that has already passed: %q", stale)
 	}
 }

@@ -106,9 +106,20 @@ type Session struct {
 	// Weight is the session's share for max-min fair allocation (design.md section 6.1),
 	// acted on by shareLocked since GOV-18. Zero and negative are read as the default 1.
 	//
-	// GOV-B02's focus boost is the only thing that should ever move it; a second weighting
-	// mechanism alongside this one is explicitly not wanted.
+	// ONE MECHANISM, MORE THAN ONE TRIGGER. This field is the only weighting scheme there is
+	// and nothing should be built beside it — but what moves it is open: GOV-B01's
+	// `governor boost` sets it because a person said so, and GOV-B02's focus boost would set
+	// the same field because the window came forward. §6.1 used to say the focus boost was
+	// the only thing that may ever move a weight, which read as a ban on the manual one.
 	Weight int
+	// BoostedUntil is when a temporary weight reverts to 1. Zero means the weight is not
+	// temporary and nothing will revert it.
+	//
+	// A BOOST EXPIRES FOR THE SAME REASON A PINNED BUDGET DOES (design.md section 9.1). It is
+	// a manual override of a fairness rule, so a forgotten one is a session quietly taking
+	// more than its share of every contended budget for as long as the daemon lives — and
+	// unlike a pinned budget, nothing about the machine looks wrong while it happens.
+	BoostedUntil time.Time
 	// StartedAt is when the session registered.
 	StartedAt time.Time
 }
@@ -409,11 +420,65 @@ func (t *Table) shareLocked(session string, asking float64, limit int) float64 {
 // A session holding leases without having registered gets the default rather than zero. Zero
 // would make its entitlement zero and deny it forever, and the leases prove it is real; the
 // registration is what is missing, not the session.
+//
+// AN EXPIRED BOOST IS DROPPED HERE, on the read, rather than only by the reaper. This is the
+// function fair share actually consults, so expiring at the point of use means no admission
+// decision can ever be made against a boost whose deadline has passed — including on a daemon
+// whose reaper is wedged, and including from a path added later that does not know the reaper
+// sweeps these.
 func (t *Table) weightOfLocked(id string) float64 {
-	if s, ok := t.sessions[id]; ok && s.Weight > 0 {
+	s, ok := t.sessions[id]
+	if !ok {
+		return 1
+	}
+	s = t.expireBoostLocked(s)
+	if s.Weight > 0 {
 		return float64(s.Weight)
 	}
 	return 1
+}
+
+// expireBoostLocked reverts a session whose boost has run out, and returns the current session.
+//
+// IT IS SHARED BY THE ADMISSION PATH AND THE SNAPSHOT, and it has to be. The first version
+// expired only in weightOfLocked, which fair share consults — so admission was correct while
+// Snapshot went on REPORTING the boosted weight indefinitely, and `governor status` would have
+// shown a session at weight 2 that was being admitted at weight 1. A surface disagreeing with
+// the decision it is describing is worse than either being wrong on its own, because it makes
+// the decision impossible to check.
+func (t *Table) expireBoostLocked(s Session) Session {
+	if s.BoostedUntil.IsZero() || t.opt.Now().Before(s.BoostedUntil) {
+		return s
+	}
+	s.Weight, s.BoostedUntil = 1, time.Time{}
+	t.sessions[s.ID] = s
+	return s
+}
+
+// Boost sets a session's share weight until until, and reports whether the session was known.
+//
+// It is NOT a second weighting mechanism — it writes Session.Weight, the one field fair share
+// has read since GOV-18, and adds a deadline to it. design.md section 6.1 says there must be
+// one mechanism; it does not say there may be only one trigger, and GOV-B02 (still in Backlog,
+// and possibly to be dropped) would set the same field from window focus.
+//
+// An unknown session is refused rather than invented. A weight with no session attached would
+// sit in the table forever, counting toward the global weight in every fair-share walk on
+// behalf of nothing, and there is no event that would ever remove it.
+func (t *Table) Boost(session string, weight int, until time.Time) bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	s, ok := t.sessions[session]
+	if !ok {
+		return false
+	}
+	if weight < 1 {
+		weight = 1
+	}
+	s.Weight, s.BoostedUntil = weight, until
+	t.sessions[session] = s
+	return true
 }
 
 // normalWeight is how a request's weight is read before anything compares it. A request that
@@ -444,6 +509,29 @@ func (t *Table) Acquire(r Request, limit int) (Lease, bool) {
 	// that just took a slot in a build loop still wants the next one, and clearing here would
 	// make its demand flicker in and out of view once per acquire.
 
+	return t.grantLocked(r, w), true
+}
+
+// Take grants a lease without consulting the budget at all.
+//
+// IT IS THE PAUSED PATH OF design.md SECTION 9.1 AND NOTHING ELSE SHOULD USE IT. A pause means
+// a person has said "stop capping me"; the lease is still taken so that the table, the status
+// line and the reaper go on telling the truth about what is running, and only the admission
+// test is skipped. Everything downstream of the grant — TTL, liveness, release, the weight
+// total — is identical to Acquire's, because it is the same code.
+//
+// It records no demand. Demand is what a REFUSAL reveals (section 6.1), and this path cannot
+// refuse; marking a session as demanding here would inflate its fair share for thirty seconds
+// after the pause ended, letting a pause quietly buy an advantage that outlives it.
+func (t *Table) Take(r Request) Lease {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.grantLocked(r, normalWeight(r.Weight))
+}
+
+// grantLocked mints the lease. It is the whole of the grant, shared by Acquire and Take so
+// that the paused path cannot drift from the governed one.
+func (t *Table) grantLocked(r Request, w float64) Lease {
 	now := t.opt.Now()
 	t.seq++
 	l := &Lease{
@@ -471,7 +559,7 @@ func (t *Table) Acquire(r Request, limit int) (Lease, bool) {
 	}
 	t.byID[l.ID] = l
 	t.weight += w
-	return *l, true
+	return *l
 }
 
 // ReleaseBuild returns a Build lease by the tool_use_id it was taken with.
@@ -854,7 +942,8 @@ func (t *Table) Snapshot() Snapshot {
 	s := Snapshot{}
 	per := map[string]*SessionStat{}
 	for id, sess := range t.sessions {
-		per[id] = &SessionStat{Session: sess}
+		// Expired here too, not only on the admission path: see expireBoostLocked.
+		per[id] = &SessionStat{Session: t.expireBoostLocked(sess)}
 	}
 	for _, l := range t.byID {
 		st, ok := per[l.Session]
