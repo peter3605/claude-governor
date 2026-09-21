@@ -236,6 +236,34 @@ asked once and are waiting properly.
 A parked acquire that ends in a grant is **not** counted as a denial. A session that waited
 patiently must not be shouted at on its next refusal.
 
+**A refusal must not state a conclusion its own numbers refute** (GOV-34). The rule above —
+name no fact the daemon did not send — was not enough on its own. `Machine at capacity (1/4
+build slots)` states only facts the daemon sent and is still unreadable, because the reader can
+see that one of four is not capacity and has not been given the third number that reconciles
+them: how much the refused request itself weighed. So a capacity refusal now carries `asking`,
+and the head sentence depends on what is actually true:
+
+| State | Head |
+|---|---|
+| held ≥ budget | `Machine at capacity` |
+| `cause: share` | `This session is at its fair share` |
+| held < budget | `Not enough free build slots` |
+
+```
+Not enough free build slots (1/4 build slots held, this one needs 3.8, thermal: nominal).
+This command was not run. This is a large build and the slots left free are not enough for
+it. Wait a few seconds and run exactly the same command again; do not look for a different
+way to build, and do not treat this as a build failure.
+```
+
+The instruction half is unchanged across all three heads — wait, then run the same command
+again — because the right response does not depend on which of them is true. Only the asserted
+fact changes, and a refusal that misstates that is one a reader stops believing. A budget below
+this host's ceiling additionally names the signal holding it down (`budget cut from 6 by run
+queue`), from the same controller state `governor status` and `governor doctor` read, so the
+three surfaces cannot disagree about why a machine is refusing. §6.1a is the incident that
+forced all of this.
+
 ### 4.3 Lease lifecycle
 
 There are two, because the two gated tools give the governor completely different evidence.
@@ -1220,6 +1248,75 @@ focus boost would set the same field because the window came forward. Neither is
 mechanism, and GOV-B02 is in any case still in Backlog and may be dropped — deferring the
 manual trigger to it would have meant deferring it to something that may never be built.
 
+**A session's FIRST slot is admitted over budget, and that is invariant 6 (GOV-34).** Global
+capacity used to be checked before fair share with no knowledge of the guarantee above, so a
+session holding *nothing* could be refused while another session held something — which is the
+guarantee stated backwards. `lease.fitsLocked` now admits a request that does not fit when the
+asking session holds nothing **and** the machine still has free room, bounded by two conditions
+that each do real work: `t.weight < limit` means the escape cannot fire while an escape is
+already outstanding, so at most one lease is over budget at a time and total weight never
+exceeds `limit` plus one lease; `heldLocked(session) == 0` means a session gets one such
+admission and its second request faces the full rule. Together they deliver invariant 6
+*sequentially* — every session eventually gets its first slot, in the order §6.2's FIFO decides
+— rather than seating every session at once, which on a four-slot ceiling is a promise the
+machine cannot keep. A machine with nothing free is genuinely at capacity and still refuses:
+there, waiting is what works, and the FIFO is what serves the waiter.
+
+#### 6.1a The 2026-09-21 false-deny incident (GOV-34)
+
+**Symptom.** From an unrelated session, a `PreToolUse` hook refused a `Bash` command five times
+over roughly fifteen minutes with `Machine at capacity (1/4 build slots, thermal: nominal).
+This command was not run.` One of four slots is not capacity. `governor status`, run between
+two refusals, agreed with the message and not with the decision: budget 4, in use 1, waiting 0,
+CPU 0.54, thermal nominal. The blocked session held no lease of its own. The session finished
+its work on CI evidence alone because it could not run `docker compose`, `alembic` or `pytest`
+locally at all.
+
+**Cause — none of the three that were suspected.** GOV-34 listed an over-aggressive cut, a
+lease-accounting error, and ungoverned sessions consuming invisible load. The evidence rules
+out all three and identifies a fourth:
+
+- *Not a cut printing the wrong number.* `daemon.acquire` reads one `limit` from `budgetNow`
+  and passes that same variable to both `lease.Table.Acquire` and `refuseForCapacity`. There is
+  no configured-versus-effective split on that path to get wrong; the budget in the message was
+  already the effective one.
+- *Not a small budget from a cut.* `~/.claude/governor/config.json` held `b_max: 4`, written by
+  `governor calibrate` ("probe measured 5.37 effective cores of 8"), and `daemon.ceiling` takes
+  `min(MaxSlots(8) = 6, b_max = 4)`. Four was this host's ceiling, not a throttle.
+- *Not lease accounting.* The daemon's own log has the incident intact, and the arithmetic in
+  it is correct throughout:
+
+  ```
+  23:45:34 budget park session=37045485-… slots=1.00/4 wait=20s
+  23:45:54 budget park-expired waited=20.001s
+  23:45:54 budget deny session=37045485-… reason=capacity cause=capacity slots=1.00/4 denials=1
+  ```
+
+- *The actual cause: the request's own weight, which the refusal never named.* `docker compose`
+  classifies `Heavy`; `Heavy.ExpectedPeakCores()` is 4.5; `budget.SlotsFor(4.5)` is 3.75 slots.
+  The admission rule is `t.weight + weight > limit`, so `1.00 + 3.75 = 4.75 > 4` refused —
+  correctly, by its own arithmetic. **On a four-slot ceiling a Heavy build cannot be admitted
+  beside any other lease at all, however small**, and the work-conserving escape only fired on a
+  completely *empty* table. The other session held its one slot for ten minutes, so the blocked
+  session was not waiting for a queue, it was waiting for a condition that `maxParkedWait` could
+  not reach. Every retry restarted the same twenty-second park and hit the same table.
+
+**Two defects, and they are separate.** The scheduling one is fixed by the escape above: a
+session holding nothing is admitted while the machine has room. The reporting one is that
+`Slots` and `Budget` were on the wire and `Asking` was not, so the renderer had two of the three
+numbers the arithmetic needs and printed a sentence that contradicts itself inside its own
+parentheses. A capacity refusal now names the weight the request asked for, uses a third head
+(`Not enough free build slots`) whenever held is strictly below the budget, and — when the
+budget is genuinely below this host's ceiling — names the signal cutting it, from the same
+controller state `governor status` and `governor doctor` read. §4.2's rule that a refusal must
+not state a fact the daemon did not send needed a companion: a refusal must not state a
+*conclusion* the facts it sends do not support.
+
+**Why the default budget was not raised.** Four was the calibrated ceiling for this host and the
+binding constraint was never the budget's size — it was that a single request could exceed the
+free room and had no path to progress. Raising it would have moved the same cliff to a
+different pair of numbers.
+
 ### 6.2 Wait queue
 
 FIFO across sessions. The next freed slot goes to whoever has waited longest, so a noisy
@@ -1254,6 +1351,13 @@ capacity rather than served, and retries under the deny cooloff. The exposure is
 `maxParkedWait` and by nothing else. That is acceptable only because §6.1 caps what the
 long-building session can hold in the first place: a long build occupies its own session's
 share, not the machine.
+
+**That bound did not hold for a session's first slot, and §6.1a is what it cost** (GOV-34).
+"Starvation is bounded by the length of the builds already running" is true of the table and
+false of what the session experiences: the gate refuses at `maxParkedWait` and tells the model
+not to start further builds, so a session whose request is larger than the free room retries
+into the same table until it gives up. Admitting a session's first slot over budget is what
+puts a bound back on the case the queue could not reach.
 
 A waiter that times out at the same instant as the pump grants it a lease keeps the lease
 rather than being refused beside it — the removal and the hand-over happen under one lock, so
@@ -1314,6 +1418,13 @@ per connection. Deliberately boring — this is a hot path.
 // <- refused by FAIR SHARE (§6.1): the machine had room, it belongs to another session
 {"v":1,"ok":false,"reason":"capacity","budget":6,"in_use":3,"slots":3,"cpu":0.51,
  "thermal":"nominal","source":"local","denials":1,"cause":"share"}
+// <- refused, the machine had room and this request is bigger than what is left (§6.1a).
+//    `asking` is the weight the admission rule used, and without it the message contradicts
+//    itself; `ceiling` and `cut` say why the budget is below what this host could allow, and
+//    are omitted when it is not. All three are additive — an older gate ignores them.
+{"v":1,"ok":false,"reason":"capacity","budget":4,"in_use":1,"slots":1,"asking":3.75,
+ "cpu":null,"thermal":"nominal","source":"local","denials":1,"cause":"capacity",
+ "ceiling":6,"cut":"run queue"}
 // <- refused, nested fan-out (§6.3); never preceded by a "waiting" line
 {"v":1,"ok":false,"reason":"depth","budget":6,"in_use":4,"cpu":null,
  "thermal":"nominal","source":"local"}

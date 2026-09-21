@@ -12,7 +12,9 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/peter3605/claude-governor/internal/budget"
 	"github.com/peter3605/claude-governor/internal/config"
+	"github.com/peter3605/claude-governor/internal/lease"
 	"github.com/peter3605/claude-governor/internal/transport"
 )
 
@@ -1115,5 +1117,70 @@ func TestBeingUncalibratedDoesNotMoveTheExitCode(t *testing.T) {
 	if withCode != withoutCode {
 		t.Errorf("exit %d calibrated against %d uncalibrated: the warning moved the exit code, so `install` would fail on a host that could not calibrate",
 			withCode, withoutCode)
+	}
+}
+
+// GOV-34 clause 4: doctor reports a budget below what the host could allow, and says which
+// signal is responsible.
+//
+// THE MACHINE COULD NOT ANSWER "WHY ONLY THREE" FROM ANY SURFACE IT HAD. On 2026-09-21 a
+// session spent fifteen minutes unable to run a build with the refusal text, `governor status`
+// and `governor doctor` all in front of it, and none of the three could say whether the budget
+// it kept being refused against was this host's ceiling or a cut below it. It is a warning
+// rather than a failure because a cut budget is the control loop working — see checkBudget.
+func TestDoctorNamesTheSignalCuttingTheBudget(t *testing.T) {
+	w := newWorld(t)
+	endpoint, _ := startTestDaemonConfigured(t, 4, lease.Options{}, func(d *daemon) {
+		// A controller with room to be cut, driven past its threshold once. Wired before
+		// serve starts, which is the whole reason startTestDaemonConfigured exists.
+		d.loop = &budget.Controller{Max: 6}
+		d.loop.Step(budget.Reading{RunQueue: budget.RunQueueMax * 4})
+		d.sources = []budget.Source{budget.LocalSource{Live: d.liveBudget, InUse: d.table.InUse}}
+	})
+	t.Setenv(transport.EndpointEnv, endpoint)
+	w.writeHooks(w.settings, selfBinary(t), goodHooks())
+	w.writeCalibration()
+
+	code, found, out := doctor(t)
+	got := want(t, found, "budget", "warn", out)
+	if !strings.Contains(got.detail, "run queue") {
+		t.Errorf("the finding does not name the signal responsible: %q", got.detail)
+	}
+	if !strings.Contains(got.detail, "6") {
+		t.Errorf("the finding does not say what the budget could have been: %q", got.detail)
+	}
+	// A warning is not a defect and must not fail the command, for the same reason a stray
+	// daemon does not: a red line that means "working as designed" teaches a reader to
+	// ignore red lines. Asserted as "nothing FAILED" rather than "exit 0", because this
+	// world has no session registry and no daemon that has seen a spawn, so two checks
+	// legitimately cannot verify themselves and carry the exit code to 3 on their own.
+	if code == 1 {
+		t.Errorf("exit code = 1: a cut budget was reported as a broken install\n%s", out)
+	}
+	for name, f := range found {
+		if f.state == "FAIL" {
+			t.Errorf("check %q failed on a machine whose only finding is a cut budget: %q\n%s",
+				name, f.detail, out)
+		}
+	}
+}
+
+// The other side of the same check: a machine whose budget is at its ceiling has nothing to
+// report, and must say so rather than warning about a cut that is not happening.
+func TestDoctorIsQuietWhenNothingIsCuttingTheBudget(t *testing.T) {
+	w := newWorld(t)
+	endpoint, _ := startTestDaemonConfigured(t, 6, lease.Options{}, func(d *daemon) {
+		d.loop = &budget.Controller{Max: 6}
+		d.loop.Step(budget.Reading{RunQueue: 0})
+		d.sources = []budget.Source{budget.LocalSource{Live: d.liveBudget, InUse: d.table.InUse}}
+	})
+	t.Setenv(transport.EndpointEnv, endpoint)
+	w.writeHooks(w.settings, selfBinary(t), goodHooks())
+	w.writeCalibration()
+
+	_, found, out := doctor(t)
+	got := want(t, found, "budget", "ok", out)
+	if strings.Contains(got.detail, "cut by") {
+		t.Errorf("the finding claims a cut on a machine at its ceiling: %q", got.detail)
 	}
 }

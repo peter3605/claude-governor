@@ -125,6 +125,16 @@ type statusResponse struct {
 	PinnedUntil  string `json:"pinned_until"`
 	Paused       bool   `json:"paused"`
 	PausedUntil  string `json:"paused_until"`
+	// Ceiling is the largest budget this host would allow with nothing cutting it, and Cut
+	// names the signal that is cutting it — "run queue", "thermal", or "" for neither
+	// (GOV-34). Only doctor reads them; the status line does not render them.
+	//
+	// They exist because a budget of three and a ceiling of three print the same digit as a
+	// budget of three cut down from six, and on 2026-09-21 nothing on the machine could tell
+	// a session which of the two it was looking at. Absent from an older daemon, which reads
+	// as "no ceiling reported" and is answered with a pass rather than a guess.
+	Ceiling int    `json:"ceiling"`
+	Cut     string `json:"cut"`
 }
 
 // cachedStatus is one status reply plus when it was taken.

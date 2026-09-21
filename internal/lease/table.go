@@ -272,6 +272,39 @@ func (t *Table) Refusal(r Request, limit int) string {
 //
 // It reports, second, whether it was FAIR SHARE that refused rather than capacity — the two
 // are a different message to the caller, and Refusal is what turns that into one.
+//
+// GOV-34 WIDENED THE ESCAPE FROM "EMPTY" TO "THIS SESSION HOLDS NOTHING", because an empty
+// table is not the only way a request can be refused forever. A Heavy build weighs 3.75 and
+// this machine's calibrated ceiling is 4, so it does not fit beside ANY other lease, however
+// small — and the table is not empty, so the escape above never fired. The 2026-09-21
+// incident is that exact case: one session held 1.00 for ten minutes, another session holding
+// nothing was refused five times for "capacity" at 1.00/4, and no amount of waiting inside
+// maxParkedWait could have changed the answer. Invariant 6 says every live session is
+// guaranteed one slot before any session gets a second, and that is precisely what was
+// violated: the refused session had none and the holder had one.
+//
+// THE ESCAPE NEEDS FREE HEADROOM, AND THAT IS WHAT SEPARATES IT FROM AN ORDINARY QUEUE. A
+// machine at exactly 4 of 4 really is at capacity: a session asking for its first slot there
+// is refused because there is nothing to give it, waiting genuinely works, and §6.2's FIFO
+// hands it the next release. That case must keep refusing, and `t.weight < limit` is what
+// keeps it refusing. The incident is the other case — 1.00 of 4, three slots free, refused —
+// where waiting is not what fixes it because the free space is not the binding constraint,
+// the size of the request against it is. So the rule reads: while the machine has room, a
+// session holding nothing is never turned away for lack of it.
+//
+// WHAT BOUNDS IT is the pair of conditions, and neither is redundant. `t.weight < limit`
+// means the escape may not fire while an escape is already outstanding, so at most ONE lease
+// is over budget at a time and the table's total weight never exceeds limit plus one lease.
+// `heldLocked(session) == 0` means a session gets at most one such admission and its SECOND
+// request faces the full rule, so a session cannot walk over the budget one lease at a time.
+// Together they deliver invariant 6 sequentially — every session eventually gets its first
+// slot, in the order §6.2's FIFO decides — rather than seating every session at once, which
+// on a four-slot ceiling would be a promise the machine cannot keep.
+//
+// THE EMPTY-TABLE CASE IS KEPT SEPARATE even though the wider rule subsumes its capacity
+// half, because it also skips fair share: on an empty table a session refused within
+// demandWindow still counts as contending, so shareLocked can bind against a machine with
+// nothing running at all. Deleting the branch would reintroduce the deadlock by that door.
 func (t *Table) fitsLocked(session string, weight float64, limit int) (ok, byShare bool) {
 	if len(t.byID) == 0 {
 		// Work-conserving, and it precedes fair share deliberately: an empty table means
@@ -280,6 +313,13 @@ func (t *Table) fitsLocked(session string, weight float64, limit int) (ok, bySha
 		return true, false
 	}
 	if t.weight+weight > float64(limit) {
+		if t.weight < float64(limit) && t.heldLocked(session) == 0 {
+			// The machine has room, this session holds none of it, and nothing is over
+			// budget yet: it is asking for its first slot and invariant 6 guarantees it
+			// one. Fair share is skipped for the same reason the empty-table branch skips
+			// it — a session that holds nothing cannot be over its share of anything.
+			return true, false
+		}
 		return false, false
 	}
 	if weight+t.heldLocked(session) > t.shareLocked(session, weight, limit) {
@@ -480,6 +520,15 @@ func (t *Table) Boost(session string, weight int, until time.Time) bool {
 	t.sessions[session] = s
 	return true
 }
+
+// WeightOf is how much budget a request will contend for, in slots, for a caller that needs
+// to REPORT that number rather than compare it.
+//
+// It exists because GOV-34 made a refusal name the weight the request asked for — without it
+// "1/4 build slots" is a sentence that refutes itself — and the number a refusal quotes has to
+// be the number the rule used. Re-deriving it at the call site is how a refusal ends up
+// quoting 0 for the pre-GOV-15 request shape that the table reads as a whole slot.
+func WeightOf(r Request) float64 { return normalWeight(r.Weight) }
 
 // normalWeight is how a request's weight is read before anything compares it. A request that
 // names no weight is one whole slot — the shape every gate before GOV-15 sent — and reading

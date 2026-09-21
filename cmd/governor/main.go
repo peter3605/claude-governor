@@ -141,6 +141,15 @@ func printStatus(stdout io.Writer, c cachedStatus) {
 	if v.Pinned {
 		fmt.Fprintf(stdout, "pinned yes%s\n", untilSuffix(v.PinnedUntil))
 	}
+	// WHY THE BUDGET IS THE NUMBER IT IS, when it is below what this host could allow
+	// (GOV-34). Printed here for the same reason the pin is: this is the command a person
+	// runs when their session is the one being refused, and "budget 4" on a machine
+	// calibrated for six reads exactly like a six-slot machine's "budget 6" unless something
+	// says otherwise. On 2026-09-21 nothing did, and the refusal that sent them here could
+	// not say either. Both now quote one controller (section 6.1a).
+	if c.Reply.Cut != "" && c.Reply.Ceiling > v.Budget {
+		fmt.Fprintf(stdout, "cut %s (ceiling %d)\n", c.Reply.Cut, c.Reply.Ceiling)
+	}
 	if v.Paused {
 		fmt.Fprintf(stdout, "paused yes%s\n", untilSuffix(v.PausedUntil))
 	}

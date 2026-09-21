@@ -172,6 +172,16 @@ type acquireResponse struct {
 	// same struct, and a bool of that name would make every grant fail to decode. Absent from
 	// an older daemon, which decodes as "" and prints the sentence it always printed.
 	Cause string `json:"cause"`
+	// Asking is how much budget the refused request wanted, in slots, and it is the number
+	// whose absence let the gate print "Machine at capacity (1/4 build slots)" on
+	// 2026-09-21. See refuseReply.Asking. Zero from a daemon too old to send it, and every
+	// clause that quotes it is conditional on that, for the same reason CPU is.
+	Asking float64 `json:"asking"`
+	// Ceiling is the budget this host would allow with nothing cutting it and Cut names the
+	// signal doing the cutting, or "" when nothing is. Both are what let a refusal quoting
+	// three slots on a six-slot machine say WHY it is quoting three.
+	Ceiling int    `json:"ceiling"`
+	Cut     string `json:"cut"`
 }
 
 // hookPayload is the PreToolUse payload, measured in GOV-01 and recorded in
@@ -615,34 +625,78 @@ func denyReason(resp acquireResponse, in intent) string {
 	}
 
 	var b strings.Builder
-	// WHICH SENTENCE IS TRUE DEPENDS ON WHICH RULE REFUSED (GOV-18). Since fair share landed,
-	// a session can be refused while the machine still has free slots — they belong to another
-	// session — and saying "Machine at capacity (4/6)" there is a fabrication of exactly the
-	// kind section 4.2 forbids, as well as being visibly self-contradicting to the reader.
-	// An older daemon does not send the field, which decodes as "", which is the text that
-	// binary has always printed.
-	head := "Machine at capacity"
-	if resp.Cause == "share" {
-		head = "This session is at its fair share"
+	// WHICH SENTENCE IS TRUE DEPENDS ON WHICH RULE REFUSED (GOV-18, GOV-34). Since fair share
+	// landed, a session can be refused while the machine still has free slots — they belong to
+	// another session — and saying "Machine at capacity (4/6)" there is a fabrication of
+	// exactly the kind section 4.2 forbids, as well as being visibly self-contradicting to the
+	// reader. An older daemon does not send the field, which decodes as "", which is the text
+	// that binary has always printed.
+	//
+	// GOV-34 ADDED THE THIRD HEAD, and it is the one the 2026-09-21 incident needed. A
+	// capacity refusal is not always a full machine: a Heavy build weighs 3.75 slots, so on a
+	// four-slot ceiling it is refused beside a single one-slot lease, and "Machine at capacity
+	// (1/4 build slots)" is then a sentence that contradicts itself inside its own
+	// parentheses. Held strictly below the budget means the machine is NOT at capacity and the
+	// only honest thing to say is that what is left is not enough for this particular command.
+	head, why := "Machine at capacity", refusedFull
+	switch {
+	case resp.Cause == "share":
+		head, why = "This session is at its fair share", refusedShare
+	case resp.Slots < float64(resp.Budget):
+		head, why = "Not enough free build slots", refusedTooBig
 	}
 	// formatSlots rather than %.1f so a machine holding four whole builds says "4/6" and not
 	// "4.0/6": the decimal is there to stop a machine holding only agents rounding to a
 	// reassuring zero, not to decorate the common case.
-	fmt.Fprintf(&b, "%s (%s/%d build slots", head, formatSlots(resp.Slots), resp.Budget)
+	fmt.Fprintf(&b, "%s (%s/%d build slots held", head, formatSlots(resp.Slots), resp.Budget)
+	// The number whose absence made the incident's message unreadable. Conditional like every
+	// other clause here: a daemon too old to send it sends zero, and a refusal claiming a
+	// command needs no slots would be the fabrication section 4.2 forbids.
+	if resp.Asking > 0 {
+		fmt.Fprintf(&b, ", this one needs %s", formatSlots(resp.Asking))
+	}
 	if resp.CPU != nil {
 		fmt.Fprintf(&b, ", CPU %.0f%%", *resp.CPU*100)
 	}
 	if resp.Thermal != "" && resp.Thermal != signals.Unknown {
 		fmt.Fprintf(&b, ", thermal: %s", resp.Thermal)
 	}
+	// A cut budget and a small machine produce the same number, and only this tells them
+	// apart. Both fields are required before it is printed: a ceiling with no cause, or a
+	// cause with no ceiling, would be half a fact stated as a whole one.
+	if resp.Cut != "" && resp.Ceiling > resp.Budget {
+		fmt.Fprintf(&b, ", budget cut from %d by %s", resp.Ceiling, resp.Cut)
+	}
 	b.WriteString("). ")
 	if in.kind == "build" {
-		b.WriteString(buildEscalation(resp.Denials, resp.Cause))
+		b.WriteString(buildEscalation(resp.Denials, why))
 	} else {
 		b.WriteString(escalation(resp.Denials))
 	}
 	return b.String()
 }
+
+// The three situations a capacity refusal can actually be in, which is one more than the two
+// GOV-18 left behind.
+//
+// They are a type rather than a pair of bools because the three are mutually exclusive and the
+// instruction half has to pick exactly one sentence per denial count. Two bools would make the
+// fourth combination — at its share AND too big — expressible, and nothing in the admission
+// rule can produce it: Refusal reports whichever half refused, not both.
+type refusalWhy int
+
+const (
+	// refusedFull: every slot is taken. The original case, and the only one whose sentence
+	// was ever correct before GOV-34 — it was being printed for the other two as well.
+	refusedFull refusalWhy = iota
+	// refusedShare: the machine has room and it belongs to other sessions (GOV-18).
+	refusedShare
+	// refusedTooBig: the machine has room and this command is bigger than what is left
+	// (GOV-34). A Heavy build weighs 3.75 slots, so on a four-slot ceiling it does not fit
+	// beside a single one-slot lease — the machine is a third full and the command still
+	// cannot start.
+	refusedTooBig
+)
 
 // buildEscalation is the instruction half of a capacity deny for a BUILD, and it has to say
 // something completely different from the spawn text below.
@@ -659,39 +713,53 @@ func denyReason(resp acquireResponse, in intent) string {
 // CORRECT response here and the queue is what makes it cheap: the gate parks a build for up to
 // wait_max before ever refusing it, so a refusal already means the machine stayed full for
 // twenty seconds. What escalation adds is honesty about how long that has been going on.
-// THE INSTRUCTION IS THE SAME FOR BOTH CAUSES; ONLY THE FACT DIFFERS (GOV-18). "Every slot is
-// taken" and "this session has reached its share of them" call for the identical response —
-// wait, then run the same command again — but only one of them is true at a time, and a
-// refusal that misstates why is one a reader stops believing. So the cause swaps the clause
-// that asserts something about the machine and leaves the instruction untouched.
-func buildEscalation(denials int, cause string) string {
-	share := cause == "share"
+// THE INSTRUCTION IS THE SAME FOR ALL THREE CAUSES; ONLY THE FACT DIFFERS (GOV-18, GOV-34).
+// "Every slot is taken", "this session has reached its share of them" and "what is left is too
+// small for this build" call for the identical response — wait, then run the same command
+// again — but only one of them is true at a time, and a refusal that misstates why is one a
+// reader stops believing. So the cause swaps the clause that asserts something about the
+// machine and leaves the instruction untouched. GOV-34 added the third because the first was
+// being printed for it: a session told "other builds are using every slot" against a visible
+// count of one in four learns that the gate's reasons are not worth reading.
+func buildEscalation(denials int, why refusalWhy) string {
+	pick := func(full, share, tooBig string) string {
+		switch why {
+		case refusedShare:
+			return share
+		case refusedTooBig:
+			return tooBig
+		default:
+			return full
+		}
+	}
 	switch {
 	case denials <= 1:
-		why := "Other builds on this machine are using every slot."
-		if share {
-			why = "This session is already using its fair share of the build slots, and " +
-				"other sessions are using theirs."
-		}
-		return "This command was not run. " + why + " Wait a few seconds and run exactly " +
-			"the same command again; do not look for a different way to build, and do not " +
-			"treat this as a build failure."
+		return "This command was not run. " + pick(
+			"Other builds on this machine are using every slot.",
+			"This session is already using its fair share of the build slots, and other "+
+				"sessions are using theirs.",
+			// NOT "the machine is full", which is the sentence that made the 2026-09-21
+			// refusal unbelievable: it is demonstrably not full and the reader can see the
+			// count. What is true is that this particular command is larger than the room
+			// left, and the instruction — wait, retry the same command — is unchanged.
+			"This is a large build and the slots left free are not enough for it.",
+		) + " Wait a few seconds and run exactly the same command again; do not look for a " +
+			"different way to build, and do not treat this as a build failure."
 	case denials == 2:
-		why := "The machine has been saturated for a while."
-		if share {
-			why = "This session has been at its share for a while."
-		}
-		return "This command was not run, for the 2nd time. " + why + " Wait longer before " +
-			"retrying the same command, and do not start any further builds or test runs " +
-			"in the meantime."
+		return "This command was not run, for the 2nd time. " + pick(
+			"The machine has been saturated for a while.",
+			"This session has been at its share for a while.",
+			"The slots this build needs have not come free for a while.",
+		) + " Wait longer before retrying the same command, and do not start any further " +
+			"builds or test runs in the meantime."
 	default:
-		why := "Something on this machine is holding every build slot."
-		if share {
-			why = "Other sessions have been holding their share of the build slots."
-		}
 		return fmt.Sprintf("This command was not run, for the %dth time. %s Stop starting "+
 			"builds, tell the user the machine is contended, and let them decide — do not "+
-			"keep retrying.", denials, why)
+			"keep retrying.", denials, pick(
+			"Something on this machine is holding every build slot.",
+			"Other sessions have been holding their share of the build slots.",
+			"Something on this machine has been holding the slots this build needs.",
+		))
 	}
 }
 

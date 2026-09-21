@@ -469,3 +469,39 @@ func TestStatusMarksALiveSessionThatNeverRegistered(t *testing.T) {
 		t.Errorf("marked a properly registered session as ungoverned: %q", got)
 	}
 }
+
+// GOV-34: `governor status` says why the budget is what it is, when something is holding it
+// below what this host could allow.
+//
+// This is the surface the 2026-09-21 incident report quoted — "budget 4, in use 1, waiting 0,
+// cpu 0.54, thermal nominal" — and its problem was not that any line was wrong. It was that
+// the person reading it could not tell a four-slot machine from a six-slot machine cut to
+// four, and neither could the refusal that sent them here.
+func TestStatusSaysWhatIsCuttingTheBudget(t *testing.T) {
+	cut := cachedStatus{At: time.Now(), Reply: statusResponse{
+		V: protocolVersion, Budget: 3, InUse: 1, Slots: 1, Thermal: "nominal",
+		Ceiling: 6, Cut: "run queue",
+	}}
+	var out strings.Builder
+	printStatus(&out, cut)
+	for _, want := range []string{"budget 3", "run queue", "ceiling 6"} {
+		if !strings.Contains(out.String(), want) {
+			t.Errorf("`governor status` does not report %q:\n%s", want, out.String())
+		}
+	}
+
+	// And it stays quiet when nothing is cutting anything, rather than printing a line about
+	// a ceiling the budget is already at. A status line that always says something about a
+	// cut is one nobody reads when there is a cut.
+	for _, quiet := range []statusResponse{
+		{V: protocolVersion, Budget: 6, Thermal: "nominal", Ceiling: 6, Cut: ""},
+		// A daemon too old to send either field. Not a cut; not anything.
+		{V: protocolVersion, Budget: 6, Thermal: "nominal"},
+	} {
+		var out strings.Builder
+		printStatus(&out, cachedStatus{At: time.Now(), Reply: quiet})
+		if strings.Contains(out.String(), "cut") {
+			t.Errorf("`governor status` claims a cut nobody reported:\n%s", out.String())
+		}
+	}
+}
