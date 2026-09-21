@@ -164,11 +164,45 @@ func selfBinary(t *testing.T) string {
 // fakeGovernor writes an executable that answers `version` with the three lines given.
 func fakeGovernor(t *testing.T, dir, name, binary string, protocol, schema int) string {
 	t.Helper()
+	return markedGovernor(t, dir, name, binary, protocol, schema, "")
+}
+
+// markedGovernor is fakeGovernor with a mark that changes the file's BYTES and none of its
+// numbers.
+//
+// It exists because two fakeGovernors reporting the same version are byte-identical, and the
+// case GOV-B13 is about is two builds that answer `version` identically and are not the same
+// build. Without a way to differ in content alone, the only staleness a test could stage is
+// the version-string kind — the kind that already worked.
+func markedGovernor(t *testing.T, dir, name, binary string, protocol, schema int, mark string) string {
+	t.Helper()
 	path := filepath.Join(dir, name)
 	body := fmt.Sprintf("#!/bin/sh\necho \"governor %s\"\necho \"protocol %d\"\necho \"config schema %d\"\n",
 		binary, protocol, schema)
+	if mark != "" {
+		// A comment: it changes the digest and cannot change a line of the output.
+		body += "# " + mark + "\n"
+	}
 	if err := os.WriteFile(path, []byte(body), 0o755); err != nil {
 		t.Fatalf("write fake binary: %v", err)
+	}
+	return path
+}
+
+// copyOfSelf writes a byte-identical copy of this test binary at a fresh path.
+//
+// The point is a file that is NOT the same inode as the running executable but holds exactly
+// its bytes — the "hooks run the current build, installed at its own path" case, which is
+// what a correct install looks like from doctor's side and which sameFile alone cannot see.
+func copyOfSelf(t *testing.T, dir, name string) string {
+	t.Helper()
+	body, err := os.ReadFile(selfBinary(t))
+	if err != nil {
+		t.Fatalf("read self: %v", err)
+	}
+	path := filepath.Join(dir, name)
+	if err := os.WriteFile(path, body, 0o755); err != nil {
+		t.Fatalf("write copy: %v", err)
 	}
 	return path
 }
@@ -539,8 +573,12 @@ func TestDoctorNamesAHookPointingAtAMissingBinary(t *testing.T) {
 // which is the false alarm that teaches people to ignore a diagnostic.
 func TestDoctorFindsHooksThePluginRegistered(t *testing.T) {
 	w := newWorld(t)
-	bin := fakeGovernor(t, mkdir(t, filepath.Join(w.pluginRoot, "bin")), "governor",
-		binaryVersion, protocolVersion, configSchemaVersion)
+	// A byte-copy of this build rather than a fakeGovernor, because "correctly installed" is
+	// what this world is staging and install copies the running binary verbatim. A stand-in
+	// that merely reported the right version numbers was enough while the binary check only
+	// compared numbers; GOV-B13 made it compare bytes, and a fixture that cannot pass the
+	// real check is a fixture describing an install nobody has.
+	bin := copyOfSelf(t, mkdir(t, filepath.Join(w.pluginRoot, "bin")), "governor")
 	w.writeHooks(filepath.Join(w.pluginRoot, "hooks", "hooks.json"),
 		"${CLAUDE_PLUGIN_ROOT}/bin/governor", goodHooks())
 
@@ -623,6 +661,80 @@ func TestDoctorCatchesHooksRunningADifferentBuild(t *testing.T) {
 	got := want(t, found, "binary", "FAIL", out)
 	if !strings.Contains(got.detail, "0.0.0-ancient") || !strings.Contains(got.detail, binaryVersion) {
 		t.Errorf("the finding does not name both versions: %q\n%s", got.detail, out)
+	}
+}
+
+// TestDoctorCatchesAStaleInstallThatReportsTheSameVersion is GOV-B13's acceptance criterion.
+//
+// EVERY NUMBER MATCHES IN BOTH HALVES OF THIS TEST. That is the whole point: on a pre-release
+// build `binaryVersion` is `0.0.0-dev` for every build ever made, so a check that compares
+// version strings cannot tell a current install from one four merged PRs behind — and for
+// twelve days it did not, reporting `ok binary` while the gate ran GOV-18's predecessor. A
+// test that staged staleness by giving the two binaries different versions would exercise
+// the path that already worked and would leave this one exactly as broken as it was.
+//
+// So the two halves differ in CONTENT alone, and the check has to notice that or fail.
+func TestDoctorCatchesAStaleInstallThatReportsTheSameVersion(t *testing.T) {
+	w := newWorld(t)
+	dir := mkdir(t, filepath.Join(w.home, "install"))
+
+	// Stale: a different build, answering `version` with this build's own three numbers.
+	stale := markedGovernor(t, dir, "governor", binaryVersion, protocolVersion, configSchemaVersion,
+		"built from an older commit")
+	w.writeHooks(w.settings, stale, goodHooks())
+
+	_, found, out := doctor(t)
+	got := want(t, found, "binary", "FAIL", out)
+	if !strings.Contains(got.detail, "stale") {
+		t.Errorf("the finding does not call the install stale: %q\n%s", got.detail, out)
+	}
+	if got.fix != "governor install" {
+		t.Errorf("the finding does not name the fix every other finding names: %q\n%s", got.fix, out)
+	}
+	// The version is not evidence of staleness here and the report must not imply it is.
+	if strings.Contains(got.detail, "vs") {
+		t.Errorf("the finding reports a version difference where there is none: %q", got.detail)
+	}
+
+	// Current: the same bytes this build is running, installed at its own path. Not the same
+	// inode, so sameFile cannot shortcut it — the digest is what has to clear it.
+	current := copyOfSelf(t, dir, "governor")
+	if current != stale {
+		t.Fatalf("the reinstall wrote a different path (%s vs %s); "+
+			"the second half is no longer testing the first half's install", current, stale)
+	}
+
+	// Only the binary finding is asserted on. This world has no daemon, so the report
+	// legitimately carries failures that have nothing to do with the install being current;
+	// asserting on the exit code here would tie GOV-B13's test to every other check's world.
+	_, found, out = doctor(t)
+	got = want(t, found, "binary", "ok", out)
+	if !strings.Contains(got.detail, "byte-identical") {
+		t.Errorf("the finding does not say what cleared it: %q\n%s", got.detail, out)
+	}
+	if got.fix != "" {
+		t.Errorf("a current install still names a fix: %q\n%s", got.fix, out)
+	}
+}
+
+// TestDoctorSaysWhatItCouldNotCheckWhenItIsTheInstalledBinary holds clause 3.
+//
+// Invoked through the install — the ordinary way — the binary running the check and the
+// binary the hooks run are one file, and staleness is unknowable from there. The check may
+// not imply otherwise. It stays a pass because nothing is known to be wrong and because
+// `unverified` is exit 3, which would land on every ordinary doctor run and on `governor
+// install`'s own verification; the honesty goes in the sentence instead.
+func TestDoctorSaysWhatItCouldNotCheckWhenItIsTheInstalledBinary(t *testing.T) {
+	w := newWorld(t)
+	w.writeHooks(w.settings, selfBinary(t), goodHooks())
+
+	_, found, out := doctor(t)
+	got := want(t, found, "binary", "ok", out)
+	if !strings.Contains(got.detail, "staleness unchecked") {
+		t.Errorf("the finding claims more than it checked: %q\n%s", got.detail, out)
+	}
+	if !strings.Contains(got.detail, "fresh build") {
+		t.Errorf("the finding does not say how to get the answer it could not get: %q", got.detail)
 	}
 }
 
