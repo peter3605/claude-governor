@@ -28,6 +28,7 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"sort"
@@ -50,6 +51,14 @@ type record struct {
 		WaitedMS  float64  `json:"waited_ms"`
 		CWD       string   `json:"cwd"`
 	} `json:"build"`
+	Sample *struct {
+		// ClaudeCPU is cores busy across every Claude Code session process AND its
+		// transitive descendants — the quantity tools/childcpu decomposes live, and the
+		// one clause 2 scores. Reading it here rather than in a scratch query is
+		// deliberate: the retired clause-3 grep published a wrong count precisely
+		// because the reading lived outside the tool that owns the vocabulary.
+		ClaudeCPU float64 `json:"claude_cpu"`
+	} `json:"sample"`
 }
 
 type day struct {
@@ -57,6 +66,9 @@ type day struct {
 	granted, parked, denied, failedOpen int
 	testRuns, ambiguous, notTest        int
 	sessions                            map[string]bool
+	// childCores holds one entry per awake second, so a percentile over it is a percentile
+	// over the window itself rather than over the builds in it.
+	childCores []float64
 }
 
 func (d *day) builds() int { return d.granted + d.parked + d.denied + d.failedOpen }
@@ -123,7 +135,11 @@ func main() {
 		}
 		switch r.Kind {
 		case "sample":
-			get(d).awakeSec++
+			dd := get(d)
+			dd.awakeSec++
+			if r.Sample != nil {
+				dd.childCores = append(dd.childCores, r.Sample.ClaudeCPU)
+			}
 		case "build":
 			if r.Build == nil {
 				bad++
@@ -245,7 +261,47 @@ func main() {
 		fmt.Printf("\n%d line(s) could not be read and are excluded.\n", bad)
 	}
 
+	childCoresReport(days, keys)
 	halves(days, keys)
+}
+
+// pct returns the p'th percentile of a, which it sorts in place. p is a fraction.
+func pct(a []float64, p float64) float64 {
+	if len(a) == 0 {
+		return 0
+	}
+	sort.Float64s(a)
+	i := int(math.Round(float64(len(a)-1) * p))
+	return a[i]
+}
+
+// childCoresReport prints clause 2's scored quantity per active day.
+//
+// It reports the whole upper tail rather than the peak alone because the peak is an extreme
+// order statistic, not the "distribution statistic over every sampled second" advice.md
+// reaches for when it elects to score it: one unlucky second moves the max and moves nothing
+// else. The columns are here so the choice of scored statistic is made against its own
+// measured stability rather than against the phrase.
+func childCoresReport(days map[string]*day, keys []string) {
+	var active []string
+	for _, k := range keys {
+		if days[k].builds() > 0 && len(days[k].childCores) > 0 {
+			active = append(active, k)
+		}
+	}
+	if len(active) == 0 {
+		return
+	}
+	fmt.Println()
+	fmt.Println("child cores (clause 2's scored quantity — cores busy in Claude Code and its " +
+		"descendants, one reading per awake second):")
+	fmt.Printf("  %-12s %8s %7s %7s %7s %7s %7s\n",
+		"day", "n", "p50", "p90", "p95", "p99", "max")
+	for _, k := range active {
+		c := days[k].childCores
+		fmt.Printf("  %-12s %8d %7.2f %7.2f %7.2f %7.2f %7.2f\n",
+			k, len(c), pct(c, .50), pct(c, .90), pct(c, .95), pct(c, .99), pct(c, 1))
+	}
 }
 
 func printRow(label string, d *day) {
@@ -322,6 +378,35 @@ func halves(days map[string]*day, keys []string) {
 		fmt.Println("  NOTE: one half has zero denials. Denials per hour cannot carry a " +
 			"before/after comparison on this window — there is no stable baseline to beat.")
 	}
+	peakHalves(a, b)
+}
+
+// peakHalves applies the same pre-registered noise floor to clause 2's SCORED quantity.
+//
+// Clause 2 was amended on 2026-09-20 to score the peak because denials per hour failed this
+// test. Nothing had yet run the test on the replacement, so this does. The gap between the two
+// halves is the smallest change an after-window can be believed to show.
+func peakHalves(a, b *day) {
+	if len(a.childCores) == 0 || len(b.childCores) == 0 {
+		return
+	}
+	fmt.Println("  the SCORED quantity's own noise floor (same test, applied to child cores):")
+	for _, st := range []struct {
+		name string
+		p    float64
+	}{{"p95", .95}, {"p99", .99}, {"max", 1}} {
+		x, y := pct(a.childCores, st.p), pct(b.childCores, st.p)
+		gap := math.Abs(x - y)
+		mean := (x + y) / 2
+		rel := 0.0
+		if mean > 0 {
+			rel = 100 * gap / mean
+		}
+		fmt.Printf("    %-4s %6.2f vs %6.2f cores   gap %5.2f (%5.1f%%) — an after-window "+
+			"must beat this to be readable\n", st.name, x, y, gap, rel)
+	}
+	fmt.Println("    A window whose halves differ by more than the effect being looked for " +
+		"cannot score that effect, whichever statistic is elected.")
 }
 
 func agg(days map[string]*day, keys []string) *day {
@@ -336,6 +421,7 @@ func agg(days map[string]*day, keys []string) *day {
 		t.testRuns += d.testRuns
 		t.ambiguous += d.ambiguous
 		t.notTest += d.notTest
+		t.childCores = append(t.childCores, d.childCores...)
 	}
 	return t
 }
