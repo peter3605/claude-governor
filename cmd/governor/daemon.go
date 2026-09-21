@@ -116,6 +116,22 @@ type request struct {
 	// session
 	Action string `json:"action"`
 	Weight int    `json:"weight"`
+
+	// control (design.md section 9.1, GOV-B01)
+	//
+	// THE KEYS ARE NEW ONES, AND THEY HAD TO BE. The obvious name for the pinned budget was
+	// `slots` and for its verb `action` — and this struct already carries `slots` as a FLOAT
+	// (the gate's lease weight) and `action` as the session verb, with a disjoint vocabulary.
+	// One decode struct serves every operation on this connection, so a key is only free if no
+	// other message uses it with a different type or a different meaning. Section 7 records
+	// this trap twice already, for `share` against the grant's integer and for `slots` against
+	// `weight`; a third instance would have made every `limit` decode as a lease weight of N
+	// slots, which is not an error anything would have reported.
+	Control string `json:"control"`
+	// Limit is the budget to pin, in slots, for the `limit` verb.
+	Limit int `json:"limit"`
+	// ForMS is how long the override lasts, in milliseconds. Zero takes the default.
+	ForMS int `json:"for_ms"`
 }
 
 // The response shapes of design.md section 7, one type each.
@@ -341,6 +357,23 @@ type statusReply struct {
 	// ungoverned machine on the strength of the second. Mirrors SessionsKnown, which was added
 	// for exactly this shape of mistake.
 	SpawnSurfaceKnown bool `json:"spawn_surface_known"`
+
+	// The manual overrides of design.md section 9.1 (GOV-B01). Additive, like the governance
+	// fields above: a daemon from before this story sends none of them, which reads as "no
+	// override in force" — the right answer for a daemon that has no way to have one.
+	//
+	// Pinned and Paused are sent even when false so that a reader can tell "not pinned" from
+	// a daemon too old to know; the DEADLINES are omitempty because a zero time serialises as
+	// a year-1 timestamp, and a surface rendering "pinned until 0001-01-01" would be stating a
+	// fact nobody computed.
+	Pinned bool `json:"pinned"`
+	// PinnedBudget is the budget the SOURCES computed, kept beside the pinned Budget above so
+	// a person can see the number the loop would have chosen. Without it a pin explains
+	// nothing: the status line says 2 slots and the reason it is 2 is invisible.
+	SourceBudget int    `json:"source_budget,omitempty"`
+	PinnedUntil  string `json:"pinned_until,omitempty"`
+	Paused       bool   `json:"paused"`
+	PausedUntil  string `json:"paused_until,omitempty"`
 }
 
 type sourceStat struct {
@@ -369,6 +402,9 @@ type sessionStat struct {
 	Started string `json:"started,omitempty"`
 	CWD     string `json:"cwd,omitempty"`
 	Version string `json:"version,omitempty"`
+	// BoostedUntil is when a manually raised weight reverts (GOV-B01, section 9.1). Empty
+	// when the weight is not temporary, which is every session nobody has boosted.
+	BoostedUntil string `json:"boosted_until,omitempty"`
 	// Kind is the harness's session kind. Only an interactive session can be restarted, which
 	// is the only fix an ungoverned session has.
 	Kind string `json:"kind,omitempty"`
@@ -430,6 +466,16 @@ type daemon struct {
 	machineSeen []signals.LiveSession
 	machineErr  error
 	machineHook time.Time
+
+	// overrides are the manual pins of design.md section 9.1 (GOV-B01): a pinned budget and
+	// a pause, each expiring on its own. Read on the budget path through liveBudget and
+	// reported by status; see override.go for why nothing here is persisted.
+	//
+	// A VALUE, NOT A POINTER, so that a daemon built as a struct literal — which is how every
+	// test in this package builds one — has a working override rather than a nil one. The
+	// first version was a pointer initialised only in newDaemonWithLeases and it panicked on
+	// the acquire path in eleven tests.
+	overrides override
 
 	// loop is the AIMD controller (design.md section 5.2). It is stepped only by sample(),
 	// and its budget is read through LocalSource.Live, so nothing else touches it.
@@ -815,6 +861,39 @@ func (d *daemon) liveBudget() int {
 	return d.loop.Budget()
 }
 
+// budgetNow is the budget every decision is made against: the sources reduced by min(), with a
+// manual pin (design.md section 9.1) applied on top.
+//
+// THE PIN IS APPLIED HERE RATHER THAN INSIDE LocalSource, and the reason is a seam rule. The
+// sources are the tier-two seam (section 12.1) and each is one interface with one
+// implementation; a pin is not a budget SOURCE, it is a person overruling the answer the
+// sources gave, and teaching LocalSource about it would put a local-only concept inside the
+// abstraction that exists to stop local-only concepts leaking. Applying it at the point of use
+// also means it works on a daemon with no controller wired — which is every daemon a test
+// builds, and so the difference between a pin that is tested and one that is only shipped.
+//
+// The quotas are returned unmodified on purpose. They are what the SOURCES said, and status
+// reports them separately from the budget in force: a person looking at a pinned daemon should
+// be able to see the number the loop would have chosen, or the pin explains nothing.
+//
+// A PAUSE IS NOT APPLIED HERE. Pausing means "stop capping", and the obvious implementation —
+// return a huge number — would make `governor status` report a budget no source ever computed,
+// which is the fabricated-reading failure section 4.2 and the status line both exist to
+// prevent. acquire skips the capacity test instead, and every surface reports it as a pause.
+func (d *daemon) budgetNow(who principal) (int, []budget.Quota, overrideState) {
+	limit, quotas := budget.Min(context.Background(), d.sources, who)
+	over := d.overrides.state()
+	if over.pinned() {
+		limit = over.Limit
+		if limit < budget.Floor {
+			// Invariant 4 is not negotiable by a person either. A pin of zero is a wedged
+			// machine, not a budget.
+			limit = budget.Floor
+		}
+	}
+	return limit, quotas, over
+}
+
 // serve accepts connections until ctx is cancelled, reaping leases on a ticker throughout.
 func (d *daemon) serve(ctx context.Context, ln net.Listener) {
 	var wg sync.WaitGroup
@@ -1057,6 +1136,8 @@ func (d *daemon) dispatch(req request) any {
 		return d.status(req)
 	case "advise":
 		return d.advise(req)
+	case "control":
+		return d.control(req)
 	default:
 		return ackReply{V: d.speaks, Reason: "unknown_op", InUse: d.table.InUse()}
 	}
@@ -1093,7 +1174,7 @@ func leaseRequestFor(req request) lease.Request {
 // acquire takes a tentative lease if the budget has room, and decides what to do when it
 // does not: refuse the caller outright, refuse it for capacity, or park it.
 func (d *daemon) acquire(req request) any {
-	limit, quotas := budget.Min(context.Background(), d.sources, req.Principal)
+	limit, quotas, over := d.budgetNow(req.Principal)
 	src := sourceName(quotas)
 
 	// GOV-30. Recorded for every acquire, including the ones about to be denied: the ledger's
@@ -1123,6 +1204,19 @@ func (d *daemon) acquire(req request) any {
 	//
 	// The cost is one mutex-guarded length read on the hot path, and only the CONTENDED path
 	// pays anything more: an empty queue is the uncontended case and falls straight through.
+	// PAUSED MEANS THE CAP IS OFF, NOT THAT THE BOOKS ARE (section 9.1). The lease is still
+	// taken, so `governor status` during a pause reports what is genuinely running and the
+	// reaper still collects it; only the admission test is skipped. A pause that stopped
+	// recording would leave the person who set it with no way to judge when to end it, which
+	// is the one thing they need it for.
+	//
+	// It is checked after the depth limit, not before: a nested fan-out is not short of a slot
+	// and never was, so "stop capping" has nothing to say about it.
+	if over.Paused {
+		l := d.table.Take(leaseRequestFor(req))
+		return d.granted(l, limit, src)
+	}
+
 	if d.waits.len() == 0 {
 		if l, ok := d.table.Acquire(leaseRequestFor(req), limit); ok {
 			return d.granted(l, limit, src)
@@ -1410,7 +1504,7 @@ func (d *daemon) session(req request) any {
 
 // status reports the budget and its holders, for the statusline, doctor and /governor.
 func (d *daemon) status(req request) statusReply {
-	limit, quotas := budget.Min(context.Background(), d.sources, req.Principal)
+	limit, quotas, over := d.budgetNow(req.Principal)
 	snap := d.table.Snapshot()
 
 	sources := make([]sourceStat, 0, len(quotas))
@@ -1436,6 +1530,7 @@ func (d *daemon) status(req request) statusReply {
 		byID[s.ID] = &sessionStat{
 			Session: s.ID, PID: s.PID, Weight: s.Weight,
 			Tentative: s.Tentative, Confirmed: s.Confirmed,
+			BoostedUntil: rfc3339OrEmpty(s.BoostedUntil),
 			// A session in the table's snapshot registered unless it is one of the synthetic
 			// entries Snapshot invents for a lease whose session it never saw, which carry
 			// no PID and no start time. Those are the ones worth telling apart.
@@ -1491,9 +1586,38 @@ func (d *daemon) status(req request) statusReply {
 		Sessions:          sessions,
 		SpawnSurface:      d.surface.sightings(),
 		SpawnSurfaceKnown: true,
+		Pinned:            over.pinned(),
+		Paused:            over.Paused,
+	}
+	if over.pinned() {
+		out.PinnedUntil = over.LimitUntil.UTC().Format(time.RFC3339)
+		// What the sources said, which is not what Budget now reports. sourceBudget reads the
+		// quotas rather than calling Min a second time: a second call is a second answer, and
+		// on a moving budget the two would disagree by a tick for no reason a reader could see.
+		out.SourceBudget = sourceBudget(quotas)
+	}
+	if over.Paused {
+		out.PausedUntil = over.PausedUntil.UTC().Format(time.RFC3339)
 	}
 	d.fillSignals(&out)
 	return out
+}
+
+// sourceBudget is the tightest budget the sources themselves reported, before any manual pin.
+//
+// Floor rather than zero for a daemon with no usable source, matching what budget.Min would
+// have returned, so that the two numbers a pinned status reply carries are always comparable.
+func sourceBudget(quotas []budget.Quota) int {
+	best := 0
+	for _, q := range quotas {
+		if best == 0 || q.Budget < best {
+			best = q.Budget
+		}
+	}
+	if best < budget.Floor {
+		return budget.Floor
+	}
+	return best
 }
 
 // fillSignals copies the latest reading into a status reply, or leaves every signal null.
@@ -1619,4 +1743,140 @@ func (d *daemon) ceiling(capacity float64) int {
 		return d.calibratedBMax
 	}
 	return max
+}
+
+// controlReply answers a `control` request (design.md section 9.1).
+//
+// It reports the state that RESULTED rather than acknowledging the request, because every one
+// of these commands is typed by a person who wants to know what is now true — and because two
+// of them can be no-ops. `resume` with nothing pinned and `limit` against a daemon already
+// pinned to that number both succeed, and only the resulting state tells them apart.
+type controlReply struct {
+	V  int  `json:"v"`
+	OK bool `json:"ok"`
+	// Reason is set only on a refusal, from the same closed-set discipline as the gate's.
+	Reason string `json:"reason,omitempty"`
+	// Budget is what the gate will admit against from now on.
+	Budget int `json:"budget"`
+	// SourceBudget is what the control loop would have chosen, present only while pinned, so
+	// that the reply can say what the pin is overruling rather than only what it set.
+	SourceBudget int    `json:"source_budget,omitempty"`
+	Pinned       bool   `json:"pinned"`
+	PinnedUntil  string `json:"pinned_until,omitempty"`
+	Paused       bool   `json:"paused"`
+	PausedUntil  string `json:"paused_until,omitempty"`
+	// Weight is this session's share weight after a `boost`, and Boosted says whether the
+	// boost actually landed — a boost naming a session the daemon has never seen does not.
+	Weight       int    `json:"weight,omitempty"`
+	Boosted      bool   `json:"boosted,omitempty"`
+	BoostedUntil string `json:"boosted_until,omitempty"`
+	// Released says whether `resume` actually had something to release, so the client can tell
+	// "I have released your pin" from "there was nothing set".
+	Released bool `json:"released,omitempty"`
+	InUse    int  `json:"in_use"`
+}
+
+// boostWeight is what `governor boost` sets a session's weight to.
+//
+// Two, because the story says "double this session's weight" and every session starts at 1.
+// It is deliberately not a knob: fair share is max-min over integer weights, and a surface
+// that let a person type any number would be one where the right move is always to type a
+// bigger number than the other sessions. One step, expiring, is an override; an open-ended
+// dial is a bidding war with yourself.
+const boostWeight = 2
+
+// control applies a manual override (design.md section 9.1).
+//
+// Every verb here is idempotent and every one of them answers with the resulting state. None
+// of them can fail in a way that leaves the daemon partly changed: each is a single guarded
+// write to one field, so a malformed request is refused before anything moves.
+func (d *daemon) control(req request) any {
+	for_ := time.Duration(req.ForMS) * time.Millisecond
+
+	switch req.Control {
+	case "limit":
+		if req.Limit < 1 {
+			// Refused rather than floored silently. A person who typed `limit 0` meant
+			// something, and invariant 4 says it cannot be had; answering "1 slot, as you
+			// asked" would be the surface agreeing with a request it did not honour.
+			return controlReply{V: d.speaks, Reason: "bad_limit", Budget: d.budgetOnly(req), InUse: d.table.InUse()}
+		}
+		st := d.overrides.setLimit(req.Limit, for_)
+		d.event("control limit=%d until=%s", st.Limit, st.LimitUntil.Format(time.RFC3339))
+		// Pinning can free capacity as well as remove it — pinning UP is the common case, and
+		// a session parked behind the old budget should not wait out its timeout to discover
+		// that. The pump is the same one a release calls.
+		d.pump()
+		return d.controlState(req, st)
+	case "pause":
+		st := d.overrides.setPaused(for_)
+		d.event("control paused until=%s", st.PausedUntil.Format(time.RFC3339))
+		d.pump()
+		return d.controlState(req, st)
+	case "resume":
+		had := d.overrides.release()
+		d.event("control resume released=%t", had)
+		d.pump()
+		r := d.controlState(req, d.overrides.state())
+		r.Released = had
+		return r
+	case "boost":
+		if for_ <= 0 {
+			for_ = defaultOverrideTTL
+		} else if for_ > maxOverrideTTL {
+			for_ = maxOverrideTTL
+		}
+		until := time.Now().Add(for_)
+		ok := d.table.Boost(req.Session, boostWeight, until)
+		d.event("control boost session=%s weight=%d landed=%t", req.Session, boostWeight, ok)
+		r := d.controlState(req, d.overrides.state())
+		r.Boosted = ok
+		if ok {
+			r.Weight = boostWeight
+			r.BoostedUntil = until.UTC().Format(time.RFC3339)
+		} else {
+			// Not an error — the daemon simply has no such session, which is what a boost
+			// from an unregistered session looks like and is worth saying rather than
+			// silently reporting success.
+			r.Reason = "unknown_session"
+		}
+		return r
+	default:
+		return controlReply{V: d.speaks, Reason: "unknown_control", Budget: d.budgetOnly(req), InUse: d.table.InUse()}
+	}
+}
+
+// controlState builds the successful reply for whatever is now in force.
+func (d *daemon) controlState(req request, st overrideState) controlReply {
+	limit, quotas, _ := d.budgetNow(req.Principal)
+	r := controlReply{
+		V: d.speaks, OK: true, Budget: limit, InUse: d.table.InUse(),
+		Pinned: st.pinned(), Paused: st.Paused,
+	}
+	if st.pinned() {
+		r.PinnedUntil = st.LimitUntil.UTC().Format(time.RFC3339)
+		r.SourceBudget = sourceBudget(quotas)
+	}
+	if st.Paused {
+		r.PausedUntil = st.PausedUntil.UTC().Format(time.RFC3339)
+	}
+	return r
+}
+
+// budgetOnly is the budget in force, for the refusal replies that still want to report it.
+func (d *daemon) budgetOnly(req request) int {
+	limit, _, _ := d.budgetNow(req.Principal)
+	return limit
+}
+
+// rfc3339OrEmpty renders a deadline for the wire, or "" for a zero time.
+//
+// Empty rather than the year-1 timestamp a zero time.Time formats to: a consumer that saw
+// "0001-01-01T00:00:00Z" would have to know to special-case it, and the one that forgot would
+// render a boost that expired two thousand years ago as a boost.
+func rfc3339OrEmpty(t time.Time) string {
+	if t.IsZero() {
+		return ""
+	}
+	return t.UTC().Format(time.RFC3339)
 }

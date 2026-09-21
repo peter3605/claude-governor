@@ -83,6 +83,7 @@ type paths struct {
 	manifest string // <plugin>/.claude-plugin/plugin.json
 	hooks    string // <plugin>/hooks/hooks.json
 	mcp      string // <plugin>/.mcp.json
+	command  string // <plugin>/commands/governor.md
 	binary   string // <plugin>/bin/governor
 	settings string // ~/.claude/settings.json
 	// link is a convenience symlink onto the user's PATH. It is only ever written when its
@@ -111,6 +112,7 @@ func resolvePaths() (paths, error) {
 		manifest: filepath.Join(plugin, ".claude-plugin", "plugin.json"),
 		hooks:    filepath.Join(plugin, "hooks", "hooks.json"),
 		mcp:      filepath.Join(plugin, ".mcp.json"),
+		command:  filepath.Join(plugin, "commands", commandFileName),
 		binary:   filepath.Join(plugin, "bin", installedBinaryName),
 		settings: filepath.Join(home, ".claude", "settings.json"),
 		link:     filepath.Join(home, ".local", "bin", installedBinaryName),
@@ -243,6 +245,44 @@ func pluginMCP() ([]byte, error) {
 		},
 	})
 }
+
+// commandFileName is the slash command's file, and its basename is HALF THE COMMAND'S NAME.
+//
+// Claude Code advertises a plugin command as `<manifest name>:<file basename>`, measured in
+// hook-surface.md section 22.2 — so this file being called governor.md is what makes the
+// command `/claude-governor:governor`. Renaming it renames the command, silently, for everyone
+// who has learned the old name.
+const commandFileName = "governor.md"
+
+// pluginCommand is commands/governor.md: the manual override surface of design.md section 9.1.
+//
+// IT IS A PROMPT, NOT AN ENTRY POINT. A command file is expanded into the model's context and
+// cannot itself be the implementation, so every verb it names is a real subcommand of this
+// binary and this file's job is only to run the right one. That is also what keeps the
+// overrides usable from a script and from a second terminal, which is when a person most wants
+// them.
+//
+// THREE THINGS IN IT ARE MEASURED RATHER THAN STYLISTIC, and each was wrong in the first draft
+// of design.md section 9 (hook-surface.md section 22):
+//
+//   - `$ARGUMENTS`, never `$1`. Positional substitution is off by one — `$1` is the SECOND
+//     word — and an out-of-range `$N` is left in the prompt as the literal text `$N`. A body
+//     reading `$1` as the verb and `$2` as the number gets the number and the string "$2".
+//   - The `!`-line starts at column zero. Inline, the construct is NOT executed and reaches
+//     the model as literal backticked text — which in the probe produced a model reporting the
+//     text of a command as that command's output. On the one surface whose value is that its
+//     numbers are real, that is the failure worth engineering against.
+//   - `allowed-tools` covers this binary, because without it the pre-execution is refused. The
+//     refusal is the safe shape — the model is handed an error where the output would have
+//     been, so it has nothing to invent from — but a `/governor status` that could never show
+//     a status would be a command with no reason to exist.
+//
+// The bytes are a Go string rather than an embed because the file they mirror lives at the
+// repository root, outside this package, and go:embed cannot reach up out of its own
+// directory. TestTheShippedCommandMatchesTheRepository holds the two together, in the same way
+// TestSectionNineNamesEveryStateFile holds section 9 to section 13.3: a copy nobody can check
+// is how the first drift survives.
+func pluginCommand() []byte { return []byte(commandMarkdown) }
 
 // gateHookTimeout bounds the gate hook, in seconds (design.md section 4.1).
 //
@@ -392,6 +432,7 @@ func runInstall(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "governor install: hooks: %v\n", err)
 		return 1
 	}
+	command := pluginCommand()
 	mcp, err := pluginMCP()
 	if err != nil {
 		fmt.Fprintf(stderr, "governor install: mcp: %v\n", err)
@@ -413,6 +454,7 @@ func runInstall(args []string, stdout, stderr io.Writer) int {
 		in.planFile(p.manifest, manifest)
 		in.planFile(p.hooks, hooks)
 		in.planFile(p.mcp, mcp)
+		in.planFile(p.command, command)
 		in.planBinary(self)
 		in.planSettings(settingsChanged)
 		in.planLink()
@@ -429,6 +471,10 @@ func runInstall(args []string, stdout, stderr io.Writer) int {
 		return 1
 	}
 	if err := in.writeFile(p.hooks, hooks); err != nil {
+		fmt.Fprintf(stderr, "governor install: %v\n", err)
+		return 1
+	}
+	if err := in.writeFile(p.command, command); err != nil {
 		fmt.Fprintf(stderr, "governor install: %v\n", err)
 		return 1
 	}

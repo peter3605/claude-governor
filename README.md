@@ -70,6 +70,23 @@ governor calibrate    # re-measure this machine; run it while you are working
 governor uninstall    # remove all of it
 ```
 
+**When you already know a heavy build is coming, say so** rather than waiting for the loop to
+be hurt by it and work it out. From inside a session that is `/claude-governor:governor`; from
+a terminal it is the same four verbs:
+
+```sh
+governor limit 2 for 30m   # pin the budget, whatever the loop thinks
+governor pause for 15m     # stop capping, without stopping the daemon
+governor resume            # give it back early
+governor boost             # double this session's share of a contended budget
+```
+
+**Every one of them expires, and the status line says so while it holds** — `2/2 slots -
+pinned`, or `governor: gating paused` in place of the count. That is deliberate: a manual
+override nobody can see is how a governor stops being trusted, because the machine feels wrong
+and the person who set it an hour ago has no reason to suspect themselves. Nothing here
+survives a daemon restart, and the longest any of it can be asked for is a day.
+
 **A check can say `unknown`, and that is not a failure.** It means the check could not answer
 its own question rather than that something is broken — most often the `spawn` check on a
 freshly installed machine, which confirms the hook really fires by watching a real subagent

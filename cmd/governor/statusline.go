@@ -117,6 +117,14 @@ type statusResponse struct {
 	// render it. Absent from an older daemon, which reads as "nothing confirmed".
 	SpawnSurface      []spawnSighting `json:"spawn_surface,omitempty"`
 	SpawnSurfaceKnown bool            `json:"spawn_surface_known"`
+	// The manual overrides of design.md section 9.1 (GOV-B01). Absent from an older daemon,
+	// which reads as "nothing overridden" — the right answer for a daemon with no way to hold
+	// an override.
+	Pinned       bool   `json:"pinned"`
+	SourceBudget int    `json:"source_budget"`
+	PinnedUntil  string `json:"pinned_until"`
+	Paused       bool   `json:"paused"`
+	PausedUntil  string `json:"paused_until"`
 }
 
 // cachedStatus is one status reply plus when it was taken.
@@ -243,6 +251,26 @@ type statusView struct {
 	// confirmed together. A tentative lease is a spawn in flight and counting it is right:
 	// it is a slot this session is currently consuming.
 	Mine int
+	// Pinned and Paused are the manual overrides of section 9.1, and the status line says so
+	// while either holds.
+	//
+	// SAYING SO IS THE POINT OF THE STORY, not a nicety. A pinned budget is indistinguishable
+	// from a budget the control loop chose — the same number in the same place — so a person
+	// who pinned it an hour ago and has since forgotten has no way to learn that the reason the
+	// machine feels slow is themselves. An override nobody can see is how a governor stops
+	// being trusted.
+	Pinned      bool
+	PinnedUntil time.Time
+	Paused      bool
+	PausedUntil time.Time
+	// Boosted is set when THIS session's weight has been raised by hand, and BoostedUntil is
+	// when it reverts. It is an override like the two above and it is shown for the same
+	// reason — but it is the one a person is least likely to remember setting, because unlike
+	// a pin or a pause NOTHING ABOUT THE MACHINE LOOKS DIFFERENT while it holds. It only
+	// changes who wins when two sessions contend, which is invisible from either of them.
+	Boosted      bool
+	BoostedUntil time.Time
+
 	// Ungoverned is set when THIS session's hooks are not loaded, so nothing it spawns is
 	// being capped (GOV-29).
 	//
@@ -313,6 +341,17 @@ func view(c cachedStatus, session string) statusView {
 		Waiting: c.Reply.Waiting,
 		CPU:     c.Reply.CPU,
 		Thermal: c.Reply.Thermal,
+		Pinned:  c.Reply.Pinned,
+		Paused:  c.Reply.Paused,
+	}
+	// Parsed rather than carried as a string so the renderer works in durations. An
+	// unparseable stamp leaves the zero time, and the clause that would have named it is
+	// simply not printed — the same rule every other clause on this line follows.
+	if t, err := time.Parse(time.RFC3339, c.Reply.PinnedUntil); err == nil {
+		v.PinnedUntil = t
+	}
+	if t, err := time.Parse(time.RFC3339, c.Reply.PausedUntil); err == nil {
+		v.PausedUntil = t
 	}
 	if session == "" {
 		return v
@@ -322,6 +361,9 @@ func view(c cachedStatus, session string) statusView {
 			continue
 		}
 		v.Mine = s.Tentative + s.Confirmed
+		if t, err := time.Parse(time.RFC3339, s.BoostedUntil); err == nil {
+			v.Boosted, v.BoostedUntil = true, t
+		}
 		// Only this session's own verdict is rendered. The line has room for one machine and
 		// one session, and a person reading it is asking about the window in front of them.
 		// Whether some other session is ungoverned is doctor's question to answer.
@@ -355,6 +397,15 @@ func render(v statusView, width int) string {
 		// an instruction. The daemon-down line above is worded the same way for the same
 		// reason — both mean "nothing is capping this", and both name what to do about it.
 		line, _ := fit([]string{"governor: ungoverned", "restart to enable"}, width)
+		return line
+	}
+
+	if v.Paused {
+		// Said INSTEAD of the slot count, like the ungoverned line above and for the same
+		// reason. While gating is paused the count is still true and completely misleading:
+		// it reads "2/4 slots" on a machine that will admit a fifth, a sixth and a hundredth,
+		// so the number is the thing that would be misread and the number is what goes.
+		line, _ := fit([]string{"governor: gating paused" + leftClause(v.PausedUntil)}, width)
 		return line
 	}
 
@@ -404,6 +455,21 @@ func clauses(v statusView, mine bool) []string {
 		slots += fmt.Sprintf(" (%d yours)", v.Mine)
 	}
 	out = append(out, slots)
+	if v.Boosted {
+		// Beside the pin, and for a stronger version of the same reason. A boosted session
+		// looks exactly like an ordinary one from the outside, so this clause is the only
+		// place it is ever visible — and a boost quietly outbidding every other session on
+		// the machine is the override least likely to be remembered.
+		out = append(out, "boosted"+leftClause(v.BoostedUntil))
+	}
+	if v.Pinned {
+		// SECOND, not last, and never dropped before the load signals. A pinned budget is the
+		// explanation for the slot count immediately to its left, and the clauses are ordered
+		// by how much a reader needs them — cpu and thermal are context for the number, this
+		// is the reason the number is what it is. On a narrow terminal the context should go
+		// first and the reason should stay.
+		out = append(out, "pinned"+leftClause(v.PinnedUntil))
+	}
 	if v.Waiting > 0 {
 		// Only when non-zero, and it is here because a full budget and a full budget with a
 		// queue behind it are different situations that read identically without it. It is
@@ -442,6 +508,39 @@ func thermalWord(t signals.Thermal) string {
 		return ""
 	default:
 		return string(t)
+	}
+}
+
+// leftClause renders " 42m left", or nothing when the deadline is absent or already passed.
+//
+// HOW LONG IS LEFT, NOT WHEN IT ENDS. A wall-clock time makes the reader do arithmetic against
+// a clock that may not be on screen, and the question a person glancing at this line is asking
+// is not "when does it end" but "is this still a thing". A remaining duration answers that
+// without being read carefully.
+//
+// Nothing at all when the stamp is missing, for the rule this whole line follows: a clause
+// naming a fact the daemon did not send is a fabrication, and on the surface that exists to be
+// trusted at a glance a made-up deadline is worse than no deadline.
+func leftClause(until time.Time) string {
+	if until.IsZero() {
+		return ""
+	}
+	left := time.Until(until)
+	if left <= 0 {
+		return ""
+	}
+	return " " + compactDuration(left)
+}
+
+// compactDuration renders a remaining time in one short token, for a line with no room.
+func compactDuration(d time.Duration) string {
+	switch {
+	case d >= time.Hour:
+		return fmt.Sprintf("%dh%dm left", int(d.Hours()), int(d.Minutes())%60)
+	case d >= time.Minute:
+		return fmt.Sprintf("%dm left", int(d.Minutes()))
+	default:
+		return fmt.Sprintf("%ds left", int(d.Seconds()))
 	}
 }
 
