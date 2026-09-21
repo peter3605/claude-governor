@@ -1459,6 +1459,21 @@ func (d *diagnosis) checkProtocol() {
 // upgrade there is nothing that forces them to be the same build. This asks the hooked
 // binary what it is, by running it — the one subprocess in this file, bounded, and only ever
 // a path that this file has already established is a governor binary.
+//
+// THE VERSION NUMBERS ARE NOT ENOUGH, AND GOV-B13 IS WHAT THAT COST. Every development build
+// calls itself `0.0.0-dev`, so two different builds compare equal on all three numbers and
+// this check reported `ok` for twelve days while the hooks ran a binary four merged PRs
+// behind main. section 13.4 had predicted it in as many words. The bytes are therefore
+// compared as well as the numbers, by the same digest `governor install` uses to decide
+// whether it has anything to copy — which makes the two agree by construction: if install
+// would replace the binary, doctor says the install is stale, and if it would not, doctor
+// says it is current. Nothing here writes; it is the same predicate read from the other end.
+//
+// ITS BLIND SPOT IS INHERENT AND IS NAMED IN THE REPORT. Any check of this shape compares the
+// binary running the check against the binary the hooks run, so when doctor IS the installed
+// binary the two are one file and there is nothing to compare — which is the ordinary way
+// doctor is invoked. That case says so in its own detail line rather than claiming more than
+// it checked. See section 13.4.
 func (d *diagnosis) checkBinary() {
 	// Only the binaries behind the six hooks of section 4.1. A governor command wired to
 	// some other event by hand is the user's business and not evidence about the gate's
@@ -1490,8 +1505,36 @@ func (d *diagnosis) checkBinary() {
 			self = abs
 		}
 	}
+	// One file, so there is no second build to compare against. Saying only "the hooks run
+	// this binary" would be true and would also be the sentence that hid GOV-B13, so the
+	// detail names what this invocation could not look at. It stays a pass: nothing is known
+	// to be wrong, and spending `unverified` here would put exit 3 on every ordinary run of
+	// doctor — the "red line in front of every user" cost that state's own comment exists to
+	// avoid. section 13.4 carries the same limit for a reader who looks there instead.
 	if sameFile(bin, self) {
-		d.add("binary", pass, fmt.Sprintf("the hooks run this binary (%s %s)", short(bin), binaryVersion), "")
+		d.add("binary", pass,
+			fmt.Sprintf("the hooks run this binary (%s %s) — staleness unchecked, "+
+				"run doctor from a fresh build to compare", short(bin), binaryVersion), "")
+		return
+	}
+
+	// Identical bytes settle it before any subprocess does. Two files holding the same bytes
+	// are the same build whatever they call themselves, so there is nothing to ask and the
+	// `version` exec is skipped — the cheap, certain answer ahead of the expensive, parsed one.
+	same, err := sameContent(bin, self)
+	if err != nil {
+		// Could not read one of them, so the comparison did not happen. GOV-30's state is the
+		// honest report: not "I looked and it is fine", not "I looked and it is stale" — "I
+		// could not look". Passing here is how a check that cannot verify starts lying.
+		d.add("binary", unverified,
+			fmt.Sprintf("cannot compare %s with this build (%v)", short(bin), err),
+			"governor install")
+		return
+	}
+	if same {
+		d.add("binary", pass,
+			fmt.Sprintf("the hooks run %s, byte-identical to this build (%s)",
+				short(bin), binaryVersion), "")
 		return
 	}
 
@@ -1519,8 +1562,14 @@ func (d *diagnosis) checkBinary() {
 			"governor install")
 		return
 	}
-	d.add("binary", pass,
-		fmt.Sprintf("the hooks run %s, same versions as this build (%s)", short(bin), v.binary), "")
+	// Every number matches and the bytes do not: a different build wearing the same version.
+	// This is the GOV-B13 case exactly, and it is the one the old check called `ok`. It is a
+	// failure rather than a warning because the install is genuinely not what the repo says
+	// it is, and the fix is the ordinary one every other finding names.
+	d.add("binary", fail,
+		fmt.Sprintf("the hooks run %s, a DIFFERENT BUILD reporting the same version (%s) — "+
+			"the install is stale", short(bin), v.binary),
+		"governor install")
 }
 
 // hookedVersions is what `governor version` reports.

@@ -1998,8 +1998,12 @@ being asked of them is to run a hook on every subagent spawn.
 GOV-20 shipped `doctor`, and it reports eleven findings rather than the six checks this table
 lists — `binary`, `protocol` and `config` are the three halves of "versions agree", split
 because they have three different fixes and a line carrying three fixes is a line nobody acts
-on; `strays` is GOV-B11's, below. Five details are worth stating because they are decisions
+on; `strays` is GOV-B11's, below. Six details are worth stating because they are decisions
 rather than implementation:
+
+- **`binary` compares bytes, not just version numbers**, because on a development build the
+  numbers are the same for every build ever made. GOV-B13; §13.4 has the reasoning, what the
+  omission cost, and the one case the check cannot answer.
 
 - **A finding can be `skip`.** With the daemon down there is no protocol version to compare
   and no lease table to read, and reporting those as further *failures* would print four
@@ -2172,6 +2176,12 @@ it added" and "removes things it did not":
   `stateFiles`.
 - **`samples.jsonl` survives a plain uninstall**, per the Phase 0 table below. It is the
   measurement the setpoint is derived from and it is not reconstructable.
+- **GOV-B13's staleness check adds no row.** `doctor` now digests
+  `~/.claude/skills/claude-governor/bin/governor` and the binary running the check, and
+  writes neither — no cache, no stamp, no recorded digest. The row above is unchanged and
+  uninstall has nothing further to remove. It is stated rather than left silent because this
+  table is what makes uninstall verifiable: "a check was added and this list did not change"
+  is a fact a reader has to be able to confirm without re-reading the check.
 - **The `statusLine` value is restored, not deleted.** There is only one status line, so
   install *replaces* whatever was there; uninstall's job is to undo a replacement, and the
   backup is the only record of the previous value. When install found no settings file at all
@@ -2362,6 +2372,38 @@ with `-ldflags -X main.binaryVersion=<tag>`, which is why `binaryVersion` is a v
 compares the version the hooks run against the version running the check, and two different
 builds that both call themselves `0.0.0-dev` compare equal — so an upgrade that left stale
 hooks behind would pass the one check that exists to catch it.
+
+**That happened, and the check now compares the bytes as well as the numbers.** The paragraph
+above stood here as a hypothetical and was not one: on 2026-09-20 the installed hook binary
+was four merged PRs behind main — GOV-33, GOV-18, GOV-26, GOV-B01 — and `doctor` reported
+`ok binary — the hooks run this binary (0.0.0-dev)` throughout, twelve of thirteen checks
+passing. GOV-18 changes max-min fair build slots and the queue's back door, which is park and
+deny behaviour, which was the very metric the measurement window about to open would score.
+A baseline taken on that binary against an after-window on a newer one would have differed by
+GOV-18 as well as by the thing under test, with no way to separate them afterwards.
+
+So `checkBinary` digests both files (GOV-B13). The comparison is deliberately the **same
+predicate `install` uses to decide whether it has anything to copy**, read from the other end:
+if `install` would replace the binary, `doctor` says the install is stale, and if it would
+not, `doctor` says it is current. They cannot drift apart, because there is one rule. Identical
+bytes also settle the question before the `version` subprocess runs — two files holding the
+same bytes are the same build whatever they call themselves, so there is nothing to ask.
+
+**The check cannot see staleness when it IS the installed binary, and says so.** Any check of
+this shape compares the binary running the check against the binary the hooks run; invoked
+through the install — the ordinary way — those are one file and there is no second build to
+compare against. That case reports `ok` with `staleness unchecked` in its own detail line and
+names the fresh build as how to get the answer. It stays a pass rather than `unknown` because
+nothing is known to be wrong and `unknown` is exit `3`, which would land on every ordinary
+`doctor` run and on `install`'s own verification — the "red line in front of every user" cost
+that state was careful to avoid when GOV-30 introduced it. **A check whose blind spot is
+undocumented is how the hole above survived being written down, so it is documented in both
+places a reader might look: here, and in the report itself.**
+
+Release builds were never affected, which is why this was a chore and not a launch blocker —
+a published version carries a real tag and the version comparison alone is enough. The broken
+case was exclusively the dogfooding path, which is also the path every finding in this
+project's backlog is produced on.
 
 Every protocol message carries `"v"`. A daemon that does not support a gate's version replies
 `unsupported_version`, and the gate treats that reply exactly like an unreachable daemon: it
