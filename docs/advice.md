@@ -149,6 +149,11 @@ Unchanged, and the source of clause 2's peak. `docs/phase-0-findings.md` §8 has
   unwrapping never fires and `npx jest` and `npx some-local-bin` record identically as `npx`.
   That is 14 of this window's 190 records. Fixing it would move the classifier's measured gated
   share and error rates, so it belongs to a story of its own, not to this window.
+- **A day is the finest boundary the report can express, and it is a UTC day.**
+  `tools/buildstats` buckets on `r.TS[:10]`. Anything that changes mid-day — a reinstall, a
+  recalibration, a budget change — cannot be excluded by `--since`/`--until`, only by splitting
+  the log by hand. The 2026-09-21 reinstall landed at `03:26:26Z` and did exactly this. A window
+  must therefore begin on a UTC day boundary, or its first row silently mixes two configurations.
 - **Wall-clock time is not the denominator.** The sampler writes one record per second
   unconditionally, so a period's sample count *is* the seconds the machine was awake in it. On a
   laptop that is shut most of the day the two differ by an order of magnitude, and reporting per
@@ -244,13 +249,13 @@ version (design.md §10.4). It resolves itself with ordinary use.
    `ok sessions  6 of 6 live session(s) registered with the daemon`, 2026-09-20.
 2. ~~**Let a few days of ordinary use accumulate**, then re-check the rate from
    `samples.jsonl`~~ — **DONE 2026-09-20, and the rate is real.** See the next section.
-3. **Reinstall from current `main` first.** Added by the re-check. The installed binary is from
-   `455df4a` and is four merged PRs behind, one of which is GOV-18 — max-min fair build slots
-   and the queue's back door, i.e. *park and deny behaviour*, which is clause 2's metric.
-   **GOV-B13** exists so that the next stale install is caught by `doctor` rather than by a
-   window: today nothing reports it, because every dev build calls itself `0.0.0-dev`.
+3. ~~**Reinstall from current `main` first.**~~ **DONE 2026-09-20T23:26 local /
+   2026-09-21T03:26:26Z.** Built from `accf4a6` and installed; GOV-B13's new `doctor` check
+   confirms the hooks run a binary byte-identical to that build. **This instant is now a seam
+   in the series** — see the next section.
 4. **Give clause 2 a metric with a stable baseline**, or accept the peak as the scored quantity.
    The halves test says denials per hour cannot carry the comparison on this machine.
+   **Re-opened 2026-09-21: the peak fails the same test.** See below.
 5. **Only then** open the baseline week, and record its start date in this file.
 
 If the rate does not make a meaningful denominator, **say so and do not start the week.** An empty
@@ -331,6 +336,79 @@ between two adjacent active days, and no amount of waiting makes a count of elev
 The peak is a distribution statistic over every sampled second and is the quantity with a real
 chance of carrying a comparison. The recommendation, recorded here before the window rather than
 after it, is that **parks and denials are reported as descriptive and the peak is what is scored**.
+
+---
+
+## The pre-window re-check, 2026-09-21
+
+The reinstall cleared item 3. Checking what that left produced three findings, two of which move
+the window's start date and one of which re-opens item 4.
+
+### The advice has not shipped, so the series to date is all baseline
+
+Recorded because it is the window's provenance and it is cheap to get wrong later. **Clause 1 is
+not built.** There is no `SKILL.md` anywhere in the repo, and the only thing the `SessionStart`
+hook emits is `onboard.go`'s first-run notice, which is deliberately a `systemMessage` and not
+`hookSpecificOutput.additionalContext` — `onboard_test.go` asserts the absence. No standing
+instruction has ever been injected into any session's context. Every build in `samples.jsonl` is
+therefore a *before* observation, and the baseline is still available to be opened.
+
+### The instrument cannot express the window's boundary
+
+`tools/buildstats` buckets by `r.TS[:10]` — a **UTC day**. The binary changed at
+`2026-09-21T03:26:26Z`, which is *inside* UTC day 09-21, so that row conflates two gates and two
+budgets. Split at the boundary, pinned to a `15:49Z` cutoff so that this session's own suite run
+is excluded:
+
+| slice | awake h | builds | b/h | granted | parked | denied | f-open |
+|---|---|---|---|---|---|---|---|
+| 09-21 before `03:26:26Z` — old binary, b_max 2 | 1.97 | 53 | 26.9 | 49 | 4 | 0 | 0 |
+| 09-21 after `03:26:26Z` — **new binary, b_max 4** | 7.36 | 110 | 14.9 | 101 | 1 | 8 | 0 |
+
+The rate on the new binary is real — 14.9 builds and 1.09 denials per awake hour, `failed-open`
+still 0 — so nothing here argues against opening a window. What it argues is that **the baseline
+must start at UTC 2026-09-22**, the first day wholly on one binary and the first that `--since`
+can name. Clause 2(c) requires one gate binary across a window and the tool cannot express a
+finer boundary than a day, so the ~7 awake hours already collected on the new binary are spent
+rather than banked.
+
+### The peak fails the same halves test that retired denials — and it had never been run
+
+Clause 2 was amended on 2026-09-20 to score the peak *because* denials per hour failed the
+pre-registered noise floor. **The replacement was never put through that test.** It is now, and
+`buildstats` runs it from here on. On the two active days that share one binary and one budget:
+
+| statistic | 2026-09-17 | 2026-09-20 | gap | relative |
+|---|---|---|---|---|
+| p95 | 2.40 | 3.32 | 0.92 | 32.1% |
+| p99 | 3.47 | 4.03 | 0.56 | **14.9%** |
+| **max — the elected statistic** | 4.35 | 6.06 | **1.72** | **33.0%** |
+
+**The max carries a ~33% noise floor.** For an after-window to be readable, a standing
+instruction would have to cut peak child cores by more than 1.7 cores on an 8-core machine. That
+is not a plausible effect size for a sentence of advice, which means clause 2 as amended is
+close to unscoreable for the same reason the metric it replaced was.
+
+The cause is that **the max is an extreme order statistic, not the "distribution statistic over
+every sampled second"** this document reached for when it elected the peak. One unlucky second
+moves the max and moves nothing else. `p99` is the statistic that phrase actually describes: it
+is computed over the same 17,528 and 9,185 readings and is **more than twice as stable**.
+
+**Recommendation, recorded before the window rather than after it: score `p99` child cores, and
+report `p95` and `max` descriptively alongside it.** This is a refinement of clause 2(b) in the
+direction 2(b) was already arguing, not a retreat from it — the peak stays in the report, it
+just stops being the thing the story is judged on. Clause 2's metric is Peter's call and this is
+evidence for it, not a decision taken.
+
+### Two smaller things, neither blocking
+
+- **`doctor` reads `sessions 4 of 7`**, up from `0 of 7` at the reinstall — the ledger is
+  refilling by natural turnover. The three stale entries are live sessions that registered with
+  the replaced daemon; their hooks point at the same path and so still gate and still record, so
+  this is a bookkeeping gap and not a hole in the data. It clears as those sessions restart.
+- **`governor status` reports `budget 1` against `b_max 4`.** That is the AIMD loop floored under
+  a `loadavg1` of 87, not a configuration problem: clause 2 fixes the *ceiling* across both
+  windows, and the live budget is supposed to move. Noted so a later reader does not chase it.
 
 ---
 
