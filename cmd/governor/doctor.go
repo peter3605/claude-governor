@@ -223,6 +223,7 @@ func (d *diagnosis) run() {
 	d.checkBinary()
 	d.checkConfig()
 	d.checkCalibration()
+	d.checkBudget()
 	d.checkSessions()
 	d.checkLeases()
 	d.checkStrayDaemons()
@@ -1741,6 +1742,84 @@ func (d *diagnosis) checkLeases() {
 		fmt.Sprintf("%d of %d leases cannot be reclaimed by their owner: %s",
 			ownerless+dead, held, strings.Join(names, ", ")),
 		fix)
+}
+
+// ---------------------------------------------------------------------------
+// budget
+// ---------------------------------------------------------------------------
+
+// checkBudget reports a budget that is below what this host could allow, and names what is
+// holding it down (GOV-34 clause 4).
+//
+// THE QUESTION IT ANSWERS IS "WHY IS THIS MACHINE ONLY ALLOWING THREE", and before this story
+// nothing could answer it. The budget on the wire has always been the EFFECTIVE one — acquire
+// passes one `limit` to the admission test and to the refusal, so those two cannot disagree —
+// but a reader seeing "3" had no way to tell a machine calibrated for three from a six-slot
+// machine cut to three by the run queue. On 2026-09-21 a session spent fifteen minutes unable
+// to run a build and had `governor status`, the refusal text and doctor all available, and not
+// one of the three could tell it why.
+//
+// IT IS A WARNING, NOT A FAILURE, and the distinction is the same one checkStrayDaemons drew.
+// A cut budget is the governor WORKING: the run queue was high, the loop halved the budget,
+// and it will climb back. Nothing is broken and no install is defective, so failing would be
+// crying wolf at the control loop doing its job — and a red line that means "working as
+// designed" teaches a reader that red lines mean nothing. What it is instead is the one fact
+// that makes an otherwise inexplicable refusal explicable, which is worth a line.
+//
+// A PIN IS REPORTED SEPARATELY FROM A CUT because they are not the same event and do not have
+// the same fix. A cut is the machine's own answer and resolves itself; a pin is a person
+// overruling it (design.md section 9.1) and resolves when that person says so, or when it
+// expires. Reading a pin as "something is cutting the budget" would send someone hunting a
+// load spike that is not there.
+func (d *diagnosis) checkBudget() {
+	if !d.up {
+		d.add("budget", skip, "no daemon to read the budget from (see daemon above)", "")
+		return
+	}
+	r := d.reply
+
+	switch {
+	case r.Pinned:
+		detail := fmt.Sprintf("%d slots, pinned by hand", r.Budget)
+		if r.SourceBudget > 0 {
+			detail = fmt.Sprintf("%d slots, pinned by hand over the %d the control loop chose",
+				r.Budget, r.SourceBudget)
+		}
+		if r.PinnedUntil != "" {
+			detail += " until " + r.PinnedUntil
+		}
+		d.add("budget", warn, detail,
+			"let it expire, or lift it now: claude-governor:governor resume")
+
+	case r.Cut != "" && r.Ceiling > r.Budget:
+		// The case the clause is about. Name the number, name the signal — the same
+		// discipline design.md section 4.2 puts on a refusal, for the same reason.
+		d.add("budget", warn,
+			fmt.Sprintf("%d of a possible %d slots: the budget is cut by %s",
+				r.Budget, r.Ceiling, r.Cut),
+			"nothing to fix — it climbs back as the machine quietens; to override it now: "+
+				"claude-governor:governor limit N")
+
+	case r.Ceiling > r.Budget:
+		// Below the ceiling with nothing claiming responsibility. The controller sets its cut
+		// and its budget under one lock, so this should be unreachable; reporting it as a
+		// definite state rather than passing over it is what would surface the day it is not.
+		d.add("budget", warn,
+			fmt.Sprintf("%d of a possible %d slots, and the daemon reports no signal cutting it",
+				r.Budget, r.Ceiling),
+			"restart the daemon so the control loop re-reads the host: kill $(cat "+
+				short(d.pidPath())+") && governor install")
+
+	case r.Ceiling > 0:
+		d.add("budget", pass,
+			fmt.Sprintf("%d slots, the most this host allows, with nothing cutting it", r.Budget), "")
+
+	default:
+		// A daemon with no control loop — which is every daemon a test builds, and a daemon
+		// that has not yet taken its first sample. Its budget is fixed, so the question this
+		// check asks has a definite answer and it is "no". That is a pass, not a shrug.
+		d.add("budget", pass, fmt.Sprintf("%d slots, fixed", r.Budget), "")
+	}
 }
 
 // pidPath is where the daemon serving this diagnosis's endpoint keeps its pid.

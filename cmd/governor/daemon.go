@@ -198,6 +198,30 @@ type refuseReply struct {
 	// and the gate fail open on all traffic, which is the silent ungoverning this project
 	// exists to avoid. A name is only free if nothing else on the wire already uses it.
 	Cause string `json:"cause,omitempty"`
+	// Asking is how much budget the refused request wanted, in slots (GOV-34).
+	//
+	// WITHOUT IT THE REFUSAL REFUTES ITSELF. "Machine at capacity (1/4 build slots)" was a
+	// real message on 2026-09-21 and one of four slots is not capacity — the missing number
+	// is the 3.75 the request itself weighed, which is what turned three free slots into no
+	// room. Slots says what is held and Budget says what is allowed; neither says how big
+	// the thing being refused is, and a reader given two of the three cannot check the
+	// arithmetic or tell a contended machine from an oversized command.
+	//
+	// It is the weight the admission rule USED, via lease.WeightOf, not the one on the wire:
+	// a request that names no weight contends for a whole slot, and a refusal quoting the
+	// literal 0 would be describing a lease that cannot exist.
+	Asking float64 `json:"asking,omitempty"`
+	// Ceiling is the largest budget this host would allow if nothing were cutting it, and
+	// Cut names the signal that IS cutting it, or is empty when nothing is.
+	//
+	// THE BUDGET ON THE WIRE HAS ALWAYS BEEN THE EFFECTIVE ONE — acquire passes one `limit`
+	// to the admission test and to the refusal, so they cannot disagree — and these two do
+	// not change that. What they add is the thing a reader could not previously recover: on
+	// a machine calibrated for six slots, a refusal quoting three looks exactly like a
+	// refusal on a machine that only ever had three. Additive, and the protocol version is
+	// NOT bumped: an older gate ignores them and prints the sentence it always printed.
+	Ceiling int    `json:"ceiling,omitempty"`
+	Cut     string `json:"cut,omitempty"`
 }
 
 // waitingReply is the interim answer to an acquire the daemon has decided to park
@@ -374,6 +398,14 @@ type statusReply struct {
 	PinnedUntil  string `json:"pinned_until,omitempty"`
 	Paused       bool   `json:"paused"`
 	PausedUntil  string `json:"paused_until,omitempty"`
+	// Ceiling and Cut are refuseReply's fields of the same name, on the surface a person
+	// actually reads (GOV-34 clause 2). A denial and `governor status` disagreeing about why
+	// the machine is refusing is what made the 2026-09-21 incident unreadable from either
+	// end, so both now quote the SAME controller state rather than each deriving its own.
+	// Additive; a daemon from before this story sends neither, which reads as "no cut", and
+	// that is the right answer for a daemon with no way to have one.
+	Ceiling int    `json:"ceiling,omitempty"`
+	Cut     string `json:"cut,omitempty"`
 }
 
 type sourceStat struct {
@@ -859,6 +891,21 @@ func (d *daemon) liveBudget() int {
 		return budget.Floor
 	}
 	return d.loop.Budget()
+}
+
+// cutNow is the signal holding the budget below this host's ceiling, and the ceiling itself.
+//
+// Read under the same lock as liveBudget and from the same controller, because the whole
+// point of GOV-34 clause 2 is that the refusal text and `governor status` cannot disagree.
+// A daemon with no controller — which is every daemon a test builds — is not cutting
+// anything, and says so rather than inventing a ceiling it never computed.
+func (d *daemon) cutNow() (ceiling int, cut string) {
+	d.signalsMu.Lock()
+	defer d.signalsMu.Unlock()
+	if d.loop == nil {
+		return 0, ""
+	}
+	return d.loop.Max, d.loop.Cut()
 }
 
 // budgetNow is the budget every decision is made against: the sources reduced by min(), with a
@@ -1349,12 +1396,15 @@ func (d *daemon) granted(l lease.Lease, limit int, src string) grantReply {
 // ends in a grant must not count as a denial, or a session that waited patiently would be
 // shouted at on its next refusal.
 func (d *daemon) refuseForCapacity(req request, limit int, src string) refuseReply {
+	ceiling, cut := d.cutNow()
 	r := refuseReply{
 		V: d.speaks, Reason: "capacity",
 		Budget: limit, InUse: d.table.InUse(), Slots: d.table.Slots(), Source: src,
 		CPU: nil, Thermal: d.thermal(),
 		Denials: d.denials.record(req.Session),
 		Cause:   d.table.Refusal(leaseRequestFor(req), limit),
+		Asking:  lease.WeightOf(leaseRequestFor(req)),
+		Ceiling: ceiling, Cut: cut,
 	}
 	// Logged here rather than at each call site so that a refusal added later cannot be one
 	// the log does not know about. This is the event that costs the model something, and it
@@ -1589,6 +1639,7 @@ func (d *daemon) status(req request) statusReply {
 		Pinned:            over.pinned(),
 		Paused:            over.Paused,
 	}
+	out.Ceiling, out.Cut = d.cutNow()
 	if over.pinned() {
 		out.PinnedUntil = over.LimitUntil.UTC().Format(time.RFC3339)
 		// What the sources said, which is not what Budget now reports. sourceBudget reads the

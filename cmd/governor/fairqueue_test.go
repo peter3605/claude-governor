@@ -33,7 +33,17 @@ func TestAFreshAcquireDoesNotJumpTheQueue(t *testing.T) {
 		t.Fatal("could not seed the table")
 	}
 
-	// A big waiter queues and cannot be satisfied: 3.5 held, 3.75 wanted, budget 4.
+	// The head waiter already holds something of its own. That is what makes it a head that
+	// CANNOT be satisfied since GOV-34: a session holding nothing is admitted over budget
+	// rather than queued (invariant 6, internal/lease.fitsLocked), so a waiter that held
+	// nothing would be granted here and this test would have no queue to reason about. An
+	// agent lease is the smallest thing that can hold the escape shut, which keeps the
+	// arithmetic below almost unchanged.
+	if _, ok := d.table.Acquire(lease.Request{Session: "big", Kind: lease.Agent, Weight: 0.08, ToolUseID: "big-0"}, 4); !ok {
+		t.Fatal("the head waiter could not take the lease that makes it a contender")
+	}
+
+	// A big waiter queues and cannot be satisfied: 3.58 held, 3.75 wanted, budget 4.
 	big := &waiter{session: "big", req: lease.Request{Session: "big", Kind: lease.Build, Weight: 3.75, ToolUseID: "big-1"}}
 	big.granted = make(chan lease.Lease, 1)
 	d.waits.enqueue(big)

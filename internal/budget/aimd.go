@@ -241,6 +241,30 @@ type Controller struct {
 	clean int
 	// started is false until the first Step, so that B begins at Max rather than at zero.
 	started bool
+	// cut names the signal that last took the budget below its ceiling, or is empty while
+	// the budget is AT the ceiling and nothing is holding it down.
+	//
+	// GOV-34 ADDED IT SO A REFUSAL CAN SAY WHY. The budget on the wire has always been the
+	// EFFECTIVE one — the daemon passes one `limit` to both the admission test and the
+	// refusal — but a person reading "3/3 build slots" on a machine calibrated for six has
+	// no way to tell a small machine from a cut one, and `governor status` could not tell
+	// them either. The refusal text and doctor both quote this; neither derives it, because
+	// a second copy of the branch conditions below is a second thing that can drift.
+	//
+	// It is the LAST cause, not a set, and it is cleared the moment the budget reaches the
+	// ceiling again rather than when the signal recovers. A budget still climbing back after
+	// a run-queue spike is still a budget the run queue cut, and saying so is the honest
+	// answer to "why is this machine only allowing three".
+	cut string
+}
+
+// Cut names the signal currently holding the budget below its ceiling: "run queue",
+// "thermal", or "" when nothing is.
+func (c *Controller) Cut() string {
+	if !c.started || c.b >= c.Max {
+		return ""
+	}
+	return c.cut
 }
 
 // Budget is the current budget in slots.
@@ -383,6 +407,7 @@ func (c *Controller) Step(r Reading) int {
 		// that does throttle.
 		c.b = Floor
 		c.clean = 0
+		c.cut = "thermal"
 	case Cutting(r, c.runQueueMax()):
 		// MULTIPLICATIVE DECREASE, on the run queue alone. It halves rather than stepping
 		// down because the cost of being over is bounded by how fast you can get back, and
@@ -392,6 +417,7 @@ func (c *Controller) Step(r Reading) int {
 		if c.b < Floor {
 			c.b = Floor
 		}
+		c.cut = "run queue"
 	case c.clean < NominalTicksBeforeIncrease:
 		// Coming back from a thermal cut. Hold at the floor until the machine has been clean
 		// for three consecutive ticks, so the budget does not oscillate against the
@@ -410,6 +436,12 @@ func (c *Controller) Step(r Reading) int {
 		// cgroup quota can change — so it is enforced on every tick rather than only on the
 		// increase.
 		c.b = max
+	}
+	if c.b >= max {
+		// Back at the ceiling: nothing is holding the budget down any more, so there is no
+		// cut to name. Cut() tests the same thing, and this keeps the field from outliving
+		// the condition it describes if the ceiling itself moves down to meet the budget.
+		c.cut = ""
 	}
 	return c.b
 }
