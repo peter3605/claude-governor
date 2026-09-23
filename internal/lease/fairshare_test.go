@@ -195,7 +195,8 @@ func TestPartialDemandIsRedistributed(t *testing.T) {
 }
 
 // TestFairShareRespectsSessionWeight checks the share is per unit of registered weight, which
-// is what GOV-B02's focus boost will move — and the only thing that should.
+// is what `governor boost` moves — and, since GOV-B02 was dropped on 2026-09-23, the only
+// thing that moves it at all.
 //
 // Both sessions establish demand by being refused, the machine drains, and then each asks for
 // everything. The weighted caps are what decide the refill: weight 3 against weight 1 on a
