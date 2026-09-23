@@ -107,10 +107,13 @@ type Session struct {
 	// acted on by shareLocked since GOV-18. Zero and negative are read as the default 1.
 	//
 	// ONE MECHANISM, MORE THAN ONE TRIGGER. This field is the only weighting scheme there is
-	// and nothing should be built beside it — but what moves it is open: GOV-B01's
-	// `governor boost` sets it because a person said so, and GOV-B02's focus boost would set
-	// the same field because the window came forward. §6.1 used to say the focus boost was
-	// the only thing that may ever move a weight, which read as a ban on the manual one.
+	// and nothing should be built beside it — but what moves it is open. In practice there is
+	// exactly one trigger: GOV-B01's `governor boost`, which sets it because a person said so.
+	// GOV-B02 would have set the same field from window focus and was DROPPED on 2026-09-23,
+	// because fair share has never bound here — every refusal on record is cause=capacity and
+	// none is cause=share, and reweighting a full machine moves a refusal rather than removing
+	// it (design.md §6.1). §6.1 used to say the focus boost was the only thing that may ever
+	// move a weight, which read as a ban on the manual one.
 	Weight int
 	// BoostedUntil is when a temporary weight reverts to 1. Zero means the weight is not
 	// temporary and nothing will revert it.
@@ -499,8 +502,8 @@ func (t *Table) expireBoostLocked(s Session) Session {
 //
 // It is NOT a second weighting mechanism — it writes Session.Weight, the one field fair share
 // has read since GOV-18, and adds a deadline to it. design.md section 6.1 says there must be
-// one mechanism; it does not say there may be only one trigger, and GOV-B02 (still in Backlog,
-// and possibly to be dropped) would set the same field from window focus.
+// one mechanism; it does not say there may be only one trigger. It is now the ONLY trigger:
+// GOV-B02 would have set the same field from window focus and was dropped on 2026-09-23.
 //
 // An unknown session is refused rather than invented. A weight with no session attached would
 // sit in the table forever, counting toward the global weight in every fair-share walk on

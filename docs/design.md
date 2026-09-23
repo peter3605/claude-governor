@@ -1244,9 +1244,30 @@ contradict to ship `boost` at all. What it was guarding is worth keeping and is 
 what it said: there must be exactly one *mechanism*, `Session.Weight` as read by
 `shareLocked`, and no second scheme layered beside it. Triggers may be plural.
 `/claude-governor:governor boost` (GOV-B01) sets a weight because a person said so; GOV-B02's
-focus boost would set the same field because the window came forward. Neither is a second
-mechanism, and GOV-B02 is in any case still in Backlog and may be dropped — deferring the
-manual trigger to it would have meant deferring it to something that may never be built.
+focus boost would have set the same field because the window came forward. Neither is a second
+mechanism.
+
+**The automatic trigger was measured, and NOT built. GOV-B02 was dropped on 2026-09-23.** The
+mechanism keeps exactly one trigger, `governor boost`, and GOV-B01's decision not to defer the
+manual trigger to GOV-B02 is retrospectively the right one — it would have deferred it to
+something that never shipped.
+
+The story's own bar was a claim about habit: the automatic trigger is worth building only if a
+person who knows the watched session is starved fails to type `boost`. That is observable as
+`deny ... cause=share` against the foreground session, and across the whole of `daemon.log`
+there are **17 denials, every one `cause=capacity`, and zero `cause=share`**. No session's
+weight has ever moved from 1.
+
+So **fair share has never bound on this machine.** Every refusal observed so far was the machine
+being genuinely full, which is capacity's job — and no weighting could have improved any of
+them, because reweighting a full machine moves a refusal from one session to another rather than
+removing it. The story was not merely unproven; it was aimed at a condition that has not
+occurred. Dropping it also avoids the accessibility permission its own traps flagged as close to
+the `sudo` constraint this design otherwise refuses (§5.3).
+
+This is a statement about one 8-core laptop running one person's sessions, not about the idea. If
+`cause=share` refusals do start appearing against a foreground session, the mechanism is already
+built and only the trigger is missing: refile it then, with the log lines as the evidence.
 
 **A session's FIRST slot is admitted over budget, and that is invariant 6 (GOV-34).** Global
 capacity used to be checked before fair share with no knowledge of the guarantee above, so a
