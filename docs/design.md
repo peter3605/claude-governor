@@ -1083,15 +1083,22 @@ under-represents heavy modes. And they cannot be right everywhere, because **the
 not the same cost in two repositories** — `uv run pytest` in one project here is expensive in
 0.7% of 148 calls, while `python -m pytest` in another is among the most expensive commands on
 the machine. A per-host table keyed on command shape, seeded from these classes and corrected
-from what the sampler observes, is the design this points at. The seed exists so the first
-decision is not random; it is not the last word.
+from what the sampler observes, was the design this pointed at.
 
-**That table is a correction to `SlotCores`, NOT a live estimate replacing the loop** — the
-difference is §5.4, where the live-estimate version was measured and rejected. GOV-B03 also
-bounded how much such a table can be worth: per-shape estimation is tractable for `pytest`
-(cv 0.53) and intractable for `go test` (cv 1.30, the corpus's 7.4-core maximum, 3.4 sigma of
-drift between its halves), which is the most common expensive shape. It is tractable where it
-is least needed. docs/bash-corpus.md §8 carries the numbers.
+**That table was measured and NOT built either. GOV-B14 was dropped on 2026-09-23.** It was the
+residue of GOV-B03 (§5.4) and it failed for the same reason one grain finer down.
+docs/bash-corpus.md §9 carries the measurement; the short form is that the table would have had
+to be sized by the **p90**, and a shape's p90 is *less* stable than its mean, not more:
+`go test` moved 3.90x between the corpus's halves with non-overlapping confidence intervals,
+against an in-scope correction to `SlotCores` worth **9%** inside a noise band of 156%.
+
+`Class.ExpectedPeakCores()` therefore remains a constant, and the classes remain a prior that is
+never corrected from observation. **The one finding worth carrying forward is that `pytest`'s p90
+is genuinely stable (1.06x across halves, a 9%-wide interval) and sits 28% below `SlotCores`** —
+which cannot be collected by correcting a constant, because `B` is global and one `go test` burst
+at ~4 cores a build would saturate a machine sized for pytest. Collecting it needs a lease that
+costs what its shape costs, which is a change to this section's arithmetic rather than to its
+numbers, and is filed as its own story rather than assumed here.
 
 **18.4% of calls taking a lease is a reduction, not cheapness.** It turns a 220× problem into
 roughly an 11× one. §4.4's performance budget was priced for a gate firing a few dozen times a

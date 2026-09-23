@@ -450,6 +450,10 @@ carries the corpus's 7.4-core maximum, its cv of 1.30 is worse than its class's,
 needed and intractable exactly where it would matter.** That is the finding the residue story
 carries, and it is a weaker result than "per-shape is the finer version of the same idea".
 
+**The residue story was GOV-B14, and it was dropped too — see §9.** This section measured
+per-shape stability on the *mean*; §9 measures it on the p90, which is the statistic a budget
+must actually be sized by, and finds it less stable still.
+
 ### Limits of this section specifically
 
 - **`xcodebuild`'s stability is untested, not confirmed.** Its cv is attractive but n is 8 and 9
@@ -461,3 +465,83 @@ carries, and it is a weaker result than "per-shape is the finer version of the s
 - **Why the `go` family got dearer is not established here.** The second half of the window is
   this project's own development, which runs `go test -race ./...` heavily; that is a plausible
   cause and it is not a measured one. The finding is that the drift is real, not what caused it.
+
+---
+
+## 9. Does a finer grain rescue it? (GOV-B14, answered 2026-09-23)
+
+**No, and the story that proposed it was dropped on this evidence.** §8 closed with the finding
+that per-shape estimation looked "tractable exactly where it is least needed", and filed GOV-B14
+to correct `budget.SlotCores` per host and per shape where the measurement said it was tractable.
+That story's own instruction was to close it rather than ship a table that moves nothing. This is
+the measurement that decided it.
+
+Reproduced by `TestPerShapeCostStabilityAtTheP90` in `internal/classify`, skipped unless
+`GOVERNOR_CORPUS` is set. Corpus re-collected at 22,859 calls from 611 transcripts against 679,381
+host samples (2026-09-08T17:26Z .. 2026-09-23T20:59Z), 2,427 fittable and 882 of those gated.
+
+### The statistic the story had to use is the one that does not hold still
+
+§8 measured stability on the **mean**. GOV-B14 was not free to size by the mean — clause 2 of the
+story required the **p90**, because sizing by the mean is exactly what killed GOV-B03. Nobody had
+measured whether a *shape's* p90 holds still. It does not, and it is **worse than the mean**:
+
+| shape | first half p90 [95% CI] | second half p90 [95% CI] | ratio | CI width | verdict | B on 8 cores |
+|---|---|---|---:|---:|---|---:|
+| `go` | 1.281 [0.999, 1.464] | 4.023 [3.287, 4.137] | 3.14x | 36% | **moved** | 6 → 1 |
+| `go build` | 1.059 [0.552, 1.493] | 1.756 [1.043, 3.113] | 1.66x | 118% | **too thin** | 7 → 4 |
+| `go test` | 1.012 [0.891, 1.308] | 3.952 [2.784, 4.199] | 3.90x | 41% | **moved** | 7 → 2 |
+| `mypy` | 0.671 [0.485, 0.769] | 0.643 [0.540, 0.868] | 1.04x | 51% | **too thin** | 11 → 12 |
+| `pytest` | 0.895 [0.842, 0.918] | 0.848 [0.811, 0.862] | 1.06x | 9% | stable | 8 → 9 |
+
+`go test`'s mean moved 1.97x between halves; its **p90 moved 3.90x, and the two intervals do not
+touch**. A per-shape table built in one fortnight would say `B = 7` and in the next `B = 2`.
+Clause 4 of the story asked for a stated answer to "how old is this number allowed to be"; for
+the `go` family there is no answer that makes the number usable.
+
+**A p90 needs an interval, not a sigma.** §8's half-to-half comparisons use the standard error of
+a mean, which has a closed form; a p90 does not, so each half's p90 carries a seeded bootstrap 95%
+interval and the verdict is whether the intervals overlap.
+
+**Overlapping is not agreeing, and the distinction cut the usable set from three to one.**
+`go build` and `mypy` overlap only because their intervals are 118% and 51% of their own p90 —
+a corpus too thin to *disagree*, which is not a stable statistic. A shape counts only if its
+intervals agree **and** are narrow enough to size with.
+
+### The in-scope correction is inside its own noise
+
+GOV-B14 stated its own scope: *"a correction to a CONSTANT, not a change to the control law."*
+That constant is `budget.SlotCores` = 1.2. The aggregate correction available to it:
+
+| statistic | cores | B on 8 cores |
+|---|---:|---:|
+| shipped constant | 1.200 | 6 |
+| measured Medium p90 | 1.091 | 7 |
+
+**A 9% correction — against a Medium p90 that itself moved 0.984 → 2.523 between the halves, a
+2.56x swing.** A 9% correction inside a 156% noise band is the case the story's traps named, and
+the instruction was explicit: say so and close it.
+
+### The one durable finding, and why it did not fit this story
+
+`pytest` clears every bar. Its p90 is stable across halves at 1.06x, its interval is 9% wide on
+n = 162 → 116, and at 0.87 cores it sits **28% below the shipped constant**. It is also the
+commonest gated shape, 31% of all gated calls. On a pytest-heavy pool the correct budget is 9
+rather than 6.
+
+That cannot be collected by correcting a constant. `B` is global and the mix is heterogeneous:
+size `B` for pytest and one `go test` burst at ~4 cores a build saturates the machine. Collecting
+it requires **per-build cost accounting at admission** — a lease that costs what its shape costs,
+rather than one slot — which is a change to the control law and therefore outside the scope
+GOV-B14 set for itself. Filed separately rather than smuggled in here.
+
+### What this section does NOT say
+
+- **It does not say per-shape cost is meaningless.** It says the p90 of the *expensive* shapes is
+  non-stationary on this host, and that the one shape with a trustworthy p90 cannot be exploited
+  through a constant.
+- **It does not settle `xcodebuild`.** Still n = 9, still below the twenty this section requires
+  before reading a p90 at all. §8's caveat stands unchanged.
+- **It is one 8-core laptop over a fortnight**, and the second half is this project's own
+  development, which runs `go test -race ./...` heavily. That remains a plausible and unmeasured
+  cause of the `go` family's drift, exactly as §8 recorded.
