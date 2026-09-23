@@ -431,6 +431,19 @@ halves test exists so that the threshold cannot be chosen once the answer is vis
 
 ## The baseline window
 
+### Window state
+
+These two lines are the machine-readable state of this experiment. **Edit them when a window
+opens or closes and nothing else needs to change** — `TestClause1WaitsForTheBaselineWindow` and
+the local reminder both read exactly this, and the guard releases itself when the baseline reads
+`closed`.
+
+- **Baseline window:** open since `2026-09-22`
+- **After-window:** not open
+
+Permitted values are `open since <YYYY-MM-DD>`, `closed <YYYY-MM-DD>..<YYYY-MM-DD>`, and
+`not open`.
+
 **Opened: UTC 2026-09-22.** Recorded here, before it closes, so that its start is a fact rather
 than a reconstruction. Every condition in the pre-clock checklist was met first.
 
@@ -451,6 +464,14 @@ than a reconstruction. Every condition in the pre-clock checklist was met first.
 `additionalContext` on any hook, which is the only reason the series counts as a baseline.
 Shipping the instruction mid-window destroys it and there is no way to separate the halves
 afterwards.
+
+**This is enforced, not merely asked for.** `TestClause1WaitsForTheBaselineWindow` in
+`cmd/governor` fails the build if clause 1's mechanism appears in the tree while the baseline
+reads `open since`. It exists because the reminder channel is not reliable: a session binds to
+whatever story it is working on, so GOV-17's handoff stops surfacing the moment another story is
+started, and the loss it would cause is unrecoverable. Closing the baseline above releases the
+guard — which makes recording the close a precondition of shipping clause 1 rather than a step
+to remember afterwards.
 
 **The window needs four qualifying days, not four calendar days.** A day joins the comparison
 only above the floors in the defects list above, and this machine produced three qualifying days
