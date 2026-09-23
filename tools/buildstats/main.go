@@ -78,6 +78,33 @@ func (d *day) builds() int { return d.granted + d.parked + d.denied + d.failedOp
 // denied would count a build that ran as one that was stopped.
 func (d *day) ran() int { return d.granted + d.parked + d.failedOpen }
 
+// A day joins the halves test only if it carries enough of BOTH quantities to be one side of a
+// comparison. Without a floor here a single near-dead day becomes an entire half: advice.md's
+// halves test splits active days down the middle, so with three qualifying days and one day
+// carrying six builds, that one day is half the baseline. 2026-09-22 was exactly this — 0.87
+// awake hours and 6 builds, because the lid was shut — and it was day one of the window.
+//
+// The two floors answer two different failure modes and are deliberately not one number:
+//
+//	minActiveBuilds — the DESCRIPTIVE rates are counts over awake hours, and the relative
+//	standard error of a count is ~1/sqrt(n). Below ten builds that is worse than the 33% noise
+//	this document has already rejected as unscoreable, so such a day cannot bound anything.
+//
+//	minActiveAwakeSec — the SCORED quantity is a p99 over one reading per awake second. An hour
+//	puts ~36 readings above the percentile, so it is a tail rather than a single outlier.
+//
+// A day below either floor is excluded from the comparison and NAMED in the output. It is never
+// dropped silently: an excluded day is a fact about the window, not a tidying-up.
+const (
+	minActiveBuilds   = 10
+	minActiveAwakeSec = 3600
+)
+
+// active reports whether this day can be one side of the halves test.
+func (d *day) active() bool {
+	return d.builds() >= minActiveBuilds && d.awakeSec >= minActiveAwakeSec
+}
+
 func main() {
 	home, _ := os.UserHomeDir()
 	path := flag.String("log", filepath.Join(home, ".claude", "governor", "samples.jsonl"),
@@ -285,7 +312,7 @@ func pct(a []float64, p float64) float64 {
 func childCoresReport(days map[string]*day, keys []string) {
 	var active []string
 	for _, k := range keys {
-		if days[k].builds() > 0 && len(days[k].childCores) > 0 {
+		if days[k].active() && len(days[k].childCores) > 0 {
 			active = append(active, k)
 		}
 	}
@@ -343,16 +370,27 @@ func sortedByCount(m map[string]int) []string {
 // compare those halves to each other before comparing anything to an after-window. A difference
 // between the halves is the smallest change the window can distinguish from nothing.
 func halves(days map[string]*day, keys []string) {
-	var active []string
+	var active, excluded []string
 	for _, k := range keys {
-		if days[k].builds() > 0 {
+		switch d := days[k]; {
+		case d.active():
 			active = append(active, k)
+		case d.builds() > 0:
+			excluded = append(excluded, fmt.Sprintf("%s (%d builds, %.2f awake h)",
+				k, d.builds(), float64(d.awakeSec)/3600))
 		}
 	}
 	fmt.Println()
+	if len(excluded) > 0 {
+		fmt.Printf("excluded from the comparison — under %d builds or %.0f awake h, so too thin "+
+			"to be half of it:\n", minActiveBuilds, float64(minActiveAwakeSec)/3600)
+		for _, e := range excluded {
+			fmt.Printf("  %s\n", e)
+		}
+	}
 	if len(active) < 2 {
-		fmt.Printf("halves test           NOT POSSIBLE: %d active day(s). advice.md's noise "+
-			"floor needs two halves, so this window cannot score a change.\n", len(active))
+		fmt.Printf("halves test           NOT POSSIBLE: %d qualifying day(s). advice.md's noise "+
+			"floor needs two halves, so this window cannot score a change yet.\n", len(active))
 		return
 	}
 	mid := len(active) / 2

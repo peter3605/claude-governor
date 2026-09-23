@@ -43,3 +43,30 @@ func TestPercentileOfNothingIsNotACrash(t *testing.T) {
 		t.Errorf("pct(nil) = %v, want 0", got)
 	}
 }
+
+// TestAThinDayIsNotHalfOfTheComparison pins the floors that keep a near-dead day out of the
+// halves test. 2026-09-22 — day one of the baseline window — carried 6 builds in 0.87 awake
+// hours because the lid was shut. With three qualifying days it would have been half the
+// baseline, which is the same defect as the 2.21x volume mismatch arriving through the
+// instrument instead of the workload.
+func TestAThinDayIsNotHalfOfTheComparison(t *testing.T) {
+	for _, c := range []struct {
+		name    string
+		granted int
+		awake   int
+		want    bool
+	}{
+		{"a real active day", 88, 4 * 3600, true},
+		{"exactly on both floors", minActiveBuilds, minActiveAwakeSec, true},
+		{"2026-09-22, the lid was shut", 6, 3132, false},
+		{"enough builds, too little awake time", 200, 600, false},
+		{"enough awake time, too few builds", 3, 6 * 3600, false},
+		{"a day with nothing at all", 0, 0, false},
+	} {
+		d := &day{granted: c.granted, awakeSec: c.awake}
+		if got := d.active(); got != c.want {
+			t.Errorf("%s: %d builds in %.2f awake h -> active()=%v, want %v",
+				c.name, d.builds(), float64(c.awake)/3600, got, c.want)
+		}
+	}
+}

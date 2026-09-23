@@ -149,6 +149,15 @@ Unchanged, and the source of clause 2's peak. `docs/phase-0-findings.md` §8 has
   unwrapping never fires and `npx jest` and `npx some-local-bin` record identically as `npx`.
   That is 14 of this window's 190 records. Fixing it would move the classifier's measured gated
   share and error rates, so it belongs to a story of its own, not to this window.
+- **A day too thin to be a half is excluded, and named.** `tools/buildstats` requires a day to
+  carry at least 10 builds *and* at least one awake hour before it can be one side of the halves
+  test. The two floors answer two failure modes: a count's relative standard error is ~1/sqrt(n),
+  so under ten builds it is worse than the 33% spread this document has already rejected as
+  unscoreable; and the scored `p99` is taken over one reading per awake second, so an hour puts
+  ~36 readings above the percentile rather than one outlier. Excluded days are printed with their
+  figures, never dropped quietly. **This is not hypothetical: 2026-09-22, day one of the baseline,
+  carried 6 builds in 0.87 awake hours because the lid was shut.** Without the floor it would have
+  been half the baseline.
 - **A day is the finest boundary the report can express, and it is a UTC day.**
   `tools/buildstats` buckets on `r.TS[:10]`. Anything that changes mid-day — a reinstall, a
   recalibration, a budget change — cannot be excluded by `--since`/`--until`, only by splitting
@@ -258,7 +267,8 @@ version (design.md §10.4). It resolves itself with ordinary use.
    `max` reported descriptively beside it. Re-opened and closed in the same day: the peak failed
    the same halves test that retired denials. See the next section for the measurement and
    **the minimum detectable effect it pre-registers**.
-5. **Only then** open the baseline week, and record its start date in this file.
+5. ~~**Only then** open the baseline week, and record its start date in this file.~~
+   **DONE. THE BASELINE WINDOW OPENED ON UTC 2026-09-22.** See "The baseline window" below.
 
 If the rate does not make a meaningful denominator, **say so and do not start the week.** An empty
 window reported as a null result is worse than no window at all.
@@ -416,6 +426,37 @@ halves test exists so that the threshold cannot be chosen once the answer is vis
 - **`governor status` reports `budget 1` against `b_max 4`.** That is the AIMD loop floored under
   a `loadavg1` of 87, not a configuration problem: clause 2 fixes the *ceiling* across both
   windows, and the live budget is supposed to move. Noted so a later reader does not chase it.
+
+---
+
+## The baseline window
+
+**Opened: UTC 2026-09-22.** Recorded here, before it closes, so that its start is a fact rather
+than a reconstruction. Every condition in the pre-clock checklist was met first.
+
+| | |
+|---|---|
+| Gate binary | `accf4a6`, installed `2026-09-21T03:26:26Z`, unchanged for the window's duration |
+| `b_max` | 4 (the live budget moves; the ceiling does not) |
+| Scored quantity | `p99` child cores |
+| Minimum detectable effect | **0.56 cores**, pre-registered 2026-09-21 |
+| Clause 3 guard | test-suite runs, counted by `internal/classify.ShapeRunKind` |
+| Advice shipped? | **No — clause 1 is unbuilt.** This is what makes the window a *before* |
+
+**Read it with `go run ./tools/buildstats --since 2026-09-22 --until <last day>`.**
+
+### Two rules for whoever closes it
+
+**Do not build clause 1 while this window is open.** There is no `SKILL.md` and no
+`additionalContext` on any hook, which is the only reason the series counts as a baseline.
+Shipping the instruction mid-window destroys it and there is no way to separate the halves
+afterwards.
+
+**The window needs four qualifying days, not four calendar days.** A day joins the comparison
+only above the floors in the defects list above, and this machine produced three qualifying days
+in the six calendar days to 09-22 — 09-22 itself was not one of them. Expect roughly eight
+calendar days. Closing early with two qualifying days gives single-day halves, which is precisely
+the configuration that produced the 2.21x incomparability that sank the previous attempt.
 
 ---
 
