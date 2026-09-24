@@ -1801,6 +1801,30 @@ worst case from a lease changing to the line showing it is the interval plus a 3
 plus up to a second of cache, which at two seconds is 3.3 s — inside the tens of seconds a
 fan-out worth watching lasts.
 
+**The 50 ms budget is adequate for the round trip, and GOV-B17 measured it under load rather
+than assuming it.** The 0.6 ms above is an idle figure, and the question the budget actually
+has to survive is a busy machine, because that is when a person looks at the line. 300 real
+dial-plus-reply round trips to a live daemon over a unix socket, on this eight-core host:
+
+| | p50 | p90 | p99 | max | over the 50 ms budget |
+|---|---|---|---|---|---|
+| idle | 177 µs | 208 µs | 297 µs | 2.14 ms | 0 of 300 |
+| under a concurrent `-race` suite | 434 µs | 1.14 ms | 3.69 ms | 11.78 ms | 0 of 300 |
+
+Loaded, the p99 is still **13.5x inside** the budget and the worst single observation is 4x
+inside it, so the wire is not what spends the 50 ms. What does, when it is spent, is the
+statusline process not being scheduled at all — the same starvation GOV-B10 measured from the
+other side, where under `GOMAXPROCS=1` with four spinners a 50 ms sleep took 68 ms. That
+distinction matters because the two have opposite fixes: a slow daemon would be a reason to
+raise the budget, whereas a starved process is a reason not to, since a machine that cannot
+give this command 50 ms of wall clock will not reliably give it 500 either.
+
+The consequence is honest and worth stating: on a machine that starved, the line reads
+`governor: daemon not running - spawns ungoverned` while the daemon is in fact running and
+governing. That is the fail-open direction and it is the right one — the alternative is
+printing a slot count nobody measured — but it is a misleading sentence, and if it is ever
+seen in practice rather than in a test, the fix is the wording, not the budget.
+
 GOV-10 shipped it, and the line above is what it actually renders. Two departures from what
 this section originally illustrated, both deliberate. There is no leading spinner glyph,
 because an animated one would have to come from somewhere and the statusline is stateless,

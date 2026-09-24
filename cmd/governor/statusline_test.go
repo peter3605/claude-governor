@@ -100,6 +100,44 @@ func statusDaemon(t *testing.T, reply any) (string, *atomic.Int64, func() []byte
 	}
 }
 
+// statuslineContentBudget is the budget the tests that assert WHAT WAS RENDERED run under,
+// and it is deliberately a hundred times the product's own statuslineBudget.
+//
+// GOV-B17. A test that asserts the rendered line while allowing the production code only its
+// real 50 ms is asserting that the machine granted this process 50 ms of wall clock, which is
+// not a property of the status line. When it does not, `statusline` does exactly what it is
+// designed to do — its timer fires and `render` reports an unreachable daemon — and the
+// content assertion fails for a program that behaved correctly. Measured in CI on
+// darwin/arm64 during PR #56, in a job whose package took 136 s:
+//
+//	statusline_test.go:147: line = "governor: daemon not running - spawns ungoverned",
+//	                        want "3/5 slots - cpu 61% - thermal ok"
+//
+// It passed 10/10 locally and passed on a re-run with no code change, because nothing about
+// the code was wrong.
+//
+// THE CEILING IS NOT WHAT WAS RELAXED, AND THE BUDGET IS NOT WHAT WAS RAISED. statuslineCeiling
+// stays at 70 ms and every caller is still held to it, which is what GOV-B08 and GOV-B10 paid
+// for; the 50 ms product promise is untouched and is still exercised where it belongs — by
+// TestStatuslineWhenTheDaemonIsUnreachable, whose "accepts and never answers" case can only
+// produce its line by letting that budget expire, and by
+// TestStatuslineSurvivesAStdinThatNeverCloses. Against a generous budget the ceiling in fact
+// asserts something STRONGER than before: the command must still answer in 70 ms even though
+// it was allowed five seconds not to. A daemon that hangs therefore still fails, on both the
+// ceiling and the content.
+//
+// LATENCY AND CONTENT ARE SEPARATED, NOT TRADED. Before this, one run had to satisfy both,
+// and the two want opposite things from a loaded machine.
+//
+// AND THE PRODUCTION BUDGET WAS CHECKED BEFORE BEING LEFT ALONE, because a test-only fix is
+// only honest if 50 ms is genuinely enough. 300 real dial-plus-reply round trips to a live
+// daemon, idle and under a concurrent -race run of this package (design.md section 9 carries
+// the table): p99 297 µs idle, 3.69 ms loaded, worst single observation 11.78 ms, and 0 of 300
+// over the budget in either condition. Loaded, the p99 is 13.5x inside it. So the wire is not
+// what spends the 50 ms — a starved process is, which is a reason NOT to raise the budget,
+// since a machine that cannot grant 50 ms of wall clock will not reliably grant 500 either.
+const statuslineContentBudget = 5 * time.Second
+
 // runStatusline drives the command end to end and holds it to the contract every case
 // shares: a non-empty single line, inside the ceiling.
 //
@@ -109,11 +147,19 @@ func statusDaemon(t *testing.T, reply any) (string, *atomic.Int64, func() []byte
 // measuring nothing. The ceiling still covers the write, which is where it was before.
 func runStatuslineFor(t *testing.T, endpoint, payload string, width int) string {
 	t.Helper()
+	return runStatuslineWithin(t, endpoint, payload, width, statuslineContentBudget)
+}
+
+// runStatuslineWithin is runStatuslineFor with the budget named, for the cases whose subject
+// IS the budget — an unreachable daemon that must be given up on, and a stdin that never
+// closes. Those must run under the real statuslineBudget or they stop testing it.
+func runStatuslineWithin(t *testing.T, endpoint, payload string, width int, budget time.Duration) string {
+	t.Helper()
 	t.Setenv(transport.EndpointEnv, endpoint)
 
 	var stdout, stderr bytes.Buffer
 	took := timed(func() {
-		statuslineCommand(strings.NewReader(payload), &stdout, &stderr, transport.Dial{}, statuslineBudget, width)
+		statuslineCommand(strings.NewReader(payload), &stdout, &stderr, transport.Dial{}, budget, width)
 	})
 	line := strings.TrimSuffix(stdout.String(), "\n")
 
@@ -554,7 +600,13 @@ func TestStatuslineWhenTheDaemonIsUnreachable(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			isolateState(t)
-			line := runStatuslineFor(t, tc.endpoint(t), sampleStatusLinePayload, 0)
+			// The REAL budget, deliberately, unlike the content tests above. Two of these
+			// cases can only produce their line by letting it expire — a listener that
+			// accepts and never answers, and one that never closes the connection — so a
+			// generous budget here would stop testing the thing this case is about. It
+			// cannot flake the way GOV-B17 fixed either: a starved machine makes the
+			// fail-open line arrive sooner, which is the line being asserted.
+			line := runStatuslineWithin(t, tc.endpoint(t), sampleStatusLinePayload, 0, statuslineBudget)
 			if !strings.Contains(line, "daemon not running") {
 				t.Errorf("line = %q, want it to say the daemon is not running", line)
 			}
@@ -893,6 +945,16 @@ func TestTheDocsIllustrateTheStatusLineThatActuallyRenders(t *testing.T) {
 		},
 		"section 9, a session whose hooks never loaded": {
 			OK: true, Ungoverned: true,
+		},
+		// The only view here with OK false, added by GOV-B17 when section 9 came to
+		// illustrate this line while recording what the 50 ms budget actually buys. The
+		// shaped pattern below has always admitted "daemon not running", so the guard
+		// expected this line to be illustrable; it simply had no view that produced it, and
+		// the bidirectional check meant illustrating it anywhere failed the build. It is
+		// also the one line on this list a person is most likely to see and misread, which
+		// is a poor reason for it to be the one line no document showed.
+		"section 9, a machine whose daemon did not answer": {
+			OK: false,
 		},
 		"section 13, a budget filled by leases that outlived their agents": {
 			OK: true, InUse: 4, Slots: 4, Budget: 4,
