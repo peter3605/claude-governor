@@ -85,8 +85,8 @@ func baselineIsOpen(t *testing.T, root string) bool {
 	return open
 }
 
-// clause1Artifacts names the things whose presence means the standing instruction exists. Both
-// are specific and absent today: a skill file, and a hook that puts text in the model's context.
+// clause1Artifacts names the things whose presence means the standing instruction exists. All
+// three are specific and absent today.
 func clause1Artifacts(t *testing.T, root string) []string {
 	t.Helper()
 	found, err := clause1ArtifactsIn(root)
@@ -113,17 +113,35 @@ func clause1ArtifactsIn(root string) ([]string, error) {
 			return nil
 		}
 		rel, _ := filepath.Rel(root, path)
+		// 1. A skill checked into the repository.
 		if strings.EqualFold(d.Name(), "SKILL.md") {
 			found = append(found, rel)
 			return nil
 		}
-		// additionalContext is the field that injects text into the model's context, as
-		// distinct from systemMessage, which onboard.go uses to address the user. Only a
-		// struct tag counts: the two files that discuss the difference in prose must not
-		// trip this.
 		if strings.HasSuffix(path, ".go") && !strings.HasSuffix(path, "_test.go") {
 			b, readErr := os.ReadFile(path)
-			if readErr == nil && strings.Contains(string(b), `json:"additionalContext"`) {
+			if readErr != nil {
+				return nil
+			}
+			src := string(b)
+			// 2. A skill WRITTEN BY INSTALL, which is how this plugin ships every other
+			// file it installs. There is no go:embed here — install.go:281 records that it
+			// cannot reach out of its own directory — so `.mcp.json` and
+			// `commands/governor.md` are Go string constants (pluginMCP, pluginCommand) and
+			// a skill would be a third. THE FIRST VERSION OF THIS GUARD MISSED THAT
+			// ENTIRELY: it looked only for a SKILL.md on disk, so the most likely way for
+			// clause 1 to actually ship would have walked straight past it. design.md
+			// §13.3 is what gave it away — it carried a row for
+			// skills/heavy-build/SKILL.md that nothing writes, left over from planning
+			// clause 1, which is exactly the path a real one would take.
+			if strings.Contains(src, "SKILL.md") {
+				found = append(found, rel+` (writes a SKILL.md)`)
+			}
+			// 3. additionalContext, the field that injects text into the model's context, as
+			// distinct from systemMessage, which onboard.go uses to address the user. Only a
+			// struct tag counts: the two files that discuss the difference in prose must not
+			// trip this.
+			if strings.Contains(src, `json:"additionalContext"`) {
 				found = append(found, rel+` (json:"additionalContext")`)
 			}
 		}
@@ -213,11 +231,22 @@ func TestTheGuardItselfFires(t *testing.T) {
 			t.Errorf(`a shipped json:"additionalContext" did not trip the guard: %v`, got)
 		}
 
-		// A _test.go file must not count: the guard is about shipped behaviour, and a test
-		// asserting the field's absence necessarily mentions it.
+		// The skill as install would actually ship it: a Go string constant naming the file,
+		// the same shape as pluginMCP and pluginCommand. The first version of this guard
+		// missed this case, which is the whole reason it is pinned here.
+		installed := t.TempDir()
+		write(t, installed, "cmd/governor/install.go",
+			"const pluginSkill = \"# ask before you build\\n\"\n"+
+				"var skillPath = filepath.Join(plugin, \"skills\", \"heavy-build\", \"SKILL.md\")\n")
+		if got, _ := clause1ArtifactsIn(installed); len(got) != 1 {
+			t.Errorf("a skill written BY INSTALL did not trip the guard: %v", got)
+		}
+
+		// A _test.go file must not count, for either marker: the guard is about shipped
+		// behaviour, and a test asserting an absence necessarily names the thing.
 		onlyTest := t.TempDir()
 		write(t, onlyTest, "cmd/governor/session_test.go",
-			"want := `json:\"additionalContext\"`\n")
+			"want := `json:\"additionalContext\"`\n// and a SKILL.md is not written here\n")
 		if got, _ := clause1ArtifactsIn(onlyTest); len(got) != 0 {
 			t.Errorf("a test file tripped the guard: %v", got)
 		}
