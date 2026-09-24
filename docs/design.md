@@ -2308,7 +2308,6 @@ Uninstall is only verifiable if this list is exhaustive, so it is normative.
 | `~/.claude/skills/claude-governor/.claude-plugin/plugin.json` | install | uninstall |
 | `~/.claude/skills/claude-governor/hooks/hooks.json` (the six hooks) | install | uninstall |
 | `~/.claude/skills/claude-governor/.mcp.json` (the advisory server, section 8) | install | uninstall |
-| `~/.claude/skills/claude-governor/skills/heavy-build/SKILL.md` (the advice, section 8) | install | uninstall |
 | `~/.claude/skills/claude-governor/commands/governor.md` (the slash command, section 9.1) | install | uninstall |
 | `~/.claude/skills/claude-governor/bin/governor` | install, copied from the running binary | uninstall |
 | `~/.claude/skills/` | install, only if absent | uninstall, only if it empties |
@@ -2327,6 +2326,20 @@ Uninstall is only verifiable if this list is exhaustive, so it is normative.
 | `~/.claude/governor/config.json` | `calibrate`, **only** when `${CLAUDE_PLUGIN_DATA}` is unset — see below | uninstall |
 | `~/.claude/governor/` | daemon (`transport.Listen`) | uninstall, only once it is empty; `--purge` regardless |
 | `~/.claude/plugins/data/claude-governor-skills-dir/` (`${CLAUDE_PLUGIN_DATA}`: config, onboarding marker) | Claude Code creates it; the governor writes config.json and `onboarded` | uninstall `--purge` only |
+
+**One row was removed from this table on 2026-09-23, and the reason is worth keeping.** It read
+`skills/heavy-build/SKILL.md` (the advice, section 8), written by install and removed by
+uninstall. **Nothing writes it** — there is no reference to `heavy-build` in any Go source and
+the installed tree is five files. It was left over from planning GOV-17's clause 1, which will
+ship a skill. A phantom row is the mirror image of the omission this table exists to prevent: it
+cannot leave residue behind, but it makes the list unusable as the oracle a clean-machine
+uninstall proof (GOV-35) has to check against, and this table calls itself exhaustive.
+
+**When clause 1 does ship its skill, the row comes back in the same change.** That is this
+document's standing rule for every path, and it is now also enforced: the skill would be a Go
+string constant like `pluginMCP` and `pluginCommand`, and
+`TestClause1WaitsForTheBaselineWindow` fails on a non-test source that names a `SKILL.md` while
+the baseline window is open.
 
 Four rows carry a condition, and each condition is the difference between "removes everything
 it added" and "removes things it did not":
