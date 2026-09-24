@@ -137,17 +137,50 @@ func TestTheGateWillNotBeParkedTwice(t *testing.T) {
 // TestAParkedSpawnProceedsWhenASlotFrees is the middle row of design.md section 4.2's
 // decision table, and the reason the wait exists at all: the session stalls briefly and the
 // spawn then proceeds, costing no tokens and requiring the model to reason about nothing.
+//
+// IT ASSERTS THE ORDER OF TWO EVENTS AND NOT THEIR TIMING, which is what GOV-B16 rewrote.
+// The release used to be fired by a 150 ms timer and the outcome measured from a
+// `time.Now()` taken afterwards on this goroutine — two different epochs. Measured 2026-09-24
+// by injecting the skew directly:
+//
+//	skew   elapsed from start   elapsed from the timer's own epoch   grant-release
+//	   0            151.0 ms                             151.9 ms        +922 µs
+//	40 ms           110.6 ms                             150.8 ms        +562 µs
+//	80 ms            70.7 ms                             151.7 ms        +744 µs
+//
+// The release was never early: `grant - release` is positive throughout and the table never
+// held more than its budget of 1. What failed was the comparison, because
+// `elapsed = holdFor + releaseCost - skew`, so `elapsed < holdFor` fails whenever the
+// scheduler puts more than one release-cost — about a millisecond — between the `go`
+// statement and the clock read. That is why the observed failure reported 111.8 ms against a
+// 150 ms hold, and it is also why RAISING THE HOLD CANNOT FIX IT: a larger holdFor raises
+// `elapsed` and the bound it is compared against by the same amount, leaving the margin at
+// one release cost. GOV-B10 records what padding a load-sensitive guard costs this project.
+//
+// So the hold is gone entirely. The release is triggered by the park it is meant to follow,
+// which makes the ordering structural rather than timed: the second request is observed
+// parked — which is itself the proof that the budget was not over-granted while the first
+// lease was held — and only then is the slot freed.
 func TestAParkedSpawnProceedsWhenASlotFrees(t *testing.T) {
 	shortWait(t, 5*time.Second)
-	endpoint, _ := startTestDaemon(t, 1)
+	endpoint, d := startTestDaemon(t, 1)
 
 	if !askGateBuild(t, endpoint, "s1", "toolu_01") {
 		t.Fatal("the first build was refused")
 	}
 
-	const holdFor = 150 * time.Millisecond
+	// The releasing goroutine waits for the park rather than for a clock. If the second
+	// request is never parked it reports that instead of releasing, because a spawn allowed
+	// through without parking is the budget violation this test exists to catch — and a
+	// timer-driven release cannot tell the two apart.
+	asked := make(chan struct{})
+	parked := make(chan bool, 1)
 	go func() {
-		time.Sleep(holdFor)
+		ok := awaitParkedWaiters(d, 1, asked)
+		parked <- ok
+		if !ok {
+			return
+		}
 		var stderr strings.Builder
 		lifecycleHook(strings.NewReader(postToolUsePayload("s1", "toolu_01")),
 			&stderr, transport.Dial{}, hookBudget, buildFinish)
@@ -156,13 +189,26 @@ func TestAParkedSpawnProceedsWhenASlotFrees(t *testing.T) {
 	start := time.Now()
 	allowed := askGateBuild(t, endpoint, "s1", "toolu_02")
 	elapsed := time.Since(start)
+	close(asked)
 
-	if !allowed {
-		t.Fatalf("the parked spawn was refused after %v, though a slot freed at %v",
-			elapsed.Round(time.Millisecond), holdFor)
+	// The three outcomes are told apart deliberately. Only the second is a governor fault,
+	// and a timer-driven release reported all three as the same failure.
+	switch sawPark := <-parked; {
+	case !sawPark && allowed:
+		t.Fatalf("the second build was granted without ever parking, on a budget of 1 with the "+
+			"first lease still held: the budget was over-granted (in use = %d)", d.table.InUse())
+	case !sawPark && !allowed:
+		t.Fatalf("the gate gave up after %v without the park ever being observed; the machine "+
+			"stalled past the whole %v wait, so this run cannot say anything about the handover",
+			elapsed.Round(time.Millisecond), gateWaitMax)
+	case !allowed:
+		t.Fatalf("the parked spawn was refused after %v, though the slot it waited for was freed",
+			elapsed.Round(time.Millisecond))
 	}
-	if elapsed < holdFor {
-		t.Errorf("the spawn proceeded after %v, before the slot it was waiting for was freed", elapsed)
+	// The waiter holds the one slot the releaser gave up. Two would mean the freed slot was
+	// handed out while the original holder still had it.
+	if got := d.table.InUse(); got != 1 {
+		t.Errorf("in use = %d, want 1: the budget of 1 was not respected across the handover", got)
 	}
 	if elapsed > gateWaitMax {
 		t.Errorf("took %v, which is the whole wait: the release did not wake the waiter", elapsed)

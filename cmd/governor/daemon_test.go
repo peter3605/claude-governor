@@ -754,3 +754,30 @@ func (c *testClock) advance(d time.Duration) {
 	defer c.mu.Unlock()
 	c.now = c.now.Add(d)
 }
+
+// awaitParkedWaiters waits until at least n acquires are parked in the queue, or until abandon is
+// closed because the request that should have parked has already been answered.
+//
+// IT HAS NO DEADLINE OF ITS OWN, AND THAT IS THE POINT. A poll bounded by a constant is the
+// load-sensitive guard GOV-B08 and GOV-B10 each had to undo: on a machine stalled badly
+// enough the park arrives after the bound, the helper reports that nothing parked, and a
+// healthy governor is failed for it. The caller closes abandon once its own request has been
+// answered, which is the only condition under which no further park can appear — so waiting
+// costs nothing and cannot expire early.
+func awaitParkedWaiters(d *daemon, n int, abandon <-chan struct{}) bool {
+	for {
+		if d.waits.len() >= n {
+			return true
+		}
+		select {
+		case <-abandon:
+			// One last look. The park being registered and the caller being answered can
+			// land in either order, and giving up without re-reading would lose the race.
+			return d.waits.len() >= n
+		default:
+		}
+		// A politeness interval, not an assertion. Nothing here is compared against a
+		// duration, so this only bounds how hard the loop spins.
+		time.Sleep(time.Millisecond)
+	}
+}
