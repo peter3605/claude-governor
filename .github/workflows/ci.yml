@@ -37,6 +37,38 @@ jobs:
       # because the runner has gcc.
       - run: go test -race ./...
 
+  # A GitHub runner is not a clean machine: it carries a Go toolchain, a checkout and a warm
+  # HOME, and the install bugs worth catching live in the difference between that and a
+  # stranger's laptop — a stale binary on PATH, an existing settings.json, a daemon already
+  # running. So this runs the REAL install.sh in a container that has none of them.
+  #
+  # Linux only, and that is two decisions rather than one. macOS runner minutes bill at ~10x
+  # here, and there is no such thing as a macOS container: the clean-macOS install is a
+  # hardware test and stays with GOV-19.
+  #
+  # BOTH LIBCS, because the shipped linux binaries are CGO_ENABLED=0 and "static" is a claim
+  # worth checking rather than asserting. debian is glibc with coreutils; alpine is musl with
+  # busybox, whose `find` lacks -printf and whose wget is built in — both of which the script
+  # had to be corrected for.
+  clean-install:
+    name: clean install (${{ matrix.image }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        image: ['debian:stable-slim', 'alpine:3']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26'
+      # The script builds both linux artefacts from this working tree and serves them over
+      # TLS, so what is installed is THIS commit rather than the last release. It is a script
+      # rather than inline YAML so it can be run locally, which is where an install bug is
+      # cheapest to find.
+      - name: install, doctor, reinstall, uninstall byte-identical
+        run: bash scripts/clean-install-test.sh '${{ matrix.image }}'
+
   build:
     name: build ${{ matrix.goos }}/${{ matrix.goarch }}
     runs-on: ${{ matrix.runner }}

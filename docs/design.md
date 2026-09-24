@@ -1674,14 +1674,14 @@ claude-governor/                  the repo
 │   ├── lease/                    table, TTL, Liveness interface (PID+starttime in v1)
 │   ├── signals/                  Sampler interface; sampler_darwin.go, sampler_linux.go
 │   └── config/                   versioned schema, migration, atomic write
-├── skills/heavy-build/SKILL.md   "ask before you launch a heavy build" (section 8)
+├── skills/heavy-build/SKILL.md   NOT YET SHIPPED — GOV-17 clause 1 (sections 8, 21.2)
 └── commands/governor.md          status | limit N | pause | resume | boost (section 9.1)
 
 ~/.claude/skills/claude-governor/ the installed plugin, written by `governor install`
 ├── .claude-plugin/plugin.json    name, version, description
 ├── hooks/hooks.json              the six hooks in section 4.1
 ├── .mcp.json                     the advisory server in section 8
-├── skills/heavy-build/SKILL.md   the advice a session loads on demand (section 8)
+├── skills/heavy-build/SKILL.md   NOT YET SHIPPED — see below
 ├── commands/governor.md          the slash command (section 9.1)
 └── bin/governor                  the binary those hooks run
 
@@ -1690,6 +1690,39 @@ state  → ~/.claude/governor/      sock, daemon.pid, daemon.log, daemon.start, 
                                   config.json, samples.jsonl, sampler.lock, sampler.log
 config → ${CLAUDE_PLUGIN_DATA}/config.json, falling back to the state directory
 ```
+
+**The installed tree is FIVE files today, not six.** `skills/heavy-build/SKILL.md` is marked above
+because §21.2 says so in prose — "these three are not part of GOV-16 and have not shipped" — and
+the diagrams did not, which is the same drift §13.3 had to correct on 2026-09-23. Verify rather
+than trust either picture: the installed tree is `.claude-plugin/plugin.json`, `hooks/hooks.json`,
+`.mcp.json`, `commands/governor.md` and `bin/governor`, and there is no reference to `heavy-build`
+anywhere in the Go source. GOV-35 asserts this list against a real install in a clean container,
+which is what stops a layout diagram from being the only thing that knows.
+
+**That assertion is `scripts/clean-install-test.sh`, run by CI on every push** against
+`debian:stable-slim` (glibc, coreutils) and `alpine:3` (musl, busybox). It builds both linux
+artefacts from the working tree and serves them over TLS through `install.sh`'s own
+`GOVERNOR_BASE_URL`, so what is installed is the commit under test rather than the last release,
+and `curl --proto '=https'` is never relaxed to make a test pass. In the container it asserts
+the five installed paths, that no `skills/` directory appears, that `doctor` reports a named set
+of `ok` checks and **exactly** `sessions` and `spawn` as unverified, that a reinstall over a
+running daemon does not kill it (§13.4), and that `uninstall` leaves `$HOME` byte-identical.
+
+Three things it found that no test on the developer's machine could:
+
+- **A fresh machine has no `settings.json`, so install CREATES one** — the mirror image of the
+  merge-and-back-up path §13.3 describes. Uninstall must then *remove* that file rather than
+  restore a backup of something that never existed. It does, and now that is proven rather than
+  assumed.
+- **`doctor` has TWO unverifiable checks where there is no Claude Code, not one.** `spawn` was
+  expected; `sessions` is the second, because the session registry is filled by `SessionStart`
+  hooks firing in real sessions and a container has none. The set is asserted by name rather
+  than by count, because GOV-30's hole was a check that could not verify being counted as fine.
+- **A digest that cannot see the disk reports success.** The first version listed directories
+  with `find -printf`, which busybox rejects, with the error swallowed — so on alpine the
+  directory half was empty and a leftover directory would have compared equal. The script now
+  uses only POSIX `find`, and checks its own instrument: the digest taken after install MUST
+  differ from the one before it, or the byte-identical comparison at the end is meaningless.
 
 **§13.3's table is the normative list of paths; the state line above is a summary of the part
 of it under `~/.claude/governor/`.** GOV-B09 found it naming five of nine — `daemon.start`
