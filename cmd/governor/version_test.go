@@ -177,6 +177,10 @@ func TestEveryReplyCarriesTheProtocolVersion(t *testing.T) {
 // stops being governed. That is worth a test that cannot be satisfied by a struct literal
 // that merely looks right.
 func TestEveryRequestCarriesTheProtocolVersion(t *testing.T) {
+	// The statusline case writes its cache, and reads it back without dialling for a second
+	// after. Without a directory of its own, every later -count iteration inside that second
+	// shared the package's directory, found the cache fresh, sent nothing, and failed (GOV-B18).
+	isolateState(t)
 	lines := make(chan string, 8)
 	endpoint := recordingListener(t, lines)
 	t.Setenv(transport.EndpointEnv, endpoint)
