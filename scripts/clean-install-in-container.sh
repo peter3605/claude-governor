@@ -51,20 +51,22 @@ before=$(digest)
 note "install, through the real install.sh"
 sh /work/install.sh || fail "install.sh exited non-zero."
 
-# 13.3 is normative and GOV-35 asserts it against a real install. FIVE files, not six:
-# skills/heavy-build/SKILL.md is GOV-17 clause 1 and has not shipped.
+# 13.3 is normative and GOV-35 asserts it against a real install. SIX files: GOV-17 clause 1
+# added skills/heavy-build/SKILL.md, after its measurement window was closed in docs/advice.md.
 plugin="$HOME/.claude/skills/claude-governor"
 for f in \
 	"$plugin/.claude-plugin/plugin.json" \
 	"$plugin/hooks/hooks.json" \
 	"$plugin/.mcp.json" \
 	"$plugin/commands/governor.md" \
+	"$plugin/skills/heavy-build/SKILL.md" \
 	"$plugin/bin/governor"
 do
 	[ -f "$f" ] || fail "install did not write $f, which design.md 13.3 lists."
 done
-[ ! -e "$plugin/skills" ] || fail \
-	"install wrote a skills/ directory. If GOV-17 clause 1 has shipped, design.md 13.3 and this script must gain the row in the SAME change — and the baseline measurement window must have been closed first."
+# And nothing else under skills/: a second skill would be a path 13.3 does not list.
+[ "$(find "$plugin/skills" -type f | wc -l)" -eq 1 ] || fail \
+	"install wrote more under skills/ than skills/heavy-build/SKILL.md; design.md 13.3 must gain the row in the SAME change."
 
 # A fresh container has no settings.json, so install CREATES one. That is the opposite of
 # the developer's machine, where there is one to back up and merge, and it is the asymmetry

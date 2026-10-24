@@ -30,15 +30,37 @@ func pluginData(t *testing.T) string {
 	return dir
 }
 
-// notice runs the emission once and returns what it wrote to stdout.
+// notice runs the first-run claim once and returns the notice it produced, or "".
 func notice(t *testing.T) string {
 	t.Helper()
-	var stdout, stderr bytes.Buffer
-	emitFirstRunNotice(&stdout, &stderr)
+	var stderr bytes.Buffer
+	text := firstRunNotice(&stderr)
 	if s := stderr.String(); s != "" {
 		t.Logf("stderr: %s", s)
 	}
-	return stdout.String()
+	return text
+}
+
+// sessionStart runs the whole SessionStart emission once and decodes its stdout, failing if it
+// is not exactly one parseable JSON object.
+func sessionStart(t *testing.T) map[string]any {
+	t.Helper()
+	var stdout, stderr bytes.Buffer
+	emitSessionStart(&stdout, &stderr)
+	if s := stderr.String(); s != "" {
+		t.Logf("stderr: %s", s)
+	}
+	raw := stdout.String()
+	if strings.Count(strings.TrimSpace(raw), "\n") != 0 {
+		t.Fatalf("SessionStart wrote more than one line; the composition hook-surface.md "+
+			"section 16.1 measured is ONE object carrying both fields: %q", raw)
+	}
+	var got map[string]any
+	if err := json.Unmarshal([]byte(raw), &got); err != nil {
+		t.Fatalf("SessionStart's stdout is not parseable JSON, so Claude Code would report a "+
+			"hook error instead of either message: %v (%q)", err, raw)
+	}
+	return got
 }
 
 // The first session is told, and no session after it is.
@@ -61,30 +83,54 @@ func TestTheFirstSessionIsToldAndNoSessionAfterItIs(t *testing.T) {
 	}
 }
 
-// The notice reaches the PERSON, and puts nothing in the model's context.
+// The notice reaches the PERSON and the standing instruction reaches the MODEL, and neither
+// leaks into the other's channel.
 //
-// docs/hook-surface.md section 16 measured the two to be disjoint channels: systemMessage is
-// rendered to the user and contributes literally nothing to the model, additionalContext is
-// the exact reverse. Sending this as additionalContext would mean nobody but the model ever
-// reads it, and would also make it a standing instruction the model carries for the rest of
-// the session — which is the story's own trap and GOV-17's job, not this one's.
-func TestTheNoticeGoesToThePersonAndNotToTheModel(t *testing.T) {
+// docs/hook-surface.md section 16 measured the two to be disjoint: systemMessage is rendered to
+// the user and contributes literally nothing to the model, additionalContext is the exact
+// reverse. Sending the notice as additionalContext would make it a standing instruction nobody
+// but the model reads; sending the advice as systemMessage would tell the person to call a tool
+// they cannot call, and the model nothing.
+func TestTheNoticeGoesToThePersonAndTheAdviceToTheModel(t *testing.T) {
 	pluginData(t)
 
-	var got map[string]any
-	if err := json.Unmarshal([]byte(notice(t)), &got); err != nil {
-		t.Fatalf("the notice is not parseable JSON, so Claude Code would report a hook error "+
-			"instead of showing it: %v", err)
+	for i, wantNotice := range []bool{true, false, false} {
+		got := sessionStart(t)
+
+		msg, hasMsg := got["systemMessage"].(string)
+		if hasMsg != wantNotice {
+			t.Errorf("session %d: systemMessage present = %v, want %v — the notice is for the "+
+				"first session only", i+1, hasMsg, wantNotice)
+		}
+		if hasMsg && msg != onboardingNotice {
+			t.Errorf("session %d: systemMessage is not the first-run notice: %q", i+1, msg)
+		}
+
+		hso, _ := got["hookSpecificOutput"].(map[string]any)
+		if hso["hookEventName"] != "SessionStart" {
+			t.Errorf("session %d: hookSpecificOutput.hookEventName = %v, want SessionStart",
+				i+1, hso["hookEventName"])
+		}
+		if ctx, _ := hso["additionalContext"].(string); ctx != sessionStartAdvice {
+			t.Errorf("session %d: additionalContext is not the standing instruction, so the "+
+				"model is never told the tool exists: %q", i+1, ctx)
+		}
+
+		want := 1
+		if wantNotice {
+			want = 2
+		}
+		if len(got) != want {
+			t.Errorf("session %d: %d top-level fields, want %d: %v", i+1, len(got), want,
+				sortedKeys(boolKeys(got)))
+		}
 	}
-	if _, ok := got["systemMessage"].(string); !ok {
-		t.Errorf("the notice carries no systemMessage, which is the only field the user sees: %v", got)
+
+	if strings.Contains(sessionStartAdvice, "governor uninstall") {
+		t.Error("the standing instruction carries the notice's off switch, which is for the person")
 	}
-	if _, ok := got["hookSpecificOutput"]; ok {
-		t.Error("the notice carries hookSpecificOutput, which puts it in the model's context " +
-			"and not in front of the user (docs/hook-surface.md section 16)")
-	}
-	if len(got) != 1 {
-		t.Errorf("the notice carries %d fields, want only systemMessage: %v", len(got), sortedKeys(boolKeys(got)))
+	if strings.Contains(onboardingNotice, "request_build") {
+		t.Error("the first-run notice carries the tool's name, which is for the model")
 	}
 }
 
@@ -95,7 +141,7 @@ func TestTheNoticeGoesToThePersonAndNotToTheModel(t *testing.T) {
 // two paragraphs of what it does for them is the same as not saying it.
 func TestTheNoticeLeadsWithHowToTurnItOff(t *testing.T) {
 	pluginData(t)
-	msg := systemMessageOf(t, notice(t))
+	msg := notice(t)
 
 	first, _, _ := strings.Cut(msg, "\n")
 	if !strings.Contains(first, "governor uninstall") {
@@ -191,10 +237,9 @@ func TestSimultaneousSessionsAreToldOnceBetweenThem(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			var stdout, stderr bytes.Buffer
+			var stderr bytes.Buffer
 			<-start
-			emitFirstRunNotice(&stdout, &stderr)
-			shown[i] = stdout.String()
+			shown[i] = firstRunNotice(&stderr)
 		}()
 	}
 	close(start)
@@ -235,21 +280,15 @@ func TestOnlySessionStartShowsTheNotice(t *testing.T) {
 	if code := run([]string{"session", "start"}, &stdout, &stderr); code != 0 {
 		t.Errorf("governor session start: exit %d, want 0", code)
 	}
-	if stdout.Len() == 0 {
-		t.Error("governor session start printed no notice on a first run")
-	}
-}
-
-// systemMessageOf pulls the user-facing text out of an emitted notice.
-func systemMessageOf(t *testing.T, raw string) string {
-	t.Helper()
 	var got struct {
 		SystemMessage string `json:"systemMessage"`
 	}
-	if err := json.Unmarshal([]byte(raw), &got); err != nil {
-		t.Fatalf("parse the notice: %v (%q)", err, raw)
+	if err := json.Unmarshal(stdout.Bytes(), &got); err != nil || got.SystemMessage == "" {
+		// Checked by field, not by stdout being non-empty: the standing instruction is
+		// printed on every start, so a bare length check would pass with the notice gone.
+		t.Errorf("governor session start showed no notice on a first run: %q (err %v)",
+			stdout.String(), err)
 	}
-	return got.SystemMessage
 }
 
 // boolKeys adapts a decoded object to the set sortedKeys takes.
