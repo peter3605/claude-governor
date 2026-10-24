@@ -20,24 +20,24 @@ this project are prefixed **`GOV-`**. Connection details are in `.claude/launch-
 
 | | |
 |---|---|
-| `/next` | Pull the next unblocked story a session can actually do |
-| `/mine` | The blockers only YOU can do, longest lead time first |
-| `/start GOV-01` | Claim one, flip it to In Progress, load its Done-when and traps |
-| `/done` | Verify the acceptance criteria, tick it off, unblock what was waiting |
-| `/status` | Where this project stands |
-| `/groom <thing>` | File something you discovered mid-session |
-| `/reconcile` | Re-check open stories against the actual repo and correct the board |
+| `/lc:next` | Pull the next unblocked story a session can actually do |
+| `/lc:mine` | The blockers only YOU can do, longest lead time first |
+| `/lc:start GOV-01` | Claim one, flip it to In Progress, load its Done-when and traps |
+| `/lc:done` | Verify the acceptance criteria, tick it off, unblock what was waiting |
+| `/lc:status` | Where this project stands |
+| `/lc:groom <thing>` | File something you discovered mid-session |
+| `/lc:reconcile` | Re-check open stories against the actual repo and correct the board |
 
 ### Rules
 
 - **Bind before you build.** Substantive work should be attached to a story. If the user asks
-  for something not on the backlog, `/groom` it first, then `/start` it. One session, one story.
-- **Done means the criteria are met, not that the code is written.** `/done` re-reads the
+  for something not on the backlog, `/lc:groom` it first, then `/lc:start` it. One session, one story.
+- **Done means the criteria are met, not that the code is written.** `/lc:done` re-reads the
   story's **Done when** field and actually runs whatever verifies it. If a clause is not
   satisfied, say which one and leave the story open.
 - **Read the traps field.** **Notes and traps** holds the failure modes this design already
   anticipates. It is not decoration.
-- **Code ships through a PR.** `/done` branches as `gov-01-short-slug`, commits with the story
+- **Code ships through a PR.** `/lc:done` branches as `gov-01-short-slug`, commits with the story
   ID leading the subject, pushes, opens a PR, waits for CI, and merges once every check is
   green. A story stays `In Review` while its PR is open and unblocks nothing.
 - **CI is evaluated, not delegated.** Never `gh pr merge --auto`, never `--admin`. Zero checks

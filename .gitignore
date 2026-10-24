@@ -9,3 +9,5 @@ dist/
 .claude/.nudged
 _to_delete/
 .DS_Store
+.claude/launch-control.local.json
+.claude/_pre-plugin/
