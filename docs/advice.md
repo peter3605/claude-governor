@@ -7,10 +7,10 @@ It is written in two halves — **the method and the reading rule first, the res
 — because the question is the kind that is easy to answer by feel. `docs/dogfooding.md` is the
 same shape for the same reason, and this file inherits its discipline and one of its scars.
 
-**Status: INSTALLED 2026-09-16. WINDOW STILL NOT OPEN.** The two day-zero preconditions are now
-met — sessions are governed and the build rate is real — but the re-check found two new blockers
-and one broken query. See [The rate re-check, 2026-09-20](#the-rate-re-check-2026-09-20).
-The Results section is empty on purpose and is filled in at the end, not as it goes.
+**Status: CLOSED 2026-10-24 — CLAUSE 2 IS UNSCOREABLE ON THIS MACHINE, AND IS DROPPED.** The
+baseline window ran 2026-09-22..2026-10-23 and its own halves differ by **1.14 cores at `p99`**,
+twice the 0.56-core bar pre-registered on 2026-09-21. No after-window can clear that, so none is
+opened. Clauses 1 and 3 ship on their own merits. See [Results](#results).
 
 ---
 
@@ -438,11 +438,16 @@ opens or closes and nothing else needs to change** — `TestClause1WaitsForTheBa
 the local reminder both read exactly this, and the guard releases itself when the baseline reads
 `closed`.
 
-- **Baseline window:** open since `2026-09-22`
+- **Baseline window:** closed `2026-09-22`..`2026-10-23`
 - **After-window:** not open
 
 Permitted values are `open since <YYYY-MM-DD>`, `closed <YYYY-MM-DD>..<YYYY-MM-DD>`, and
 `not open`.
+
+**Closed: 2026-10-24, over 2026-09-22..2026-10-23, with three qualifying days rather than four,
+and the after-window will not be opened.** The halves test on the scored quantity failed by
+twice the pre-registered bar, so no after-window could be read — see [Results](#results). The
+`not open` above is final for this story, not pending.
 
 **Opened: UTC 2026-09-22.** Recorded here, before it closes, so that its start is a fact rather
 than a reconstruction. Every condition in the pre-clock checklist was met first.
@@ -483,4 +488,91 @@ the configuration that produced the 2.21x incomparability that sank the previous
 
 ## Results
 
-*Empty until both windows have closed. Filled in at the end, not as it goes.*
+**Recorded 2026-10-24. The baseline closed; the after-window was never opened, and clause 2 is
+dropped as unscoreable on this machine.** This is the outcome the story's own end states name
+for a result inside the noise floor — *"this machine cannot score this claim"*, the GOV-B03
+path — reached before an after-window instead of after one, because the baseline alone settles
+it. It is **not** a finding that the advice does not work. Nothing here measures that either way.
+
+### The baseline, as closed
+
+`go run ./tools/buildstats --since 2026-09-22 --until 2026-10-23`. The window closes on
+2026-10-23 rather than on the day it was read, so the session that closed it is not in it — the
+same reason the 2026-09-20 re-check pinned a cutoff.
+
+| | |
+|---|---|
+| Span | 2026-09-22..2026-10-23, **32 calendar days, 210.30 awake hours** |
+| Gate binary | `accf4a6`, hooks binary dated `2026-09-21T03:26:26Z` throughout — one binary, clause 2(c) held |
+| `b_max` | 4, unchanged |
+| Builds | 165: 139 granted, 10 parked, 16 denied, **0 failed-open** |
+| Test-suite runs | 128 (`go test` 75, `pytest` 52, `xcodebuild test` 1); ambiguous 0 |
+| Qualifying days | **3** — 2026-09-23, 2026-09-24, 2026-10-04. 2026-09-22 excluded (6 builds, 0.87 awake h) |
+| Clause 1 | unbuilt for the whole span, so every observation is a *before* |
+
+Per qualifying day, child cores:
+
+| day | n | p50 | p95 | **p99** | max |
+|---|---|---|---|---|---|
+| 2026-09-23 | 72,739 | 0.11 | 0.33 | **1.58** | 4.51 |
+| 2026-09-24 | 51,543 | 0.13 | 0.68 | **2.88** | 6.82 |
+| 2026-10-04 | 21,062 | 0.11 | 0.28 | **1.34** | 4.40 |
+
+### Why it closes one day short of four, and with no after-window
+
+**The halves test fails on the scored quantity, and that is decisive by this document's own
+rule.** The rule fixed in advance is that a change smaller than the gap between the baseline's
+halves is noise. On the window as it stands:
+
+| | first half (09-23) | second half (09-24..10-04) | gap |
+|---|---|---|---|
+| builds/h | 3.5 | 4.4 | 1.24x — comparable |
+| **`p99` child cores** | 1.58 | 2.72 | **1.14 cores, 53.1%** |
+| `p95` | 0.33 | 0.51 | 0.19, 44.5% |
+| `max` | 4.51 | 6.82 | 2.31, 40.7% |
+
+The 0.56-core bar was pre-registered from two days on 2026-09-21, when `p99` looked 2.2x steadier
+than the max (14.9% against 33.0%). With a real window under it, `p99` is no steadier than the
+statistics it replaced: its own halves differ by **twice the bar**, and single qualifying days
+range 1.34 to 2.88 cores. The bar was not re-chosen to fit the answer — it stands, and it is the
+reason no outcome is readable:
+
+- an after-window moving `p99` by **less than 0.56 cores** is a null result by the pre-registered rule;
+- one moving it by **more than 0.56 but less than ~1.14** is inside the baseline's own noise, so is
+  not evidence either;
+- and an effect larger than 1.14 cores on `p99` — a third of the busiest observed day's p99,
+  from one sentence of advice — is not a plausible effect size, for the reason given against the
+  max on 2026-09-21.
+
+So every reachable outcome is "cannot tell". **A fourth qualifying day does not change that.**
+It can move the halves a little either way; it cannot bring a 53% gap under a 0.56-core bar,
+and at the observed rate — three qualifying days in 32 calendar days, nothing at all gated from
+10-05 to 10-23 — it would cost weeks, followed by weeks more of after-window, to arrive at the
+same "cannot tell". This is the third metric to fail the noise floor on this machine (denials
+per hour on 09-20, the max on 09-21, `p99` now), and the document's warning at 2026-09-21 that
+the instrument may not be able to see an effect of plausible size has been borne out.
+
+**Why the halves split as they do** is visible in the table and is not a defect of the
+instrument: 2026-09-24 was a heavy multi-repo day (64 builds, 7 parks) and 2026-09-23 and
+2026-10-04 were not. The workload, not the advice, is what moves `p99` here. One developer's
+laptop does not carry enough comparable days for a sentence of advice to show through that.
+
+### What ships, and on what grounds
+
+Clause 1 ships because its mechanism is right on grounds this document does not need to
+measure: design.md §8 already established that a refusal the model was not warned about burns
+tokens learning what it could have been told, and that the tool is invisible to a session that
+does not know it exists (hook-surface.md §21.2). **It ships as a convenience, not as a proven
+saving.** Nothing in this file may be cited as evidence that it reduces load.
+
+Clause 3 — that sessions are not made worse at their job — is enforced in the wording rather
+than measured: the instruction says outright that the answer decides *when* a build or test
+runs and never *whether*, and never to skip or shrink a test run because of it. The build
+records keep being written (`trace.Build`), so a drop in test-suite runs after the advice ships
+remains visible to `tools/buildstats` to anyone who looks; this document no longer schedules
+that look.
+
+**What would make clause 2 scoreable**, recorded for whoever reopens it rather than as a plan:
+many machines rather than one, or a scripted workload replayed with and without the
+instruction, so that the comparison is between conditions rather than between weeks of one
+person's work.

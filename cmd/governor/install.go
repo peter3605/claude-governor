@@ -84,6 +84,7 @@ type paths struct {
 	hooks    string // <plugin>/hooks/hooks.json
 	mcp      string // <plugin>/.mcp.json
 	command  string // <plugin>/commands/governor.md
+	skill    string // <plugin>/skills/heavy-build/SKILL.md
 	binary   string // <plugin>/bin/governor
 	settings string // ~/.claude/settings.json
 	// link is a convenience symlink onto the user's PATH. It is only ever written when its
@@ -113,6 +114,7 @@ func resolvePaths() (paths, error) {
 		hooks:    filepath.Join(plugin, "hooks", "hooks.json"),
 		mcp:      filepath.Join(plugin, ".mcp.json"),
 		command:  filepath.Join(plugin, "commands", commandFileName),
+		skill:    filepath.Join(plugin, "skills", skillName, skillFileName),
 		binary:   filepath.Join(plugin, "bin", installedBinaryName),
 		settings: filepath.Join(home, ".claude", "settings.json"),
 		link:     filepath.Join(home, ".local", "bin", installedBinaryName),
@@ -284,6 +286,26 @@ const commandFileName = "governor.md"
 // is how the first drift survives.
 func pluginCommand() []byte { return []byte(commandMarkdown) }
 
+// skillName is the bundled skill's directory, and the second half of the name a session sees:
+// `claude-governor:heavy-build`, prefixed with the MANIFEST name rather than the directory
+// name and colon-separated (hook-surface.md section 21.2, answer 4).
+const skillName = "heavy-build"
+
+// skillFileName is fixed by Claude Code: a skill is a directory holding a SKILL.md.
+const skillFileName = "SKILL.md"
+
+// pluginSkill is skills/heavy-build/SKILL.md: the detail half of GOV-17's advice (design.md
+// section 8).
+//
+// THE DESCRIPTION IS RESIDENT AND THE BODY IS NOT, measured in hook-surface.md section 21.2,
+// and that is what decides what goes where. The body is read only after the model invokes the
+// skill — after it has already decided to build — so it carries how to act on an answer, never
+// the instruction to ask. The standing instruction is sessionStartAdvice, on SessionStart.
+//
+// A Go string mirroring a file at the repository root, for pluginCommand's reason; held equal to
+// it by TestTheShippedSkillMatchesTheRepository.
+func pluginSkill() []byte { return []byte(skillMarkdown) }
+
 // gateHookTimeout bounds the gate hook, in seconds (design.md section 4.1).
 //
 // 30 s gives the 20 s wait_max headroom. It bounds the WAIT and not the failure path — the
@@ -433,6 +455,7 @@ func runInstall(args []string, stdout, stderr io.Writer) int {
 		return 1
 	}
 	command := pluginCommand()
+	skill := pluginSkill()
 	mcp, err := pluginMCP()
 	if err != nil {
 		fmt.Fprintf(stderr, "governor install: mcp: %v\n", err)
@@ -455,6 +478,7 @@ func runInstall(args []string, stdout, stderr io.Writer) int {
 		in.planFile(p.hooks, hooks)
 		in.planFile(p.mcp, mcp)
 		in.planFile(p.command, command)
+		in.planFile(p.skill, skill)
 		in.planBinary(self)
 		in.planSettings(settingsChanged)
 		in.planLink()
@@ -475,6 +499,10 @@ func runInstall(args []string, stdout, stderr io.Writer) int {
 		return 1
 	}
 	if err := in.writeFile(p.command, command); err != nil {
+		fmt.Fprintf(stderr, "governor install: %v\n", err)
+		return 1
+	}
+	if err := in.writeFile(p.skill, skill); err != nil {
 		fmt.Fprintf(stderr, "governor install: %v\n", err)
 		return 1
 	}

@@ -117,24 +117,17 @@ did — hooks are bound when a session opens, so only restarting it will govern 
 // backstop against a wedged filesystem and nothing else.
 const firstRunNoticeBudget = hookBudget
 
-// sessionNotice is the SessionStart hook's stdout when it has something to tell the user.
-//
-// systemMessage, NOT hookSpecificOutput.additionalContext, and the difference is measured
-// rather than assumed — docs/hook-surface.md section 16. systemMessage is rendered to the
-// PERSON, as "SessionStart:startup says: <text>", and contributes literally nothing to the
-// model's context. additionalContext is the exact opposite: model only, and invisible to the
-// person. This notice is for the person, and the story's own trap is that it must not become
-// a standing instruction the model then carries for the rest of the session.
-//
-// Nothing else goes in this object. An unrecognised key is ignored rather than fatal, but a
-// hook that prints parseable JSON and then fails suppresses the error Claude Code would
-// otherwise have shown the user (section 16, D1) — so the less this hook says on stdout, the
-// less it can hide.
-type sessionNotice struct {
-	SystemMessage string `json:"systemMessage"`
-}
+// The notice reaches the person through systemMessage, NOT hookSpecificOutput.additionalContext,
+// and the difference is measured rather than assumed — docs/hook-surface.md section 16.
+// systemMessage is rendered to the PERSON, as "SessionStart:startup says: <text>", and
+// contributes literally nothing to the model's context. additionalContext is the exact
+// opposite: model only, and invisible to the person. This notice is for the person, and it must
+// not become a standing instruction the model carries for the rest of the session — the
+// standing instruction is GOV-17's, is a different text, and rides the other field
+// (sessionStartOutput in advice.go).
 
-// emitFirstRunNotice shows the notice, once, on the first session after an install.
+// firstRunNotice returns the notice if THIS session is the first after an install, and the
+// empty string otherwise.
 //
 // The claim happens before the daemon exchange rather than after it, because the notice must
 // not depend on a daemon being up: the machine a person most needs this explanation on is the
@@ -147,7 +140,7 @@ type sessionNotice struct {
 // printing first and recording afterwards — trades it for two racing sessions both printing,
 // and for a repeat every session until the write succeeds, which is the failure people
 // actually notice.
-func emitFirstRunNotice(stdout, stderr io.Writer) {
+func firstRunNotice(stderr io.Writer) string {
 	// Buffered, so the worker can never block on a send this function has stopped waiting
 	// for, and so a send that lands after the budget expired is absorbed rather than lost
 	// into a deadlock.
@@ -159,16 +152,33 @@ func emitFirstRunNotice(stdout, stderr io.Writer) {
 	})
 	select {
 	case text := <-notice:
-		// Marshalled rather than assembled, because the notice contains backticks, percent
-		// signs and newlines, and a hand-built JSON string is one edit away from being
-		// unparseable — at which point Claude Code would report a hook error instead of the
-		// message, on the first session, which is the worst possible moment.
-		line, err := json.Marshal(sessionNotice{SystemMessage: text})
-		if err != nil {
-			fmt.Fprintf(stderr, "governor session: render the first-run notice: %v\n", err)
-			return
-		}
-		fmt.Fprintf(stdout, "%s\n", line)
+		return text
 	default:
+		return ""
 	}
+}
+
+// emitSessionStart writes the SessionStart hook's stdout: the standing instruction for the
+// model on every session, and the first-run notice for the person on the first.
+//
+// The advice does not wait on anything. It is a constant, so it is emitted whether or not a
+// daemon is up — the advisory tool degrades open on its own (design.md section 8), and a session
+// that starts while the daemon is down still ought to know the tool exists for when it is back.
+func emitSessionStart(stdout, stderr io.Writer) {
+	out := sessionStartOutput{
+		SystemMessage: firstRunNotice(stderr),
+		HookSpecificOutput: sessionStartAdvise{
+			HookEventName:     "SessionStart",
+			AdditionalContext: sessionStartAdvice,
+		},
+	}
+	// Marshalled rather than assembled, because both texts contain backticks, percent signs
+	// and newlines, and a hand-built JSON string is one edit away from being unparseable — at
+	// which point Claude Code would report a hook error instead of either message.
+	line, err := json.Marshal(out)
+	if err != nil {
+		fmt.Fprintf(stderr, "governor session: render the session-start output: %v\n", err)
+		return
+	}
+	fmt.Fprintf(stdout, "%s\n", line)
 }

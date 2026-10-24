@@ -129,9 +129,10 @@ func runSession(args []string, stdout io.Writer, stderr io.Writer) int {
 	if len(args) > 0 {
 		action = args[0]
 	}
-	// The one-time notice (GOV-22) rides the SessionStart registration that already exists
-	// rather than adding a sixth hook, because a second registration on the same event is a
-	// second thing to install, to diagnose and to remove for one paragraph of text.
+	// The one-time notice (GOV-22) and the standing instruction (GOV-17) ride the SessionStart
+	// registration that already exists rather than adding a hook, because a second
+	// registration on the same event is a second thing to install, to diagnose and to remove
+	// for a paragraph of text.
 	//
 	// It is gated on the explicit argument and not on the payload's hook_event_name, unlike
 	// buildSession's fallback below. The two disagree on purpose: guessing the action wrong
@@ -140,7 +141,7 @@ func runSession(args []string, stdout io.Writer, stderr io.Writer) int {
 	// are not the same, and reading stdin here would consume the payload the hook still
 	// needs. install always writes the argument, and doctor checks that it did.
 	if action == "start" {
-		emitFirstRunNotice(stdout, stderr)
+		emitSessionStart(stdout, stderr)
 	}
 	return lifecycleHook(os.Stdin, stderr, transport.Dial{}, hookBudget, buildSession(action))
 }

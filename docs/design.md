@@ -1629,12 +1629,19 @@ prefixed with the **manifest `name`** rather than the directory name, which is a
 from the MCP tool's underscores above (§21.2, answer 4). Neither name can be composed from the
 other; both are measured.
 
-These three are **not** part of GOV-16 and have not shipped. Until they do, the tool is
-available to a session that looks for it and invisible to one that does not, so the success
-metric below cannot yet be read as a measure of whether the advice works.
+**All three shipped with GOV-17** — `sessionStartAdvice` in `cmd/governor/advice.go`, and
+`skills/heavy-build/SKILL.md` written by install from `pluginSkill`. The instruction says what
+*not* to ask about as plainly as what to ask about, makes "unsure" resolve to not asking (the
+gate is underneath either way), and says the answer decides **when** a build or test runs and
+never **whether** — the counter-metric below, written into the advice itself.
 
-Success metric: denials per hour, before and after Phase 3. If advice is landing, denials
-approach zero without the budget changing.
+**They ship as a convenience, not as a proven saving.** The success metric this section
+proposed — denials per hour falling with the budget unchanged — was measured and could not be
+scored on this machine: denials, the peak and finally `p99` child cores each failed the
+pre-registered halves test, the last by twice its bar over a 32-day baseline. GOV-17 closed
+clause 2 as unscoreable on 2026-10-24 rather than run an after-window that could only say
+"cannot tell"; [advice.md](advice.md) carries the figures. Nothing here is evidence that the
+advice lowers load, and nothing here is evidence that it does not.
 
 **And a counter-metric, which is not optional.** Denials per hour falls to zero if sessions
 stop building at all, and that is a worse machine, not a better one — the metric above would
@@ -1674,14 +1681,14 @@ claude-governor/                  the repo
 │   ├── lease/                    table, TTL, Liveness interface (PID+starttime in v1)
 │   ├── signals/                  Sampler interface; sampler_darwin.go, sampler_linux.go
 │   └── config/                   versioned schema, migration, atomic write
-├── skills/heavy-build/SKILL.md   NOT YET SHIPPED — GOV-17 clause 1 (sections 8, 21.2)
+├── skills/heavy-build/SKILL.md   the advice's detail (sections 8, 21.2) — GOV-17 clause 1
 └── commands/governor.md          status | limit N | pause | resume | boost (section 9.1)
 
 ~/.claude/skills/claude-governor/ the installed plugin, written by `governor install`
 ├── .claude-plugin/plugin.json    name, version, description
 ├── hooks/hooks.json              the six hooks in section 4.1
 ├── .mcp.json                     the advisory server in section 8
-├── skills/heavy-build/SKILL.md   NOT YET SHIPPED — see below
+├── skills/heavy-build/SKILL.md   the bundled skill (section 8)
 ├── commands/governor.md          the slash command (section 9.1)
 └── bin/governor                  the binary those hooks run
 
@@ -1691,12 +1698,11 @@ state  → ~/.claude/governor/      sock, daemon.pid, daemon.log, daemon.start, 
 config → ${CLAUDE_PLUGIN_DATA}/config.json, falling back to the state directory
 ```
 
-**The installed tree is FIVE files today, not six.** `skills/heavy-build/SKILL.md` is marked above
-because §21.2 says so in prose — "these three are not part of GOV-16 and have not shipped" — and
-the diagrams did not, which is the same drift §13.3 had to correct on 2026-09-23. Verify rather
-than trust either picture: the installed tree is `.claude-plugin/plugin.json`, `hooks/hooks.json`,
-`.mcp.json`, `commands/governor.md` and `bin/governor`, and there is no reference to `heavy-build`
-anywhere in the Go source. GOV-35 asserts this list against a real install in a clean container,
+**The installed tree is SIX files**: `.claude-plugin/plugin.json`, `hooks/hooks.json`, `.mcp.json`,
+`commands/governor.md`, `skills/heavy-build/SKILL.md` and `bin/governor`. It was five until GOV-17
+shipped the skill on 2026-10-24, and until then this section carried a `NOT YET SHIPPED` marker
+on that line, because a layout diagram had already once drifted ahead of the code (§13.3,
+2026-09-23). GOV-35 asserts this list against a real install in a clean container,
 which is what stops a layout diagram from being the only thing that knows.
 
 **That assertion is `scripts/clean-install-test.sh`, run by CI on every push** against
@@ -1704,7 +1710,7 @@ which is what stops a layout diagram from being the only thing that knows.
 artefacts from the working tree and serves them over TLS through `install.sh`'s own
 `GOVERNOR_BASE_URL`, so what is installed is the commit under test rather than the last release,
 and `curl --proto '=https'` is never relaxed to make a test pass. In the container it asserts
-the five installed paths, that no `skills/` directory appears, that `doctor` reports a named set
+the six installed paths, that `skills/` holds nothing but the one skill, that `doctor` reports a named set
 of `ok` checks and **exactly** `sessions` and `spawn` as unverified, that a reinstall over a
 running daemon does not kill it (§13.4), and that `uninstall` leaves `$HOME` byte-identical.
 
@@ -2366,6 +2372,7 @@ Uninstall is only verifiable if this list is exhaustive, so it is normative.
 | `~/.claude/skills/claude-governor/hooks/hooks.json` (the six hooks) | install | uninstall |
 | `~/.claude/skills/claude-governor/.mcp.json` (the advisory server, section 8) | install | uninstall |
 | `~/.claude/skills/claude-governor/commands/governor.md` (the slash command, section 9.1) | install | uninstall |
+| `~/.claude/skills/claude-governor/skills/heavy-build/SKILL.md` (the advice's detail, section 8) | install | uninstall |
 | `~/.claude/skills/claude-governor/bin/governor` | install, copied from the running binary | uninstall |
 | `~/.claude/skills/` | install, only if absent | uninstall, only if it empties |
 | `~/.claude/settings.json` (`statusLine` key only) | install, merged | uninstall, previous value restored from backup |
@@ -2384,19 +2391,13 @@ Uninstall is only verifiable if this list is exhaustive, so it is normative.
 | `~/.claude/governor/` | daemon (`transport.Listen`) | uninstall, only once it is empty; `--purge` regardless |
 | `~/.claude/plugins/data/claude-governor-skills-dir/` (`${CLAUDE_PLUGIN_DATA}`: config, onboarding marker) | Claude Code creates it; the governor writes config.json and `onboarded` | uninstall `--purge` only |
 
-**One row was removed from this table on 2026-09-23, and the reason is worth keeping.** It read
-`skills/heavy-build/SKILL.md` (the advice, section 8), written by install and removed by
-uninstall. **Nothing writes it** — there is no reference to `heavy-build` in any Go source and
-the installed tree is five files. It was left over from planning GOV-17's clause 1, which will
-ship a skill. A phantom row is the mirror image of the omission this table exists to prevent: it
-cannot leave residue behind, but it makes the list unusable as the oracle a clean-machine
-uninstall proof (GOV-35) has to check against, and this table calls itself exhaustive.
-
-**When clause 1 does ship its skill, the row comes back in the same change.** That is this
-document's standing rule for every path, and it is now also enforced: the skill would be a Go
-string constant like `pluginMCP` and `pluginCommand`, and
-`TestClause1WaitsForTheBaselineWindow` fails on a non-test source that names a `SKILL.md` while
-the baseline window is open.
+**The skill's row was removed on 2026-09-23 and restored on 2026-10-24, and both halves are
+worth keeping.** It was removed because nothing wrote it — left over from planning GOV-17's
+clause 1 — and a phantom row makes this table unusable as the oracle a clean-machine uninstall
+proof (GOV-35) checks against, exactly as an omission does. It came back in the same change
+that made install write the file, which is this document's standing rule for every path.
+`TestSectionThirteenThreeNamesTheSkill` now holds the row to the installer, and
+`scripts/clean-install-in-container.sh` asserts it against a real install.
 
 Four rows carry a condition, and each condition is the difference between "removes everything
 it added" and "removes things it did not":
