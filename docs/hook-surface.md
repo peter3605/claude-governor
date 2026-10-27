@@ -2078,3 +2078,142 @@ looks exactly like an answer.
 - **`argument-hint` and `description`** are carried in the probe's frontmatter throughout and
   neither was read back; only `allowed-tools` was tested for effect.
 - **Linux**, as everywhere else in this file.
+
+---
+
+## 23. The marketplace route, and the rename it forced — measured on 2.1.310 and 2.1.312
+
+GOV-19, 2026-10-24 to 2026-10-27. Host macOS (Darwin 25.4.0), arm64. Every probe ran under an
+**isolated HOME** inside the session scratchpad, so nothing was read from or written to the
+real `~/.claude` — except §23.6, which loaded a plugin for one headless run with
+`--plugin-dir` and registered nothing.
+
+**SessionStart fires without a login.** Under an isolated HOME `claude -p` prints
+`Not logged in · Please run /login` and exits 1, and a plugin's SessionStart hook has
+**already run** by then. That is what made §23.1–23.4 measurable without touching the real
+account: the probe hook appended `$CLAUDE_PLUGIN_ROOT` and `$CLAUDE_PLUGIN_DATA` to a log.
+
+### 23.1 One manifest name, two routes: the marketplace copy wins, and only it loads
+
+A probe plugin `gov-dup` was placed in `~/.claude/skills/gov-dup/` AND installed from a
+local-path marketplace `gov-dup-mkt`. `claude plugin list`, verbatim:
+
+```
+  ❯ gov-dup@gov-dup-mkt
+    Status: ✔ enabled
+
+Skills-directory plugins (.claude/skills/*):
+
+  ❯ gov-dup@skills-dir: ✘ Not loaded — the name "gov-dup" is already taken by an installed
+    plugin (gov-dup@gov-dup-mkt), which takes precedence. Give the plugin at
+    ~/.claude/skills/gov-dup a different "name" (in plugin.json or SKILL.md frontmatter) to load
+    this copy.
+```
+
+One session start, one hook line — the marketplace copy's. **Two routes cannot double-register
+the hooks when the manifest names agree.** The documentation states the same precedence
+(managed > `--plugin-dir` > installed marketplace > skills-dir > claude.ai synced).
+
+The converse is the trap: **precedence is keyed on the manifest name**, so two plugins with
+DIFFERENT names both load. §23.6 shows it happening.
+
+### 23.2 A marketplace plugin's files come from git, so it carries no binary
+
+A path/github/git source copies the plugin directory. `bin/governor` is a build artefact and is
+in no repository, so a marketplace copy of the governor's tree would load hooks pointing at
+`${CLAUDE_PLUGIN_ROOT}/bin/governor` — which does not exist in it — and by §23.1 it would take
+the hooks away from the skills-dir install that does have one.
+
+### 23.3 A `command` source: re-run every session, refused inside a session
+
+`{"source":"command","command":"<cmd>","mode":"link"}` runs `<cmd>` on the installing machine;
+it must print one absolute directory and exit 0.
+
+- **It cannot be accepted from inside a Claude Code session.** Both `-y` and
+  `--accept-command <sha256>` print `… is ignored inside a Claude Code session: run this in your
+  own terminal to accept the command shown above.` A person accepts it, once, in a terminal
+  (`claude plugin install <id> --accept-command <sha256>`, the hash coming from a `--json` run).
+- **It re-runs on every session start**, not only at install: 1 call at install, then exactly
+  1 per session across 3 sessions (4 in total). Whatever it runs is on the session-start path.
+- The installed version gets a content-hash suffix: `0.0.1` became `0.0.1-d71372ee0116`.
+
+### 23.4 What link mode actually builds
+
+`${CLAUDE_PLUGIN_ROOT}` is **not** the printed directory. It is
+`~/.claude/plugins/cache/<marketplace>/<plugin>/<version>-<hash>/`, a real directory whose
+top-level entries are symlinks into the printed one:
+
+```
+.claude-plugin -> <printed dir>/.claude-plugin
+hooks          -> <printed dir>/hooks
+.claude-plugin-link
+.in_use/
+```
+
+`hooks/hooks.json` read through the cache has the same inode as the original, so
+`${CLAUDE_PLUGIN_ROOT}/bin/governor` resolves to the one binary. `installed_plugins.json`
+records the printed directory as `sourceProducerPath`. `${CLAUDE_PLUGIN_DATA}` is
+`~/.claude/plugins/data/<plugin>-<marketplace>` — named after the route, so it differs from the
+skills-dir route's `<plugin>-skills-dir`.
+
+Uninstalling a marketplace plugin leaves its cache directory behind with an `.orphaned_at`
+marker. That is Claude Code's file, in Claude Code's cache.
+
+### 23.5 The `claude-` prefix is reserved
+
+`claude plugin validate --strict` on a marketplace whose plugin entry was named
+`claude-governor`, verbatim:
+
+```
+✘ plugins[0].name: Plugin name "claude-governor" is reserved: it passes as one of Anthropic's
+  own. A third party's plugin name cannot start with "claude-", "anthropic-", "anthropics-", or
+  "cc-plugin-", be "claude", "anthropic", "anthropics", "claude-code", or "claude-mods", or put
+  "official" beside "claude" or "anthropic". Name it for what it does.
+```
+
+The **marketplace** name `claude-governor` validated cleanly; only the plugin name is reserved.
+The plugin was renamed `build-governor`. The skills-dir route had loaded `claude-governor` for
+weeks without complaint — the rule is applied by the validator, which is what a published
+marketplace is checked against.
+
+### 23.6 The renamed plugin's real names, and the double load, seen directly — 2.1.312
+
+`governor install --no-daemon` under an isolated HOME generated the real tree; one logged-in
+headless run (`claude -p … --plugin-dir <that tree> --output-format stream-json --verbose`,
+$0.11) loaded it beside the real machine's installed `claude-governor`. From the `init` event:
+
+```
+tools:    mcp__plugin_build-governor_governor__governor__request_build
+          mcp__plugin_claude-governor_governor__governor__request_build
+mcp:      plugin:build-governor:governor   connected
+          plugin:claude-governor:governor  connected
+skills:   build-governor:heavy-build
+commands: build-governor:governor, claude-governor:governor
+```
+
+So §20.5's rule holds under the new name — `mcp__plugin_<plugin>_<server>__<tool>` — and the
+strings the standing advice, the skill and doctor's fix text now use are the measured ones.
+
+**And the two names loaded together**, two MCP servers and two of everything: exactly the
+double registration §23.1 says a name mismatch produces. `governor install` therefore removes
+an old `~/.claude/skills/claude-governor/` tree (only when its manifest says `claude-governor`
+and it holds a governor binary), `uninstall` removes it too, and `doctor` fails while the gate
+is registered in more than one file.
+
+### 23.7 Consequences folded into design.md
+
+- §9 and §13.3: the plugin is `build-governor`; every installed path moves under
+  `~/.claude/skills/build-governor/`; the data directory rows name all three spellings.
+- §13.2: `governor plugin-path` and the marketplace route.
+- The marketplace entry is a command source running `governor plugin-path` in link mode. It
+  stats two files and prints the tree, so the per-session cost of §23.3 is one exec of the Go
+  binary.
+
+### 23.8 Still unmeasured
+
+- **Where a command source's stderr goes**, and what a session shows when the command exits
+  non-zero (`plugin-path` does that before `governor install` has run). Assumed to be "plugin
+  not loaded"; not observed.
+- **A `github`-hosted marketplace.** Every probe used a local-path marketplace; a GitHub source
+  is the route a stranger takes, and it needs the repository public.
+- **The command source on Linux.**

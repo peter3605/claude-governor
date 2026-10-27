@@ -1,0 +1,21 @@
+{
+  "name": "claude-governor",
+  "owner": {
+    "name": "Peter Ho",
+    "url": "https://github.com/peter3605"
+  },
+  "description": "A jobserver for Claude Code subagents: one machine-wide budget for builds and agents, from live load and thermal state.",
+  "plugins": [
+    {
+      "name": "build-governor",
+      "description": "Budgets subagent and build concurrency across every Claude Code session on this machine. Needs the governor binary first: brew install peter3605/claude-governor/governor && governor install.",
+      "source": {
+        "source": "command",
+        "command": "governor plugin-path",
+        "mode": "link"
+      },
+      "homepage": "https://github.com/peter3605/claude-governor",
+      "license": "MIT"
+    }
+  ]
+}

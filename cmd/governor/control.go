@@ -13,7 +13,7 @@ import (
 
 // The client half of the manual overrides (design.md section 9.1, GOV-B01).
 //
-// These are what `/claude-governor:governor` actually runs. They are ordinary subcommands
+// These are what `/build-governor:governor` actually runs. They are ordinary subcommands
 // rather than anything the slash command owns, so that the override is equally available from
 // a script, from a second terminal, and to somebody debugging a machine whose sessions are all
 // wedged — which is exactly when a person most wants to say "stop capping me".

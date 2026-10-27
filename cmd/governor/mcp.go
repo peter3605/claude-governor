@@ -64,7 +64,7 @@ var adviseBudget = 250 * time.Millisecond
 
 // toolName is the tool as this server advertises it.
 //
-// A session sees it as `mcp__plugin_claude-governor_governor__governor__request_build`.
+// A session sees it as `mcp__plugin_build-governor_governor__governor__request_build`.
 // Claude Code PREFIXES `mcp__plugin_<plugin>_<server>__` onto this name rather than replacing
 // it, so `governor` lands in the string three times — measured in hook-surface.md section
 // 20.5, after the obvious guess turned out to be wrong and cost a probe run. Anything that

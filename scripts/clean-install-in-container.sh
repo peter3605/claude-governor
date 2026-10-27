@@ -53,7 +53,7 @@ sh /work/install.sh || fail "install.sh exited non-zero."
 
 # 13.3 is normative and GOV-35 asserts it against a real install. SIX files: GOV-17 clause 1
 # added skills/heavy-build/SKILL.md, after its measurement window was closed in docs/advice.md.
-plugin="$HOME/.claude/skills/claude-governor"
+plugin="$HOME/.claude/skills/build-governor"
 for f in \
 	"$plugin/.claude-plugin/plugin.json" \
 	"$plugin/hooks/hooks.json" \

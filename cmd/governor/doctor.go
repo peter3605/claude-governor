@@ -995,7 +995,7 @@ type hookSource struct {
 	pluginRoot string
 }
 
-// hookSources are the two places a governor hook can be registered.
+// hookSources are the places a governor hook can be registered.
 //
 // All three are named by design.md section 13.3. GOV-21 settled where install writes — the
 // plugin's own hooks/hooks.json under ~/.claude/skills — and the settings file is still read
@@ -1020,11 +1020,16 @@ func hookSources() ([]hookSource, error) {
 	// installed by an earlier build has hooks sitting in it, and a doctor that could not see
 	// them would report "not registered" for a file it is looking straight at, which is
 	// worse than the original mistake.
-	legacyRoot := filepath.Join(home, ".claude", "plugins", pluginName)
+	// It was only ever written under the plugin's old name, so it is spelled with that one.
+	legacyRoot := filepath.Join(home, ".claude", "plugins", legacyPluginName)
+	// The tree an install from before the rename left (marketplace.go). Read so that a
+	// machine still carrying it is seen to register every hook twice.
+	renamedRoot := legacyPluginTree(home)
 	return []hookSource{
 		{path: settings},
 		{path: filepath.Join(pluginRoot, "hooks", "hooks.json"), pluginRoot: pluginRoot},
 		{path: filepath.Join(legacyRoot, "hooks", "hooks.json"), pluginRoot: legacyRoot},
+		{path: filepath.Join(renamedRoot, "hooks", "hooks.json"), pluginRoot: renamedRoot},
 	}, nil
 }
 
@@ -1159,8 +1164,22 @@ func (d *diagnosis) checkHooks() {
 			len(missing), len(wantedHooks), short(settings), strings.Join(missing, ", ")))
 	}
 	problems = append(problems, broken...)
+	// The gate in more than one file is not redundancy. Each loaded registration runs, so
+	// every spawn takes one lease per copy and the budget fills at a fraction of its size.
+	// The usual cause is the tree left from before the rename, which install removes.
+	if gates := d.gateFiles(); len(gates) > 1 {
+		problems = append(problems, fmt.Sprintf("the gate is registered in %d places (%s), so every spawn takes %d leases",
+			len(gates), shortList(gates), len(gates)))
+	}
 	if len(problems) > 0 {
 		d.add("hooks", fail, strings.Join(problems, "; "), "governor install")
+		return
+	}
+	// Every file above can be right and none of it loaded. A marketplace plugin of the same
+	// name takes precedence over the skills-dir tree (hook-surface.md section 23), so a copy
+	// that is not a link to this tree would hold the hooks instead — and it carries no binary.
+	if foreign, fix := foreignCopies(sources[1].pluginRoot); foreign != "" {
+		d.add("hooks", fail, foreign, fix)
 		return
 	}
 	d.add("hooks", pass,
@@ -1188,6 +1207,19 @@ func (d *diagnosis) misregistered(w wantedHook) string {
 		}
 	}
 	return ""
+}
+
+// gateFiles is every file that registers the PreToolUse gate, in the order they were read.
+func (d *diagnosis) gateFiles() []string {
+	var files []string
+	seen := map[string]bool{}
+	for _, h := range d.hooks {
+		if h.event == "PreToolUse" && h.args == "gate" && !seen[h.source] {
+			seen[h.source] = true
+			files = append(files, h.source)
+		}
+	}
+	return files
 }
 
 // findHook returns the registration for one wanted hook, or nil.
@@ -1789,7 +1821,7 @@ func (d *diagnosis) checkBudget() {
 			detail += " until " + r.PinnedUntil
 		}
 		d.add("budget", warn, detail,
-			"let it expire, or lift it now: claude-governor:governor resume")
+			"let it expire, or lift it now: build-governor:governor resume")
 
 	case r.Cut != "" && r.Ceiling > r.Budget:
 		// The case the clause is about. Name the number, name the signal — the same
@@ -1798,7 +1830,7 @@ func (d *diagnosis) checkBudget() {
 			fmt.Sprintf("%d of a possible %d slots: the budget is cut by %s",
 				r.Budget, r.Ceiling, r.Cut),
 			"nothing to fix — it climbs back as the machine quietens; to override it now: "+
-				"claude-governor:governor limit N")
+				"build-governor:governor limit N")
 
 	case r.Ceiling > r.Budget:
 		// Below the ceiling with nothing claiming responsibility. The controller sets its cut

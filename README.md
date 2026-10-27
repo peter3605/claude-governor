@@ -33,7 +33,7 @@ curl -fsSL https://raw.githubusercontent.com/peter3605/claude-governor/main/inst
 ```
 
 That fetches the binary for this OS and architecture and hands off to `governor install`,
-which writes a plugin to `~/.claude/skills/claude-governor/`, merges a `statusLine` key into
+which writes a plugin to `~/.claude/skills/build-governor/`, merges a `statusLine` key into
 `~/.claude/settings.json` after backing it up, and starts the daemon. It prints every path it
 touched. **Claude Code binds hooks when a session starts, so every session you already have
 open stays ungoverned until you restart it** — install counts them and names them, and
@@ -71,7 +71,7 @@ governor uninstall    # remove all of it
 ```
 
 **When you already know a heavy build is coming, say so** rather than waiting for the loop to
-be hurt by it and work it out. From inside a session that is `/claude-governor:governor`; from
+be hurt by it and work it out. From inside a session that is `/build-governor:governor`; from
 a terminal it is the same four verbs:
 
 ```sh

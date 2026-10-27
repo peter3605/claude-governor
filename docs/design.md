@@ -1250,7 +1250,7 @@ boost is the only thing that should ever move a session's weight", which GOV-B01
 contradict to ship `boost` at all. What it was guarding is worth keeping and is narrower than
 what it said: there must be exactly one *mechanism*, `Session.Weight` as read by
 `shareLocked`, and no second scheme layered beside it. Triggers may be plural.
-`/claude-governor:governor boost` (GOV-B01) sets a weight because a person said so; GOV-B02's
+`/build-governor:governor boost` (GOV-B01) sets a weight because a person said so; GOV-B02's
 focus boost would have set the same field because the window came forward. Neither is a second
 mechanism.
 
@@ -1603,7 +1603,7 @@ that it is started at session start whether or not it is ever called
 a call.
 
 The name a session actually sees is
-`mcp__plugin_claude-governor_governor__governor__request_build` — Claude Code prefixes
+`mcp__plugin_build-governor_governor__governor__request_build` — Claude Code prefixes
 `mcp__plugin_<plugin>_<server>__` onto the tool's own name rather than replacing it, so
 `governor` appears three times. That is measured, not composed (hook-surface.md §20.5); the
 obvious guess is wrong and produces a permission denial that reads like a broken server.
@@ -1624,7 +1624,7 @@ disclosure directly: a marker in the frontmatter description was in context with
 available, and a marker in the body was invisible until the model invoked the skill. A model
 that has to invoke a skill to learn it should have asked has already run the build.
 
-The skill's name as a session sees it is `claude-governor:heavy-build` — colon-separated, and
+The skill's name as a session sees it is `build-governor:heavy-build` — colon-separated, and
 prefixed with the **manifest `name`** rather than the directory name, which is a different rule
 from the MCP tool's underscores above (§21.2, answer 4). Neither name can be composed from the
 other; both are measured.
@@ -1684,7 +1684,7 @@ claude-governor/                  the repo
 ├── skills/heavy-build/SKILL.md   the advice's detail (sections 8, 21.2) — GOV-17 clause 1
 └── commands/governor.md          status | limit N | pause | resume | boost (section 9.1)
 
-~/.claude/skills/claude-governor/ the installed plugin, written by `governor install`
+~/.claude/skills/build-governor/ the installed plugin, written by `governor install`
 ├── .claude-plugin/plugin.json    name, version, description
 ├── hooks/hooks.json              the six hooks in section 4.1
 ├── .mcp.json                     the advisory server in section 8
@@ -1855,11 +1855,11 @@ one-directional check would have passed.
 
 ### 9.1 The slash command
 
-`/claude-governor:governor` is the manual override, and design.md carried it for a long time
+`/build-governor:governor` is the manual override, and design.md carried it for a long time
 as `/governor status | limit N | pause | boost` without anything having been measured. GOV-B01
 measured it ([hook-surface.md](hook-surface.md) §22) and three of those words were wrong.
 
-**The name is `/claude-governor:governor`.** A plugin command is advertised as `<manifest
+**The name is `/build-governor:governor`.** A plugin command is advertised as `<manifest
 name>:<file basename>`, so the bare `/governor` this document illustrated for months is not a
 name that exists. It is not a choice — shortening it means renaming the plugin, which moves the
 installed path, `${CLAUDE_PLUGIN_DATA}` and every §13.3 row for a cosmetic win.
@@ -2238,6 +2238,7 @@ being asked of them is to run a hook on every subagent spawn.
 | `install.sh` | curl-able bootstrap: detect OS/arch, fetch the matching binary, hand off to `governor install` |
 | `governor install` | write the plugin (manifest, hooks, binary), merge the statusline into settings (after backup), start the daemon, print exactly what it touched, then run `doctor` and exit non-zero if it fails |
 | `governor uninstall` | reverse all of it, restore the settings backup, stop the daemon, remove state on `--purge` |
+| `governor plugin-path` | print the installed plugin tree and exit 0, or exit non-zero with nothing on stdout when there is none. It is what the marketplace entry runs (below); it stats two files and does nothing else, because Claude Code runs it on every session start |
 | `governor doctor` | daemon reachable? hooks registered? matcher matches the real tool name? **are the sessions running right now actually governed?** binary and plugin versions agree? config schema current? each failure names its fix |
 | `governor calibrate` | measure cores, performance cores, RAM, this host's ambient run queue and a short load probe; write the run-queue cut threshold and B_max for *this* machine, with a provenance note |
 | `governor version` | binary version, protocol version, config schema version |
@@ -2362,18 +2363,53 @@ under a session with **no** PID has neither available to it and holds its slot f
 TTL, half an hour for a confirmed one. That is what a full budget on an idle machine actually
 looks like, and the status line reports it as `4/4 slots` either way.
 
+### 13.2a The marketplace route, and why the plugin is `build-governor`
+
+Measured in [hook-surface.md](hook-surface.md) §23; this is what follows from it.
+
+**One tree, two registrations.** `governor install` is the only writer of the plugin. The
+marketplace entry in `.claude-plugin/marketplace.json` is a `command` source running `governor
+plugin-path` in link mode, so a marketplace install loads the very tree install wrote, through a
+cache directory of symlinks into it, and runs the one binary. A copy source could not work: a
+marketplace plugin's files come from git and `bin/governor` is in no repository. Homebrew
+supplies the binary on `PATH` for that command; `install.sh` does the same through
+`~/.local/bin`. The marketplace route is therefore `brew install` then `governor install` then
+`claude plugin install build-governor@claude-governor`, with the last step accepted by a person
+in their own terminal — Claude Code refuses to accept a command source from inside a session.
+
+**Both registrations cannot double-load, and that rests on one name.** Claude Code loads one
+plugin per manifest name: the marketplace copy takes precedence and the skills-dir copy is
+listed "Not loaded". Because both point at the same files, the shadowed row is cosmetic. A
+marketplace copy that is NOT a link to this tree would take the hooks away from it, so `doctor`
+fails the hooks check on any `build-governor@<marketplace>` whose `sourceProducerPath` is not the
+installed tree, and names the `claude plugin uninstall` that removes it.
+
+**The rename.** Claude Code reserves the `claude-` prefix for plugin names (§23.5), so the plugin
+is `build-governor`. The repository, the binary, the project and the marketplace keep their
+names. Because precedence is keyed on the name, a machine still carrying
+`~/.claude/skills/claude-governor/` would load both plugins — §23.6 saw it happen — so install
+removes that tree, uninstall removes it, and `doctor` fails while the gate is registered in more
+than one file. The old tree is removed only when it is provably ours: its manifest says
+`claude-governor` and it holds a governor binary.
+
+**The marketplace registration is not ours to remove.** It lives in Claude Code's own files
+(`installed_plugins.json`, `settings.json`'s `enabledPlugins` and `extraKnownMarketplaces`, the
+plugin cache). `governor uninstall` names it and the command that removes it rather than
+editing those files, and the byte-identical uninstall guarantee is stated for the `install.sh`
+route. Left behind, the registration is inert: `plugin-path` finds no tree and exits non-zero.
+
 ### 13.3 What touches the user's machine
 
 Uninstall is only verifiable if this list is exhaustive, so it is normative.
 
 | Path | Written by | Removed by |
 |---|---|---|
-| `~/.claude/skills/claude-governor/.claude-plugin/plugin.json` | install | uninstall |
-| `~/.claude/skills/claude-governor/hooks/hooks.json` (the six hooks) | install | uninstall |
-| `~/.claude/skills/claude-governor/.mcp.json` (the advisory server, section 8) | install | uninstall |
-| `~/.claude/skills/claude-governor/commands/governor.md` (the slash command, section 9.1) | install | uninstall |
-| `~/.claude/skills/claude-governor/skills/heavy-build/SKILL.md` (the advice's detail, section 8) | install | uninstall |
-| `~/.claude/skills/claude-governor/bin/governor` | install, copied from the running binary | uninstall |
+| `~/.claude/skills/build-governor/.claude-plugin/plugin.json` | install | uninstall |
+| `~/.claude/skills/build-governor/hooks/hooks.json` (the six hooks) | install | uninstall |
+| `~/.claude/skills/build-governor/.mcp.json` (the advisory server, section 8) | install | uninstall |
+| `~/.claude/skills/build-governor/commands/governor.md` (the slash command, section 9.1) | install | uninstall |
+| `~/.claude/skills/build-governor/skills/heavy-build/SKILL.md` (the advice's detail, section 8) | install | uninstall |
+| `~/.claude/skills/build-governor/bin/governor` | install, copied from the running binary | uninstall |
 | `~/.claude/skills/` | install, only if absent | uninstall, only if it empties |
 | `~/.claude/settings.json` (`statusLine` key only) | install, merged | uninstall, previous value restored from backup |
 | `~/.claude/settings.json.governor-backup-<ts>` | install, only when a settings file existed | uninstall, unless `--keep-backup` |
@@ -2389,7 +2425,10 @@ Uninstall is only verifiable if this list is exhaustive, so it is normative.
 | `~/.claude/governor/surface.json.tmp` | daemon, staging the file above before the rename | uninstall |
 | `~/.claude/governor/config.json` | `calibrate`, **only** when `${CLAUDE_PLUGIN_DATA}` is unset — see below | uninstall |
 | `~/.claude/governor/` | daemon (`transport.Listen`) | uninstall, only once it is empty; `--purge` regardless |
-| `~/.claude/plugins/data/claude-governor-skills-dir/` (`${CLAUDE_PLUGIN_DATA}`: config, onboarding marker) | Claude Code creates it; the governor writes config.json and `onboarded` | uninstall `--purge` only |
+| `~/.claude/plugins/data/build-governor-skills-dir/` (`${CLAUDE_PLUGIN_DATA}`: config, onboarding marker) | Claude Code creates it; the governor writes config.json and `onboarded` | uninstall `--purge` only |
+| `~/.claude/plugins/data/build-governor-claude-governor/` (`${CLAUDE_PLUGIN_DATA}` when the plugin loaded through the marketplace entry) | Claude Code creates it; the governor writes the same two files | uninstall `--purge` only |
+| `~/.claude/plugins/data/claude-governor-skills-dir/` (`${CLAUDE_PLUGIN_DATA}` under the plugin's name before the rename) | an install from before GOV-19 | uninstall `--purge` only |
+| `~/.claude/skills/claude-governor/` (the whole tree an install from before the rename wrote) | an install from before GOV-19 | **install**, and uninstall — only when its manifest is named `claude-governor` and it holds a governor binary |
 
 **The skill's row was removed on 2026-09-23 and restored on 2026-10-24, and both halves are
 worth keeping.** It was removed because nothing wrote it — left over from planning GOV-17's
@@ -2433,7 +2472,7 @@ it added" and "removes things it did not":
 - **`samples.jsonl` survives a plain uninstall**, per the Phase 0 table below. It is the
   measurement the setpoint is derived from and it is not reconstructable.
 - **GOV-B13's staleness check adds no row.** `doctor` now digests
-  `~/.claude/skills/claude-governor/bin/governor` and the binary running the check, and
+  `~/.claude/skills/build-governor/bin/governor` and the binary running the check, and
   writes neither — no cache, no stamp, no recorded digest. The row above is unchanged and
   uninstall has nothing further to remove. It is stated rather than left silent because this
   table is what makes uninstall verifiable: "a check was added and this list did not change"

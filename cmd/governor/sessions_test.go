@@ -483,7 +483,7 @@ func TestDoctorDoesNotTellYouToRestartWhenNothingIsInstalled(t *testing.T) {
 func TestHookInstallTimeIgnoresUnrelatedSettingsEdits(t *testing.T) {
 	w := newWorld(t)
 	bin := selfBinary(t)
-	pluginHooks := filepath.Join(w.home, ".claude", "skills", "claude-governor", "hooks", "hooks.json")
+	pluginHooks := filepath.Join(w.home, ".claude", "skills", "build-governor", "hooks", "hooks.json")
 	w.writeHooks(pluginHooks, bin, goodHooks())
 
 	old := time.Now().Add(-48 * time.Hour)
