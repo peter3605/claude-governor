@@ -73,7 +73,59 @@ jobs:
           chmod +x governor-*
           sha256sum governor-* > checksums.txt
           cat checksums.txt
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26'
+      - name: homebrew formula
+        # Generated from THIS release's checksums.txt (tools/brewformula), so the tap's version
+        # and digests cannot drift from the artefacts beside them. The tap repository carries a
+        # copy of this file; clean-macos below installs it before anyone else does.
+        run: go run ./tools/brewformula -version "${GITHUB_REF_NAME#v}" -checksums dist/checksums.txt > dist/governor.rb
       - uses: softprops/action-gh-release@v2
         with:
           files: dist/*
           generate_release_notes: true
+
+  # The clean-macOS half of GOV-19's Done-when, against the release as PUBLISHED — the only way
+  # to test install.sh unmodified, because it fetches releases/latest. Tag-only, because macOS
+  # minutes carry a 10x multiplier on this account; it runs once per release, not per push.
+  #
+  # A fresh runner VM and a fresh HOME stand in for a stranger's machine. It needs the repository
+  # PUBLIC: while it is private, raw.githubusercontent.com and releases/latest both 404 here,
+  # and this job fails rather than passing on nothing.
+  #
+  # It runs AFTER publish, so a failure here means a bad release is already out. That is the
+  # price of testing the real download path; the fix is a new patch tag, not a re-run.
+  clean-macos:
+    name: clean macOS install from the published release
+    needs: publish
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: install.sh unmodified, doctor, reinstall, uninstall byte-identical
+        # A short HOME: the daemon's socket lives under it and macOS caps sockaddr_un at 104
+        # bytes, which a $TMPDIR-based path can exceed (transport.MaxSocketPath).
+        run: |
+          export HOME="$(mktemp -d /tmp/h.XXXXXX)"
+          curl -fsSL --proto '=https' --tlsv1.2 \
+            "https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/${GITHUB_REF_NAME}/install.sh" \
+            -o "$RUNNER_TEMP/install.sh"
+          INSTALL_SH="$RUNNER_TEMP/install.sh" sh scripts/clean-install-in-container.sh
+      - name: the Homebrew formula installs the same version
+        # brew style and audit refuse a formula outside a tap, so a throwaway local tap holds it.
+        # The marketplace route needs no job of its own: its entry is a command source with no
+        # version, which loads the tree `governor install` writes from THIS binary (design.md
+        # 13.2a) — and accepting a command source needs a person, so CI could not drive it.
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          curl -fsSL --proto '=https' --tlsv1.2 \
+            "https://github.com/${GITHUB_REPOSITORY}/releases/download/${GITHUB_REF_NAME}/governor.rb" \
+            -o "$RUNNER_TEMP/governor.rb"
+          brew tap-new --no-git local/governor
+          cp "$RUNNER_TEMP/governor.rb" "$(brew --repository local/governor)/Formula/governor.rb"
+          brew style local/governor/governor
+          brew audit --strict --formula local/governor/governor
+          brew install local/governor/governor
+          brew test local/governor/governor
+          "$(brew --prefix)/bin/governor" version | tee "$RUNNER_TEMP/version.txt"
+          grep -qx "governor ${version}" "$RUNNER_TEMP/version.txt"

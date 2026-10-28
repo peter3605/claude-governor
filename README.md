@@ -1,11 +1,29 @@
 # claude-governor
 
-A jobserver for Claude Code subagents.
+Two promises come first, because what this asks of you is to run a hook on every subagent spawn
+and every build:
+
+**It fails open.** If the daemon is down, unreachable, slow, the wrong version, or anything else
+goes wrong, the spawn or build goes ahead ungoverned. A broken governor can never stall a
+session. Every hook has a hard deadline inside Claude Code's, and `TestGateFailsOpen` drives the
+gate through each failure shape it knows — no daemon, nobody listening on the socket, a connect
+or a reply that never comes, a connection closed mid-exchange, a garbled or truncated reply, an
+unknown protocol version, a malformed hook payload — and requires every one to let the work
+through.
+
+**It comes out clean.** `governor uninstall` removes the plugin, stops the daemon, and puts your
+`settings.json` back byte for byte. A test installs into a scratch home, uninstalls, and fails on
+any difference in a digest of the whole directory; on every push the same check runs on clean
+Debian and Alpine containers, and on every release on a clean macOS machine, from the published
+download.
+
+**What it is: a jobserver for Claude Code subagents.**
 
 Run several Claude Code sessions at once on a laptop and they will happily saturate it —
-each one fans out into subagents with no idea the others exist, and every session degrades
-together. `claude-governor` puts one CPU budget behind all of them: a small daemon watches
-load and thermal pressure, and every session asks it before spawning.
+each one fans out into subagents and builds with no idea the others exist, and every session
+degrades together. `claude-governor` puts one budget behind all of them: a small daemon watches
+load and thermal pressure, and every session asks it before spawning an agent or starting an
+expensive build.
 
 - **Adaptive, not a constant.** The budget is an AIMD control loop with a **run-queue**
   setpoint, so it climbs while the machine still has room and halves the moment it is
@@ -16,28 +34,48 @@ load and thermal pressure, and every session asks it before spawning.
   `serious` or `critical` thermal state takes the budget to the floor — not merely a
   non-nominal one, which GOV-15 measured at 2.85% of a 101-hour window with no corroborating
   evidence of throttling behind it.
-- **Fails open.** If the daemon isn't running, every spawn proceeds ungoverned. A broken
-  governor never bricks a session.
-- **Tells the model first.** An MCP tool, `governor__request_build`, lets a session ask
-  whether the machine has room for a build before it starts one — so it waits a few seconds
-  instead of being refused into shape. It answers cheap commands without contacting the
-  daemon at all, and grants everything when the daemon is down.
+- **Tells the model first.** An MCP tool lets a session ask whether the machine has room for a
+  build before it starts one — so it waits a few seconds instead of being refused into shape.
+  It answers cheap commands without contacting the daemon at all, and grants everything when
+  the daemon is down.
 
-Status: **Phase 0 — measuring.** The control loop is designed but not built; what runs today
-is instrumentation only. See [`docs/design.md`](docs/design.md).
+The design, its invariants and the measurements behind every constant are in
+[`docs/design.md`](docs/design.md).
 
 ## Install
 
+Any one of these. They all end in the same place: one plugin, `build-governor`, in
+`~/.claude/skills/build-governor/`, and one `governor` binary.
+
 ```sh
+# the one-liner
 curl -fsSL https://raw.githubusercontent.com/peter3605/claude-governor/main/install.sh | sh
+
+# or Homebrew, then install the plugin
+brew install peter3605/claude-governor/governor
+governor install
 ```
 
-That fetches the binary for this OS and architecture and hands off to `governor install`,
-which writes a plugin to `~/.claude/skills/build-governor/`, merges a `statusLine` key into
-`~/.claude/settings.json` after backing it up, and starts the daemon. It prints every path it
-touched. **Claude Code binds hooks when a session starts, so every session you already have
-open stays ungoverned until you restart it** — install counts them and names them, and
-`governor doctor` fails while any of them is still running.
+`install.sh` fetches the binary for this OS and architecture and hands off to `governor
+install`, which writes the plugin, merges a `statusLine` key into `~/.claude/settings.json`
+after backing it up, and starts the daemon. It prints every path it touched. **Claude Code binds
+hooks when a session starts, so every session you already have open stays ungoverned until you
+restart it** — install counts them and names them, and `governor doctor` fails while any of them
+is still running.
+
+**Through the Claude Code plugin marketplace**, once the binary is installed by either route
+above:
+
+```sh
+claude plugin marketplace add peter3605/claude-governor
+claude plugin install build-governor@claude-governor
+```
+
+The marketplace entry does not carry a second copy of the plugin. It runs `governor
+plugin-path`, which points Claude Code at the tree `governor install` already wrote, so both
+registrations load the same files and the same binary and cannot double up. Claude Code asks
+you to approve that command once, **in your own terminal** — it refuses to accept one from inside
+a session.
 
 **It measures your machine before it checks anything.** `governor install` ends by running
 `governor calibrate`, which reads your core count, how many of them are performance cores where
@@ -101,17 +139,22 @@ renamed the tool the hook matches on, nothing would error. The hook would simply
 every other check would stay green, and no subagent would ever be governed again. Silence is
 the only evidence that exists, so the report is built to say when all it has is silence.
 
-**Removing it leaves nothing.** `governor uninstall` deletes the plugin, restores whatever
-`statusLine` you had before — byte for byte, formatting and key order included — stops the
-daemon and removes its socket. `--purge` also removes the config, the first-run notice marker and the
-sample log, which are otherwise kept. There is a test that installs into a scratch home, uninstalls, and fails on
-any difference in a recursive digest of the whole directory; what is being asked of you is to
-run a hook on every subagent spawn, and being able to prove it comes out clean is most of why
-that should be acceptable.
+**Removing it.** `governor uninstall` deletes the plugin, restores whatever `statusLine` you had
+before — byte for byte, formatting and key order included — stops the daemon and removes its
+socket. `--purge` also removes the config, the first-run notice marker and the sample log, which
+are otherwise kept. If you added the marketplace entry, run `claude plugin uninstall
+build-governor@claude-governor` first: that registration lives in Claude Code's own files, so
+`governor uninstall` names it rather than editing them.
 
-Installing twice changes nothing the second time. The five hooks live in the plugin's own
+Installing twice changes nothing the second time. The six hooks live in the plugin's own
 `hooks/hooks.json`, so the only key touched in your `settings.json` is `statusLine`, and hooks
 of your own are left exactly where they are.
+
+**Upgrading from a version named `claude-governor`.** The plugin was renamed `build-governor`
+because Claude Code reserves the `claude-` prefix for its own plugins. Run `governor install`
+from the new version: it removes the old `~/.claude/skills/claude-governor/` tree, because two
+differently named copies would both load and every hook would run twice. `governor doctor`
+fails until it is gone.
 
 To build and install from a clone instead:
 
