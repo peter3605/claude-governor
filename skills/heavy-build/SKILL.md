@@ -10,7 +10,7 @@ or test suite takes a slot while it runs; ordinary commands take nothing and are
 
 ## Before an expensive build or test run
 
-Call `mcp__plugin_claude-governor_governor__governor__request_build` with `command` set to the
+Call `mcp__plugin_build-governor_governor__governor__request_build` with `command` set to the
 exact command line and `why` set to a few words on what it is for.
 
 - **`granted: true`** — run the command now.

@@ -7,9 +7,14 @@
 # rather than of a copy of its logic.
 #
 # Expects, in the container:
-#   /work/install.sh          the real script, mounted read-only
+#   /work/install.sh          the real script, mounted read-only (or INSTALL_SH, below)
 #   GOVERNOR_BASE_URL         where the artefact is served from
 #   CURL_CA_BUNDLE            the CA for that server, so --proto '=https' stays honest
+#
+# GOV-19 ALSO RUNS IT ON A CLEAN macOS RUNNER, against the PUBLISHED release, from release.yml.
+# There it is given INSTALL_SH (install.sh as fetched from the tag) and NO GOVERNOR_BASE_URL, so
+# install.sh downloads from releases/latest exactly as a stranger's would, and HOME is a fresh
+# directory. On darwin it additionally refuses a thermally blind binary (see the end).
 #
 # POSIX sh: the image is deliberately minimal and may not have bash.
 
@@ -31,12 +36,21 @@ note() { echo "--- $*"; }
 digest() {
 	find "$HOME" -mindepth 1 -type d | sed "s|^$HOME/|d |" | sort
 	find "$HOME" -mindepth 1 -type f | sort | while IFS= read -r f; do
-		printf 'f %s  %s\n' "$(sha256sum "$f" | cut -d' ' -f1)" "${f#"$HOME"/}"
+		printf 'f %s  %s\n' "$(sha256 "$f")" "${f#"$HOME"/}"
 	done
 }
 
-[ -n "${GOVERNOR_BASE_URL:-}" ] || fail "GOVERNOR_BASE_URL is unset; nothing to install from."
-[ -r /work/install.sh ] || fail "/work/install.sh is not mounted."
+# sha256 prints one file's digest. coreutils and busybox have sha256sum; macOS has shasum.
+sha256() {
+	if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" | cut -d' ' -f1
+	else shasum -a 256 "$1" | cut -d' ' -f1; fi
+}
+
+INSTALL_SH="${INSTALL_SH:-/work/install.sh}"
+[ -r "$INSTALL_SH" ] || fail "$INSTALL_SH is not readable; nothing to run."
+if [ -z "${GOVERNOR_BASE_URL:-}" ]; then
+	note "GOVERNOR_BASE_URL is unset: installing from the PUBLISHED release, as a stranger would"
+fi
 
 # ---------------------------------------------------------------------------------------
 note "the machine is clean before anything runs"
@@ -49,11 +63,11 @@ before=$(digest)
 
 # ---------------------------------------------------------------------------------------
 note "install, through the real install.sh"
-sh /work/install.sh || fail "install.sh exited non-zero."
+sh "$INSTALL_SH" || fail "install.sh exited non-zero."
 
 # 13.3 is normative and GOV-35 asserts it against a real install. SIX files: GOV-17 clause 1
 # added skills/heavy-build/SKILL.md, after its measurement window was closed in docs/advice.md.
-plugin="$HOME/.claude/skills/claude-governor"
+plugin="$HOME/.claude/skills/build-governor"
 for f in \
 	"$plugin/.claude-plugin/plugin.json" \
 	"$plugin/hooks/hooks.json" \
@@ -139,11 +153,24 @@ note "reinstall over a RUNNING install (design.md 13.4: rename(2), never overwri
 # is what GOV-02 measured as fatal on macOS; the hazard is placement, not the platform, so
 # the ordering is asserted wherever the job can run.
 "$gov" status >/dev/null 2>&1 || fail "the daemon does not answer after install."
-sh /work/install.sh || fail "the SECOND install.sh exited non-zero (reinstall over a running install)."
+sh "$INSTALL_SH" || fail "the SECOND install.sh exited non-zero (reinstall over a running install)."
 rc=0
 "$gov" status >/dev/null 2>&1 || rc=$?
 [ "$rc" -eq 0 ] || fail \
 	"the daemon does not answer after a reinstall (status exited $rc). Exit 137 here is the SIGKILL of design.md 13.4: the binary was overwritten in place rather than renamed."
+
+# ---------------------------------------------------------------------------------------
+if [ "$(uname -s)" = "Darwin" ]; then
+	note "the darwin binary can see thermal state (GOV-13: built with cgo, on macOS)"
+	# A darwin binary built without cgo runs perfectly and reports thermal "unknown", which the
+	# control loop treats as nominal — so a throttling Mac looks idle and the budget never floors.
+	# Nothing else in this script, in install, or in doctor would notice. This line is the
+	# acceptance check GOV-19's traps name for exactly that artefact.
+	thermal=$("$gov" status 2>/dev/null | awk '$1 == "thermal" {print $2}')
+	[ -n "$thermal" ] || fail "governor status printed no thermal line."
+	[ "$thermal" != "unknown" ] || fail \
+		"governor status reports 'thermal unknown' on macOS: this release's darwin binary was built without cgo and is thermally blind."
+fi
 
 # ---------------------------------------------------------------------------------------
 note "uninstall leaves the machine byte-identical"

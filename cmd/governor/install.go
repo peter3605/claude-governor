@@ -53,7 +53,7 @@ import (
 // Everything else is a directory that either exists or does not.
 
 // pluginName is the plugin's directory name and its name in `claude plugin list`.
-const pluginName = "claude-governor"
+const pluginName = "build-governor"
 
 // installedBinaryName is what the binary is called inside the plugin.
 //
@@ -79,7 +79,7 @@ const daemonStopTimeout = 5 * time.Second
 // uninstall removes comes from here.
 type paths struct {
 	home     string
-	plugin   string // ~/.claude/skills/claude-governor
+	plugin   string // ~/.claude/skills/build-governor
 	manifest string // <plugin>/.claude-plugin/plugin.json
 	hooks    string // <plugin>/hooks/hooks.json
 	mcp      string // <plugin>/.mcp.json
@@ -233,7 +233,7 @@ func pluginHooks() ([]byte, error) {
 // The server key is `governor`, and it is half of the tool's name in a session: Claude Code
 // composes `mcp__plugin_<plugin>_<server>__` from the plugin name and this key and PREFIXES
 // it onto the tool's own name, giving
-// `mcp__plugin_claude-governor_governor__governor__request_build` — measured in
+// `mcp__plugin_build-governor_governor__governor__request_build` — measured in
 // hook-surface.md section 20.5, stutter and all. Renaming either the plugin or this key
 // renames the tool, and anything that allowlists it then breaks silently: the model simply
 // reports it lacks permission, which reads like a server that failed to start.
@@ -252,7 +252,7 @@ func pluginMCP() ([]byte, error) {
 //
 // Claude Code advertises a plugin command as `<manifest name>:<file basename>`, measured in
 // hook-surface.md section 22.2 — so this file being called governor.md is what makes the
-// command `/claude-governor:governor`. Renaming it renames the command, silently, for everyone
+// command `/build-governor:governor`. Renaming it renames the command, silently, for everyone
 // who has learned the old name.
 const commandFileName = "governor.md"
 
@@ -287,7 +287,7 @@ const commandFileName = "governor.md"
 func pluginCommand() []byte { return []byte(commandMarkdown) }
 
 // skillName is the bundled skill's directory, and the second half of the name a session sees:
-// `claude-governor:heavy-build`, prefixed with the MANIFEST name rather than the directory
+// `build-governor:heavy-build`, prefixed with the MANIFEST name rather than the directory
 // name and colon-separated (hook-surface.md section 21.2, answer 4).
 const skillName = "heavy-build"
 
@@ -482,6 +482,7 @@ func runInstall(args []string, stdout, stderr io.Writer) int {
 		in.planBinary(self)
 		in.planSettings(settingsChanged)
 		in.planLink()
+		in.removeLegacyTree(true)
 		in.report(stdout, "would")
 		if settingsChanged {
 			fmt.Fprintf(stdout, "\n--- %s ---\n", p.settings)
@@ -514,6 +515,10 @@ func runInstall(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "governor install: %v\n", err)
 		return 1
 	}
+	// After the new tree is complete, so there is no moment with neither. Removing the old
+	// binary does not disturb a daemon running from it: the inode outlives the name, and the
+	// replace path below restarts the daemon from the new one.
+	in.removeLegacyTree(false)
 	if settingsChanged {
 		// Back up before touching it, and only when there is something to back up. The
 		// backup is timestamped so that a second install after a manual edit cannot
@@ -1043,6 +1048,7 @@ func runUninstall(args []string, stdout, stderr io.Writer) int {
 	}
 	un.removeLink()
 	un.removeTree(p.plugin)
+	un.removeLegacyTree(false)
 	un.removeStateFiles()
 	// ~/.claude/skills exists only because install put a plugin in it, and on a machine
 	// that had no settings file ~/.claude exists only because install wrote one. Both are
@@ -1052,9 +1058,22 @@ func runUninstall(args []string, stdout, stderr io.Writer) int {
 	if *purge {
 		un.removeTree(p.state)
 		un.removeTree(p.data)
+		// ${CLAUDE_PLUGIN_DATA} is named after the route the plugin loaded by, so a machine
+		// that also used the marketplace entry has its config and marker in a second place.
+		un.removeTree(marketplaceDataDir(p.home))
+		un.removeTree(legacyDataDir(p.home))
 	}
 
 	un.report(stdout, "")
+	// The marketplace registration is Claude Code's, in files this does not own, so it is
+	// named rather than removed. Left alone it is inert — plugin-path now finds no tree and
+	// exits non-zero, so the plugin reports not loaded — but it is not gone.
+	if regs, err := pluginRegistrations(p.home); err == nil {
+		for _, r := range regs {
+			fmt.Fprintf(stdout, "\nStill registered with Claude Code: %s. Remove it with: claude plugin uninstall %s\n",
+				r.id, r.id)
+		}
+	}
 	if !*purge {
 		fmt.Fprintf(stdout, "\nState kept: %s and %s. Remove them too with: governor uninstall --purge\n",
 			short(p.state), short(p.data))

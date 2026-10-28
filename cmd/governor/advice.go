@@ -30,11 +30,11 @@ package main
 // stutter and all. TestTheAdviceNamesTheToolASessionSees holds it to pluginMCP and toolName.
 const sessionStartAdvice = `claude-governor shares one CPU budget between every Claude Code session on this machine. ` +
 	`Before an expensive build or test-suite run (go build/test, cargo, make, pytest, xcodebuild, npm run build/test, docker build), ` +
-	`call mcp__plugin_claude-governor_governor__governor__request_build. ` +
+	`call mcp__plugin_build-governor_governor__governor__request_build. ` +
 	`If it is not granted, wait about wait_hint_ms and ask again. ` +
 	`The answer decides when a build or test runs, never whether: do not skip, shrink or drop a test run because of it. ` +
 	`Do NOT call it for anything else: reading or searching files, git, ls, grep, edits, a dev server, a quick script. ` +
-	`If unsure, do not call; the hook gates expensive commands either way. Details: the claude-governor:heavy-build skill.`
+	`If unsure, do not call; the hook gates expensive commands either way. Details: the build-governor:heavy-build skill.`
 
 // sessionStartOutput is the SessionStart hook's whole stdout, as one JSON object.
 //

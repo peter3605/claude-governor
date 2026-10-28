@@ -182,7 +182,7 @@ func TestSectionThirteenThreeNamesTheSkill(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read design.md: %v", err)
 	}
-	row := "| `~/.claude/skills/claude-governor/skills/heavy-build/SKILL.md`"
+	row := "| `~/.claude/skills/build-governor/skills/heavy-build/SKILL.md`"
 	if !strings.Contains(string(b), row) {
 		t.Errorf("design.md section 13.3 has no row starting %s; it is the normative list of "+
 			"what touches the user's machine, and uninstall is only verifiable while it is "+

@@ -62,7 +62,7 @@ the dead window and is not evidence.
 
 ## What is being dogfooded
 
-`governor install` puts the plugin in `~/.claude/skills/claude-governor/` and registers the
+`governor install` puts the plugin in `~/.claude/skills/build-governor/` and registers the
 gate on every subagent spawn on this machine. The policy under test is the one Phase 1
 actually ships:
 

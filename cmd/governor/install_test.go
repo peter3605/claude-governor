@@ -1483,7 +1483,7 @@ func TestInstallRegistersTheAdvisoryServer(t *testing.T) {
 	}
 
 	// The key is what names the tool in a session. Changing it renames
-	// mcp__plugin_claude-governor_governor__governor__request_build, which fails silently.
+	// mcp__plugin_build-governor_governor__governor__request_build, which fails silently.
 	server, ok := servers["governor"].(map[string]any)
 	if !ok {
 		t.Fatalf("no server keyed `governor`; the tool's name in a session is composed from "+
@@ -1562,7 +1562,7 @@ func TestInstallWritesTheSlashCommand(t *testing.T) {
 	}
 	// The basename is half the command's name in a session.
 	if filepath.Base(p.command) != "governor.md" {
-		t.Errorf("basename %q makes the command /claude-governor:%s, which is not the name "+
+		t.Errorf("basename %q makes the command /build-governor:%s, which is not the name "+
 			"design.md §9.1 documents", filepath.Base(p.command),
 			strings.TrimSuffix(filepath.Base(p.command), ".md"))
 	}
