@@ -40,7 +40,12 @@ func TestEveryPlatformGetsItsOwnURLAndDigest(t *testing.T) {
 			t.Errorf("%s is not followed by its own digest %s", a, sum)
 		}
 	}
-	for _, want := range []string{`version "0.1.0"`, `license "MIT"`, "governor install", "governor uninstall"} {
+	// brew reads the version from the URL, and `brew audit --strict` fails a formula that also
+	// states it. v0.1.0 shipped with one and failed its release check on exactly that line.
+	if strings.Contains(f, "\n  version ") {
+		t.Errorf("formula states a version; brew scans it from the URL and audit rejects it as redundant:\n%s", f)
+	}
+	for _, want := range []string{`license "MIT"`, "governor install", "governor uninstall"} {
 		if !strings.Contains(f, want) {
 			t.Errorf("formula does not contain %q", want)
 		}
