@@ -103,6 +103,11 @@ func write(w io.Writer, version string, checksums io.Reader) error {
 	}{repo, version, plats[:2], plats[2:]})
 }
 
+// THERE IS NO version LINE, and that is brew's rule rather than an omission. Every URL carries
+// the tag (.../download/v0.1.0/...), brew scans the version out of it, and `brew audit --strict`
+// rejects an explicit one as redundant — which is how v0.1.0's attached formula failed its own
+// release check. The test block's #{version} is that scanned value.
+//
 // The caveat carries the step brew cannot do for the user. Installing the formula puts a binary
 // on PATH and governs nothing: the hooks, the status line and the daemon are `governor install`,
 // which merges into the user's settings and so is not something a package manager should do
@@ -110,7 +115,6 @@ func write(w io.Writer, version string, checksums io.Reader) error {
 var formula = template.Must(template.New("formula").Parse(`class Governor < Formula
   desc "Machine-wide build and subagent budget for Claude Code sessions"
   homepage "https://github.com/{{.Repo}}"
-  version "{{.Version}}"
   license "MIT"
 
   on_macos do
