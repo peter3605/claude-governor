@@ -254,3 +254,36 @@ func daemonBuild(t *testing.T, endpoint string) string {
 	}
 	return got.Build
 }
+
+// TestTheFixNamesTheBinaryThatWouldActuallyUpgrade is the v0.1.2 upgrade, as it went.
+//
+// Measured on 2026-10-31: `brew upgrade` put 0.1.2 at /opt/homebrew/bin/governor while the
+// hooks and the daemon stayed 0.1.1. `/opt/homebrew/bin/governor doctor` failed `binary` and
+// `build` correctly and said "fix: governor install". But bare `governor` was
+// ~/.local/bin/governor, the link to the hooked 0.1.1. Running it reinstalled 0.1.1 over
+// itself, reported "unchanged" for every path, and left the old daemon running. A fix line
+// that does nothing is the failure clause 3 rules out.
+//
+// Staged here: hooks on an older build, a daemon too old to report one, and doctor run from a
+// different file. Both findings must name doctor's own path.
+func TestTheFixNamesTheBinaryThatWouldActuallyUpgrade(t *testing.T) {
+	w := newWorld(t)
+	old := markedGovernor(t, mkdir(t, filepath.Join(w.home, "hooked")), "governor",
+		"0.1.1", protocolVersion, configSchemaVersion, "the previous release")
+	endpoint, _ := startTestDaemonConfigured(t, 4, lease.Options{}, func(d *daemon) { d.build = "" })
+	t.Setenv(transport.EndpointEnv, endpoint)
+	w.writeHooks(w.settings, old, goodHooks())
+
+	_, found, out := doctor(t)
+	want := selfBinary(t) + " install"
+	for _, name := range []string{"binary", "build"} {
+		got := found[name]
+		if got.state != "FAIL" {
+			t.Fatalf("%s: %s, want FAIL\n%s", name, got.state, out)
+		}
+		if got.fix != want {
+			t.Errorf("%s: fix = %q, want %q (bare governor may be the hooked copy)\n%s",
+				name, got.fix, want, out)
+		}
+	}
+}
