@@ -1306,16 +1306,9 @@ func TestEveryDoctorFixNamesARealCommand(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read doctor.go: %v", err)
 	}
-	// `governor <word>` only where the text reads as a command to type: at the start of a
-	// string, after a colon, after a shell `&&`, or inside backticks. Prose says things like
-	// "it runs governor on every tool call in every session", and a scan that counted those
-	// would report `governor on` as a missing subcommand — a guard that cries wolf is a
-	// guard somebody deletes.
-	re := regexp.MustCompile("(?:^|\"|`|: |&& )governor ([a-z]+)")
-	named := map[string]bool{}
-	for _, m := range re.FindAllStringSubmatch(string(raw), -1) {
-		named[m[1]] = true
-	}
+	// namedSubcommands (docs_test.go) is shared with the user docs' guard, so the rule for
+	// what reads as a command to type is written once.
+	named := namedSubcommands(string(raw))
 	if len(named) == 0 {
 		t.Fatal("found no `governor <command>` fix in doctor.go; this test has stopped testing anything")
 	}
