@@ -2209,11 +2209,43 @@ is registered in more than one file.
   stats two files and prints the tree, so the per-session cost of §23.3 is one exec of the Go
   binary.
 
-### 23.8 Still unmeasured
+### 23.8 The published GitHub marketplace — measured 2026-10-31 against v0.1.1
+
+Run by Peter in his own terminal, because the command source must be accepted by a person
+(§23.3), under a throwaway HOME. The binary on `PATH` was the real v0.1.1
+`governor-darwin-arm64`, its digest checked against the release's `checksums.txt`, and the
+marketplace was the real `peter3605/claude-governor` (public). Verbatim, trimmed:
+
+```
+$ claude plugin marketplace add peter3605/claude-governor
+Cloning via SSH: git@github.com:peter3605/claude-governor.git
+Clone complete, validating marketplace…
+✔ Successfully added marketplace: claude-governor (declared in user settings)
+$ claude plugin install build-governor@claude-governor
+"build-governor" is installed by running a command from marketplace "claude-governor" on this machine:
+  governor plugin-path
+  (mode "link": its output directory is used in place (linked, not copied))
+Run this command now? [y/N] y
+✔ Successfully installed plugin: build-governor@claude-governor (scope: user)
+
+  ❯ build-governor@claude-governor
+    Version: 0.1.1-ea890ea9da2f
+    Status: ✔ enabled
+  ❯ build-governor@skills-dir: ✘ Not loaded — the name "build-governor" is already taken by an
+    installed plugin (build-governor@claude-governor), which takes precedence.
+```
+
+The installed `plugin.json` read `0.1.1`, and `<installPath>/bin/governor version` — the binary
+reached through the marketplace's own cache directory — printed `governor 0.1.1`: the same version
+the Homebrew tap installed in the v0.1.1 release run. In a terminal the command source is a
+`[y/N]` prompt showing the exact command; no hash is needed.
+
+### 23.9 Still unmeasured
 
 - **Where a command source's stderr goes**, and what a session shows when the command exits
   non-zero (`plugin-path` does that before `governor install` has run). Assumed to be "plugin
   not loaded"; not observed.
-- **A `github`-hosted marketplace.** Every probe used a local-path marketplace; a GitHub source
-  is the route a stranger takes, and it needs the repository public.
+- **Whether `marketplace add owner/repo` falls back to HTTPS without GitHub SSH keys.** §23.8
+  cloned over SSH on a machine that has them. A stranger without them is the case that matters,
+  and it was not tested.
 - **The command source on Linux.**
