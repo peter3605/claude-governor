@@ -7,6 +7,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/peter3605/claude-governor/internal/budget"
+	"github.com/peter3605/claude-governor/internal/config"
+	"github.com/peter3605/claude-governor/internal/lease"
 	"github.com/peter3605/claude-governor/internal/signals"
 )
 
@@ -265,4 +268,69 @@ func waitFor(t *testing.T, within time.Duration, cond func() bool) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	t.Fatalf("condition did not hold within %v", within)
+}
+
+// silentSampler never returns a reading until the daemon shuts down, so no tick can land.
+//
+// It is what makes "before the first sample" a state the test holds rather than a race it
+// hopes to win. A stub that answered would be read within a second, and an acquire that beat
+// it would pass for the wrong reason on a fast machine and fail on a slow one.
+type silentSampler struct{}
+
+func (silentSampler) Sample(ctx context.Context) (signals.Sample, error) {
+	<-ctx.Done()
+	return signals.Sample{}, ctx.Err()
+}
+
+func (silentSampler) Host(context.Context) (signals.Host, error) { return signals.Host{}, nil }
+
+// A daemon answers its ceiling before its first sample, not the floor (GOV-41).
+//
+// THIS IS HELD AT THE ADMISSION PATH ON PURPOSE. The controller always meant to start at the
+// ceiling — start() says so — and a test of Controller alone passed throughout the defect,
+// because the defect was observeThisMachine never giving it one. So this runs the real
+// wiring, then replaces only what reads the developer's machine: the session registry, the
+// hook mtime, and the sampler, which is swapped for one that never answers.
+//
+// The capacity is pinned so the ceiling is well above the floor on every runner. Read for
+// real on a two-core CI host it would floor anyway, and the test could not tell the fix from
+// the bug.
+func TestAColdDaemonServesItsCeilingNotTheFloor(t *testing.T) {
+	// An empty data directory, so a config left by a calibration on this machine — or a
+	// plugin context the tests happen to run inside — cannot cap the ceiling under the test.
+	t.Setenv(config.DataDirEnv, t.TempDir())
+
+	const capacity = 12
+	saved := hostCapacity
+	hostCapacity = func() (float64, string) { return capacity, "host" }
+	t.Cleanup(func() { hostCapacity = saved })
+
+	want := budget.MaxSlots(capacity)
+	if want <= budget.Floor {
+		t.Fatalf("MaxSlots(%v) = %d, which is the floor: this test could not tell a cold daemon from a warm one", float64(capacity), want)
+	}
+
+	endpoint, _ := startTestDaemonConfigured(t, budget.Floor, lease.Options{}, func(d *daemon) {
+		d.observeThisMachine()
+		d.liveSessions = noLiveSessions
+		d.hooksInstalledAt = func() time.Time { return time.Time{} }
+		d.sampler = silentSampler{}
+	})
+
+	got := call(t, endpoint, acquireReq("s1"))
+	if got.OK == nil || !*got.OK {
+		t.Fatalf("acquire refused against an empty table: %+v", got)
+	}
+	if got.Budget != want {
+		t.Fatalf("a cold daemon answered budget %d, want its ceiling %d — Max was not set before the first tick", got.Budget, want)
+	}
+
+	// And it says why, consistently: at its ceiling, cutting nothing, having measured nothing.
+	st := call(t, endpoint, map[string]any{"v": protocolVersion, "op": "status"})
+	if st.Ceiling != want || st.Cut != "" {
+		t.Errorf("status reports ceiling %d cut %q, want %d and none", st.Ceiling, st.Cut, want)
+	}
+	if st.CPU != nil {
+		t.Errorf("status reports cpu %v before any tick, want null", *st.CPU)
+	}
 }
