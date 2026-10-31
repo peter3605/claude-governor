@@ -140,6 +140,10 @@ type statusResponse struct {
 	// older than the field, and the status line and doctor both read that as stale.
 	BinaryVersion string `json:"binary_version"`
 	Build         string `json:"build"`
+	// Config is which config.json the daemon loaded and the run-queue threshold it is cutting
+	// at (GOV-44; see configdrift.go). Only doctor and install read it. Nil from a daemon
+	// older than the field, which both read as "cannot say", never as agreement.
+	Config *loadedConfig `json:"config"`
 }
 
 // cachedStatus is one status reply plus when it was taken.

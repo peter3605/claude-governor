@@ -136,13 +136,13 @@ func resolvePaths() (paths, error) {
 // stateFiles is every file the governor writes into the state directory, and it is the list
 // uninstall removes. design.md section 13.3 is the normative version; this must agree with it.
 //
-// config.File IS IN THIS LIST AND onboardMarker'S COMMENT EXPLAINS WHY. Both files live in
-// ${CLAUDE_PLUGIN_DATA} when Claude Code has named one, and fall back to the state directory
-// when it has not. In the plugin case a plain uninstall keeps them and only --purge removes
-// them, deliberately: reinstalling after an ordinary uninstall is the same machine and the
-// same person, and throwing away their calibration is as unwelcome as re-showing the first-run
-// notice. In the fallback case there is no such directory, so they are removed here along with
-// everything else — which is also what stops the state directory from failing to empty.
+// config.File AND onboardMarker ARE BOTH IN THIS LIST. config.json always lives in the state
+// directory (GOV-44; config.Path says why it no longer follows ${CLAUDE_PLUGIN_DATA}), so a
+// plain uninstall removes it and the next install recalibrates — which install does anyway.
+// The onboarding marker lives in ${CLAUDE_PLUGIN_DATA} when a hook wrote it there, where only
+// --purge removes it, so reinstalling does not re-show a notice already read; it falls back
+// to the state directory otherwise and is removed here, which is also what stops the state
+// directory from failing to empty.
 //
 // GOV-25 ADDED config.File AND IT LEAKED UNTIL IT DID. `install` did not write a config before
 // GOV-25, so nothing in the state directory needed removing and its absence from this list
@@ -558,6 +558,13 @@ func runInstall(args []string, stdout, stderr io.Writer) int {
 	// means: every file is in place and the daemon is up, so a calibration measuring this
 	// host measures the machine as the governor will actually find it.
 	calibrateDuringInstall(stdout, stderr)
+	if !*noDaemon {
+		// The daemon above loaded whatever config was on disk BEFORE that calibration. Before
+		// GOV-44 it read the file only at startup, so every install left it serving the
+		// previous calibration — on 2026-10-31, run-queue cut 4.81 with 5.02 on disk. It now
+		// reloads on its next tick; this confirms it did before doctor looks.
+		refreshDaemonConfig(p, stdout, stderr)
+	}
 
 	fmt.Fprintln(stdout, "\nRemove it with: governor uninstall")
 	// The hooks are read when a session starts, so a session already running is not
@@ -590,7 +597,7 @@ func runInstall(args []string, stdout, stderr io.Writer) int {
 func calibrateDuringInstall(stdout, stderr io.Writer) {
 	fmt.Fprintln(stdout, "\n--- governor calibrate ---")
 	fmt.Fprintln(stdout, "Measuring this machine so its limits come from your hardware, not from ours.")
-	runCalibrate(nil, stdout, stderr)
+	calibrateCommand(nil, stdout, stderr, false)
 }
 
 // verifyInstall ends the install by running doctor and printing its findings (GOV-22).
@@ -859,6 +866,36 @@ func (in *installer) report(w io.Writer, verb string) {
 // Idempotency survives this. A second install of the same binary finds a daemon that matches
 // on both counts and leaves it alone, which is what TestInstallTwiceChangesNothingTheSecondTime
 // requires: replacing a healthy daemon would drop every live lease for no reason.
+// refreshDaemonConfig makes sure the running daemon is on the config install just wrote.
+//
+// It WAITS rather than restarts, because a daemon of this build reloads config.json on its
+// next sampling tick (daemon.reloadConfig) — so the ordinary outcome is that it catches up
+// within a second and nothing is replaced, which keeps a second install a no-op for the
+// daemon. Only a daemon that is still not running the config on disk after configReloadWait
+// is replaced, and the reason is printed: that is a daemon that cannot reload, and leaving it
+// would leave install's own doctor reporting a stale calibration.
+func refreshDaemonConfig(p paths, stdout, stderr io.Writer) {
+	endpoint, err := transport.DefaultEndpoint()
+	if err != nil || !daemonAnswers(endpoint) {
+		return
+	}
+	deadline := time.Now().Add(configReloadWait)
+	for {
+		if inspectDaemon(endpoint, p.binary).current {
+			return
+		}
+		if time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	startDaemon(p, false, stdout, stderr)
+}
+
+// configReloadWait is how long install and calibrate give a running daemon to pick up a new
+// config.json: three sampling ticks, so one slow tick does not cost a restart.
+const configReloadWait = 3 * sampleInterval
+
 func startDaemon(p paths, replaced bool, stdout, stderr io.Writer) {
 	endpoint, err := transport.DefaultEndpoint()
 	if err != nil {
@@ -978,10 +1015,12 @@ func inspectDaemon(endpoint, installed string) daemonState {
 		return daemonState{why: "it did not answer a status request"}
 	}
 	var reply struct {
-		V             int    `json:"v"`
-		Reason        string `json:"reason"`
-		BinaryVersion string `json:"binary_version"`
-		Build         string `json:"build"`
+		V             int           `json:"v"`
+		Reason        string        `json:"reason"`
+		BinaryVersion string        `json:"binary_version"`
+		Build         string        `json:"build"`
+		Ceiling       int           `json:"ceiling"`
+		Config        *loadedConfig `json:"config"`
 	}
 	if err := json.Unmarshal([]byte(line), &reply); err != nil {
 		return daemonState{why: "its answer could not be parsed"}
@@ -1015,6 +1054,18 @@ func inspectDaemon(endpoint, installed string) daemonState {
 	if reply.Build != want {
 		return daemonState{why: fmt.Sprintf("it is build %s, the installed binary is build %s",
 			shortBuild(reply.Build), shortBuild(want))}
+	}
+	// The same binary can still be running the wrong numbers: a daemon that read its config
+	// from another path, or one that has not (yet) reloaded what calibrate wrote (GOV-44).
+	// The predicate is doctor's, so the "fix: governor install" that doctor prints for a
+	// drifted daemon is one this clears. A same-build daemon always reports its config, so
+	// a nil here is not a case to judge.
+	if reply.Config != nil {
+		if path, disk, found, err := readDiskConfig(); err == nil {
+			if why := calibrationDrift(reply.Config, reply.Ceiling, path, disk, found); why != "" {
+				return daemonState{why: why}
+			}
+		}
 	}
 	return daemonState{current: true}
 }

@@ -367,10 +367,10 @@ func TestEveryFailureNamesACommandToRun(t *testing.T) {
 // to ignore.
 func TestDoctorPassesOnAWorkingInstall(t *testing.T) {
 	w := newWorld(t)
-	endpoint, _ := startTestDaemon(t, 4)
+	w.writeCalibration()
+	endpoint, _ := startTestDaemonConfigured(t, 4, lease.Options{}, loadsItsConfig)
 	t.Setenv(transport.EndpointEnv, endpoint)
 	w.writeHooks(w.settings, selfBinary(t), goodHooks())
-	w.writeCalibration()
 
 	code, found, out := doctor(t)
 	// NOTHING TO FIX is the property, and it is asserted as "nothing failed" rather than

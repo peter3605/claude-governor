@@ -224,6 +224,7 @@ func (d *diagnosis) run() {
 	d.checkDaemonBuild()
 	d.checkConfig()
 	d.checkCalibration()
+	d.checkDaemonConfig()
 	d.checkBudget()
 	d.checkSessions()
 	d.checkLeases()
@@ -1627,17 +1628,11 @@ func (d *diagnosis) checkDaemonBuild() {
 		d.add("build", skip, "the daemon speaks another protocol (see protocol above)", "")
 		return
 	}
-	bins := map[string]bool{}
-	for _, w := range wantedHooks {
-		if ref := d.findHook(w); ref != nil && ref.bin != "" {
-			bins[ref.bin] = true
-		}
-	}
-	if len(bins) != 1 {
+	bin, ok := d.hookedBinary()
+	if !ok {
 		d.add("build", skip, "no single hooked binary to compare the daemon with (see binary above)", "")
 		return
 	}
-	bin := sortedKeys(bins)[0]
 	running := fmt.Sprintf("the running daemon (%s", orUnknown(d.reply.BinaryVersion))
 	if d.reply.DaemonStarted != "" {
 		running += ", up since " + d.reply.DaemonStarted
@@ -1676,6 +1671,82 @@ func (d *diagnosis) checkDaemonBuild() {
 	}
 	d.add("build", pass,
 		fmt.Sprintf("the daemon is running the hooked binary (build %s)", shortBuild(want)), "")
+}
+
+// hookedBinary is the one binary every gate hook names, or false when there is none or more
+// than one. checkDaemonBuild and checkDaemonConfig both need it, for the build to compare with
+// and for the fix line.
+func (d *diagnosis) hookedBinary() (string, bool) {
+	bins := map[string]bool{}
+	for _, w := range wantedHooks {
+		if ref := d.findHook(w); ref != nil && ref.bin != "" {
+			bins[ref.bin] = true
+		}
+	}
+	if len(bins) != 1 {
+		return "", false
+	}
+	return sortedKeys(bins)[0], true
+}
+
+// checkDaemonConfig compares the config the RUNNING DAEMON loaded — and the ceiling and
+// run-queue threshold it is serving now — with config.json on disk (GOV-44).
+//
+// It is checkDaemonBuild's second half. A daemon reads two things once at startup and never
+// again, its executable and its config; GOV-43 made the first comparable and this makes the
+// second. On 2026-10-31 one doctor run printed "calibration ... b_max 4 slots" from the file
+// and "budget 6 slots, the most this host allows" from the daemon, both green, because each
+// check read only one side. checkCalibration still reads the file and checkBudget still reads
+// the daemon; this is the line that reads both and fails when they disagree.
+//
+// THE FIX IS installFix AND IT WORKS BECAUSE inspectDaemon APPLIES THE SAME PREDICATE.
+// `governor install` replaces a running daemon whose loaded config differs from disk exactly
+// as it replaces one whose build differs, so the fix line clears the finding — GOV-43's rule
+// that a fix line must name the command that actually clears it, held here too.
+func (d *diagnosis) checkDaemonConfig() {
+	const name = "loaded"
+	if !d.up {
+		d.add(name, skip, "no daemon to compare with the config (see daemon above)", "")
+		return
+	}
+	if d.reply.V != protocolVersion || d.reply.Reason != "" {
+		d.add(name, skip, "the daemon speaks another protocol (see protocol above)", "")
+		return
+	}
+	fix := "governor install"
+	if bin, ok := d.hookedBinary(); ok {
+		fix = installFix(bin)
+	}
+	if d.reply.Config == nil {
+		// Older than config reporting. That is NOT always a stale build the check above has
+		// caught: a doctor newer than the hooks meets a daemon of the hooks' build, which
+		// passes "build" and still predates this field — and a daemon from before GOV-44 that
+		// a gate started is exactly the one that read the wrong file. So it is reported as
+		// unverifiable, with the install that upgrades it, never as a pass.
+		d.add(name, unverified, "the daemon predates config reporting, so nothing can confirm it loaded the config on disk", fix)
+		return
+	}
+	path, disk, found, err := readDiskConfig()
+	if err != nil {
+		d.add(name, skip, "the config could not be read; see the config check above", "")
+		return
+	}
+	if why := calibrationDrift(d.reply.Config, d.reply.Ceiling, path, disk, found); why != "" {
+		d.add(name, fail, "the running daemon is not running the config on disk: "+why, fix)
+		return
+	}
+	switch {
+	case !found:
+		d.add(name, pass, fmt.Sprintf("the daemon found no config at %s either; both are on built-in defaults", short(path)), "")
+	case disk.CalibratedAt == "":
+		d.add(name, pass, fmt.Sprintf("the daemon loaded %s, which carries no calibration", short(path)), "")
+	case d.reply.Ceiling == 0:
+		// No control loop, so no live ceiling or threshold to quote.
+		d.add(name, pass, fmt.Sprintf("the daemon loaded %s as calibrated %s", short(path), disk.CalibratedAt), "")
+	default:
+		d.add(name, pass, fmt.Sprintf("the daemon loaded %s as calibrated %s, and serves ceiling %d at run-queue cut %.2f",
+			short(path), disk.CalibratedAt, d.reply.Ceiling, d.reply.Config.RunQueueCut), "")
+	}
 }
 
 // installFix is the install command that actually fixes a stale finding, given the hooked
@@ -1770,7 +1841,7 @@ func (d *diagnosis) checkConfig() {
 	path, err := config.Path()
 	if err != nil {
 		d.add("config", fail, fmt.Sprintf("cannot locate the config: %v", err),
-			fmt.Sprintf("set %s or HOME", config.DataDirEnv))
+			fmt.Sprintf("set %s or HOME", transport.StateDirEnv))
 		return
 	}
 	raw, err := os.ReadFile(path)
@@ -2085,7 +2156,7 @@ func sameFile(a, b string) bool {
 // objects to. That is real, worth printing, and not a defect in this installation, which is
 // what the warn state is for. It does not move the exit code.
 //
-// A CALIBRATION FROM A DIFFERENT MACHINE IS THE CHECK WORTH HAVING. `${CLAUDE_PLUGIN_DATA}`
+// A CALIBRATION FROM A DIFFERENT MACHINE IS THE CHECK WORTH HAVING. The state directory
 // lives in a home directory, and home directories get synced, imaged and copied into
 // containers. A config carrying an 8-core laptop's ceiling on a 2-core container is not
 // corrupt and not from the future, so nothing else here would say a word about it — and the

@@ -2249,3 +2249,22 @@ the Homebrew tap installed in the v0.1.1 release run. In a terminal the command 
   cloned over SSH on a machine that has them. A stranger without them is the case that matters,
   and it was not tested.
 - **The command source on Linux.**
+
+## 24. Which processes carry `CLAUDE_PLUGIN_DATA` — measured 2026-10-31 (GOV-44)
+
+**The Bash tool's shell does NOT carry it.** `echo "PLUGIN_DATA=$CLAUDE_PLUGIN_DATA"`, run through
+the Bash tool in a session with build-governor loaded, printed `PLUGIN_DATA=` (empty). So a
+`governor` command a model runs through Bash resolves paths the way a terminal does, not the way
+a hook does.
+
+**A hook does, as an environment variable.** That is §23's measurement. It was seen again on
+this machine through an artefact rather than a probe:
+`~/.claude/plugins/data/build-governor-skills-dir/onboarded` holds `2026-10-31T19:17:16Z`. The
+SessionStart hook is its only writer, and it writes there only by resolving `CLAUDE_PLUGIN_DATA`
+from its environment.
+
+**A daemon forked from a gate inherits it.** `lazystart.go` passes the gate's whole environment
+on. On 2026-10-31 a gate-started daemon read `$CLAUDE_PLUGIN_DATA/config.json` while
+`calibrate`, run from a terminal, wrote `~/.claude/governor/config.json`. design.md §13.3a has
+the consequence and the rule it produced, and docs/dogfooding.md has the log.
+

@@ -8,9 +8,9 @@ import (
 	"time"
 
 	"github.com/peter3605/claude-governor/internal/budget"
-	"github.com/peter3605/claude-governor/internal/config"
 	"github.com/peter3605/claude-governor/internal/lease"
 	"github.com/peter3605/claude-governor/internal/signals"
+	"github.com/peter3605/claude-governor/internal/transport"
 )
 
 // stubSampler hands out a scripted reading and counts how many times it was asked.
@@ -296,9 +296,9 @@ func (silentSampler) Host(context.Context) (signals.Host, error) { return signal
 // real on a two-core CI host it would floor anyway, and the test could not tell the fix from
 // the bug.
 func TestAColdDaemonServesItsCeilingNotTheFloor(t *testing.T) {
-	// An empty data directory, so a config left by a calibration on this machine — or a
-	// plugin context the tests happen to run inside — cannot cap the ceiling under the test.
-	t.Setenv(config.DataDirEnv, t.TempDir())
+	// An empty state directory, so a config left by a calibration on this machine cannot cap
+	// the ceiling under the test.
+	t.Setenv(transport.StateDirEnv, t.TempDir())
 
 	const capacity = 12
 	saved := hostCapacity

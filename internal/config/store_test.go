@@ -487,36 +487,51 @@ func compact(t *testing.T, raw json.RawMessage) string {
 	return buf.String()
 }
 
-// Clause one of the story: the config lives at ${CLAUDE_PLUGIN_DATA}/config.json. Path is
-// where that promise is kept, and it is the seam between what Claude Code names for the
-// plugin and where the governor keeps everything else.
-func TestPathIsInsideTheDataDirectoryClaudeCodeNames(t *testing.T) {
-	dir := t.TempDir()
-	t.Setenv(DataDirEnv, dir)
+// GOV-44, clause 1: the writer and the reader resolve the same file whoever started them.
+//
+// `calibrate` runs from a terminal, where CLAUDE_PLUGIN_DATA is unset. A daemon a gate starts
+// is a child of a hook, where Claude Code sets it. Path used to prefer that variable, so the
+// two resolved different files and every gate-started daemon ran uncalibrated. The assertion
+// is therefore not "Path is in the state directory" alone: it is that setting the plugin
+// variable does not move it.
+func TestPathIsTheSameWithOrWithoutThePluginDataDirectory(t *testing.T) {
+	state := t.TempDir()
+	t.Setenv(transport.StateDirEnv, state)
 
-	got, err := Path()
+	t.Setenv(DataDirEnv, "")
+	terminal, err := Path()
 	if err != nil {
 		t.Fatalf("Path: %v", err)
 	}
-	if want := filepath.Join(dir, File); got != want {
-		t.Fatalf("Path is %s, want %s", got, want)
+	plugin := t.TempDir()
+	t.Setenv(DataDirEnv, plugin)
+	hook, err := Path()
+	if err != nil {
+		t.Fatalf("Path: %v", err)
+	}
+	if terminal != hook {
+		t.Fatalf("a terminal resolves %s and a hook-started process resolves %s: calibrate and a gate-started daemon read different files", terminal, hook)
+	}
+	if want := filepath.Join(state, File); hook != want {
+		t.Fatalf("Path is %s, want %s", hook, want)
 	}
 
 	// And it is a name, not a side effect: a doctor or a statusline that conjured a
 	// directory while merely asking where one would be is what design.md 13.3 forbids.
-	entries, err := os.ReadDir(dir)
-	if err != nil {
-		t.Fatalf("read %s: %v", dir, err)
-	}
-	if len(entries) != 0 {
-		t.Fatalf("Path created %v inside the data directory", entries)
+	for _, dir := range []string{state, plugin} {
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			t.Fatalf("read %s: %v", dir, err)
+		}
+		if len(entries) != 0 {
+			t.Fatalf("Path created %v inside %s", entries, dir)
+		}
 	}
 }
 
-// Outside a plugin context — a governor run by hand, or doctor from a shell — the config
-// falls back to the state directory, beside the socket. One directory holds the governor's
-// state, so uninstall has one place to look.
-func TestPathFallsBackToTheStateDirectoryOutsideAPluginContext(t *testing.T) {
+// The config lives in the state directory, beside the socket. One directory holds the
+// governor's state, so uninstall has one place to look.
+func TestPathIsInTheStateDirectory(t *testing.T) {
 	t.Setenv(DataDirEnv, "")
 	state := t.TempDir()
 	t.Setenv(transport.StateDirEnv, state)
@@ -530,12 +545,11 @@ func TestPathFallsBackToTheStateDirectoryOutsideAPluginContext(t *testing.T) {
 	}
 }
 
-// The end-to-end shape of clause one, driven through Path rather than a hand-built path:
-// with CLAUDE_PLUGIN_DATA set, a saved config is a config.json in that directory carrying a
-// schema number.
+// The end-to-end shape, driven through Path rather than a hand-built path: a saved config is
+// a config.json in the state directory carrying a schema number.
 func TestASavedConfigIsAConfigJSONCarryingASchemaNumber(t *testing.T) {
 	dir := t.TempDir()
-	t.Setenv(DataDirEnv, dir)
+	t.Setenv(transport.StateDirEnv, dir)
 
 	path, err := Path()
 	if err != nil {
@@ -546,7 +560,7 @@ func TestASavedConfigIsAConfigJSONCarryingASchemaNumber(t *testing.T) {
 
 	raw, err := os.ReadFile(filepath.Join(dir, File))
 	if err != nil {
-		t.Fatalf("no config.json in the data directory: %v", err)
+		t.Fatalf("no config.json in the state directory: %v", err)
 	}
 	var doc struct {
 		Schema *int `json:"schema"`

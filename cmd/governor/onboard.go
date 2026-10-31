@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/peter3605/claude-governor/internal/config"
+	"github.com/peter3605/claude-governor/internal/transport"
 )
 
 // The one-time first-run notice (GOV-22).
@@ -30,18 +31,30 @@ import (
 // the timestamp inside is for a person reading the directory, not for this code.
 const onboardMarker = "onboarded"
 
-// onboardPath is the marker's home: beside config.json, which is ${CLAUDE_PLUGIN_DATA} when
-// Claude Code has named a data directory for the plugin and the governor's own state
-// directory otherwise (design.md section 13.3).
+// onboardPath is the marker's home: ${CLAUDE_PLUGIN_DATA} when Claude Code has named a data
+// directory for the plugin, and the governor's own state directory otherwise (design.md
+// section 13.3).
+//
+// IT STILL CONSULTS THE PLUGIN VARIABLE AND config.Path NO LONGER DOES (GOV-44), and the
+// difference is the rule of design.md section 13.3a applied rather than broken. The config is
+// written from a terminal and read by a daemon a hook may have started, so the two must not
+// depend on a variable only one of them has. The marker is written AND read by the
+// SessionStart hook and nothing else, which always runs with the variable set — one kind of
+// process on both ends. Keeping it in the plugin's directory keeps what that directory buys:
+// a plain uninstall leaves the marker, so reinstalling does not re-show a notice the person
+// has already read.
 //
 // It resolves a name and touches nothing, for config.Path()'s reason: a hook that conjured
 // a directory while merely asking where one would be is what section 13.3 exists to prevent.
 func onboardPath() (string, error) {
-	cfg, err := config.Path()
+	if d := os.Getenv(config.DataDirEnv); d != "" {
+		return filepath.Join(d, onboardMarker), nil
+	}
+	dir, err := transport.StateDir()
 	if err != nil {
 		return "", err
 	}
-	return filepath.Join(filepath.Dir(cfg), onboardMarker), nil
+	return filepath.Join(dir, onboardMarker), nil
 }
 
 // claimFirstRun reports whether THIS process is the one that must show the notice, and
