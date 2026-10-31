@@ -364,6 +364,11 @@ type statusReply struct {
 	Build string `json:"build,omitempty"`
 	// DaemonStarted is when this daemon came up, RFC3339. See daemon.started.
 	DaemonStarted string `json:"daemon_started,omitempty"`
+	// Config is what this daemon loaded from config.json at startup, and the run-queue
+	// threshold it is cutting at now (GOV-44; see configdrift.go). The build's companion: the
+	// build says which binary is holding the socket, this says which config it is running.
+	// Additive, no protocol bump, for the reason given above BinaryVersion.
+	Config *loadedConfig `json:"config,omitempty"`
 	// HooksInstalled is the mtime of the gate's hooks file, RFC3339, empty when there is no
 	// such file. A session that started before it could not have loaded the gate and is
 	// ungoverned for the rest of its life, which is the whole of GOV-29's defect.
@@ -532,6 +537,15 @@ type daemon struct {
 	// design.md section 13.4 requires of every config key. See ceiling for why a calibrated
 	// value CAPS that derivation rather than replacing it.
 	calibratedBMax int
+
+	// loaded is what this daemon read from config.json at startup, reported in status so a
+	// reader can tell whether it is running what is on disk (GOV-44, configdrift.go). Nil for
+	// a daemon that never loaded a config — every daemon a test builds.
+	loaded *loadedConfig
+	// configStamp is config.json's identity when it was last loaded, so the sampling tick can
+	// see that `calibrate` rewrote it and reload (reloadConfig). Guarded by signalsMu, like
+	// loaded, calibratedBMax and the loop it feeds.
+	configStamp fileStamp
 
 	// sampler reads this host's load. It is nil unless something wired one in, and a nil
 	// sampler means the daemon reports every signal as null rather than as zero.
@@ -863,8 +877,11 @@ func (d *daemon) observeThisMachine() {
 	// The loop is wired here and nowhere else, beside the sampler that feeds it. A daemon
 	// built by a test has neither, and so keeps the fixed budget it was constructed with —
 	// which is what lets a lease test assert against a number it chose.
-	cal := loadCalibration(d.diag)
+	cal, loaded := loadCalibration(d.diag)
 	d.calibratedBMax = cal.BMax
+	loaded.RunQueueOverride = runQueueMaxOverride(io.Discard)
+	d.loaded = &loaded
+	d.configStamp = stampOf(loaded.Path)
 	// MAX IS SET HERE, NOT LEFT FOR THE FIRST TICK (GOV-41). Controller.start() begins at the
 	// ceiling precisely because the daemon is started lazily by a gate, but with Max unset
 	// the ceiling it begins at is zero, which reads as Floor: every daemon answered budget 1
@@ -1065,6 +1082,7 @@ func (d *daemon) sample(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-t.C:
+			d.reloadConfig()
 			// Read demand BEFORE the signals lock, not inside it: the wait queue has a lock
 			// of its own and every acquire holds it, so nesting the two would put the
 			// sampling goroutine in a lock order no other path uses.
@@ -1661,6 +1679,7 @@ func (d *daemon) status(req request) statusReply {
 		Waiting:           d.waits.len(),
 		BinaryVersion:     binaryVersion,
 		Build:             d.build,
+		Config:            d.statusConfig(),
 		Thermal:           d.thermal(),
 		Sources:           sources,
 		DaemonStarted:     d.started.UTC().Format(time.RFC3339),
@@ -1766,19 +1785,38 @@ func sourceName(quotas []budget.Quota) string {
 // never calibrated" — a state and not a fault (design.md section 13.4). The alternative is a
 // daemon that refuses to start because a tuning file was unreadable, which takes the machine
 // ungoverned in order to protect a number that has a working default.
-func loadCalibration(diag io.Writer) config.Config {
+//
+// BUT NONE OF THEM IS SILENT (GOV-44). A missing file used to yield an empty Config with no
+// error and no log line, so a daemon reading the wrong path ran on shipped defaults for as
+// long as it lived and its log looked exactly like a healthy uncalibrated one. Every start now
+// names the path it resolved and says what it found there, so the log of any daemon answers
+// "which config is this running" without reproducing anything.
+func loadCalibration(diag io.Writer) (config.Config, loadedConfig) {
 	path, err := config.Path()
 	if err != nil {
 		fmt.Fprintf(diag, "governor daemon: cannot locate config, using built-in defaults: %v\n", err)
-		return config.Config{}
+		return config.Config{}, loadedConfig{}
+	}
+	loaded := loadedConfig{Path: path}
+	if _, err := os.Stat(path); os.IsNotExist(err) {
+		fmt.Fprintf(diag, "governor daemon: config %s: not found, using built-in defaults\n", path)
+		return config.Config{}, loaded
 	}
 	store := &config.FileStore{Path: path, Warn: func(s string) { fmt.Fprintln(diag, s) }}
 	c, err := store.Load(context.Background())
 	if err != nil {
-		fmt.Fprintf(diag, "governor daemon: cannot read %s, using built-in defaults: %v\n", path, err)
-		return config.Config{}
+		fmt.Fprintf(diag, "governor daemon: config %s: cannot read it, using built-in defaults: %v\n", path, err)
+		return config.Config{}, loaded
 	}
-	return c
+	loaded.Found = true
+	loaded.BMax, loaded.RunQueueMax, loaded.CalibratedAt = c.BMax, c.RunQueueMax, c.CalibratedAt
+	if c.CalibratedAt == "" {
+		fmt.Fprintf(diag, "governor daemon: config %s: found, never calibrated, using built-in defaults\n", path)
+	} else {
+		fmt.Fprintf(diag, "governor daemon: config %s: found, calibrated %s (b_max %d, run-queue cut %g)\n",
+			path, c.CalibratedAt, c.BMax, c.RunQueueMax)
+	}
+	return c, loaded
 }
 
 // resolveRunQueueMax picks the threshold this daemon cuts at, from three possible sources.

@@ -1,5 +1,6 @@
-// Package config reads and writes the versioned config at
-// ${CLAUDE_PLUGIN_DATA}/config.json.
+// Package config reads and writes the versioned config at <state dir>/config.json — the
+// governor's own state directory, beside the socket. See Path for why it is not
+// ${CLAUDE_PLUGIN_DATA}.
 //
 // The seam (design.md section 12.1, 13.4): the schema is versioned and migrated on read,
 // so a config written by a newer binary must not brick an older one. Unknown keys warn and
@@ -9,7 +10,6 @@ package config
 
 import (
 	"context"
-	"os"
 	"path/filepath"
 
 	"github.com/peter3605/claude-governor/internal/transport"
@@ -75,23 +75,38 @@ const File = "config.json"
 
 // DataDirEnv is the environment variable Claude Code sets to the plugin's own data
 // directory (design.md sections 9 and 13.3).
+//
+// Path DOES NOT CONSULT IT, and the constant lives here only so the processes that do — the
+// onboarding marker, doctor's environment listing, uninstall --purge — name one spelling of it.
 const DataDirEnv = "CLAUDE_PLUGIN_DATA"
 
-// Path is where config.json lives.
+// Path is where config.json lives: the governor's own state directory, the same directory
+// as the socket, resolved by the same chain (GOVERNOR_STATE_DIR, then HOME).
 //
-// ${CLAUDE_PLUGIN_DATA}/config.json when Claude Code has named a data directory for the
-// plugin, and the governor's own state directory otherwise — the same directory as the
-// socket, because design.md section 13.3's promise is that one directory holds all of the
-// governor's state and uninstall removes it. A separate fallback location would be a path
-// uninstall silently stops covering.
+// IT DOES NOT CONSULT ${CLAUDE_PLUGIN_DATA}, AND UNTIL GOV-44 IT DID. That variable is set
+// only in processes Claude Code starts for the plugin — hooks, the MCP server — and their
+// children. `governor calibrate` and `governor install` run from a terminal where it is
+// unset, so they wrote <state dir>/config.json. A daemon lazily started by a gate is a child
+// of a hook, so it read ${CLAUDE_PLUGIN_DATA}/config.json, found nothing, and ran on the
+// compiled-in constants without a word — while binding the CORRECT socket, because
+// transport.DefaultEndpoint never looked at the plugin variable. On 2026-10-31 that daemon
+// served ceiling 6 against a calibrated 4 and cut at run queue 2.0 against a calibrated 4.72
+// (docs/dogfooding.md). Calibration is what install exists to deliver, and every daemon
+// started after a reboot comes up through the gate.
+//
+// The state directory is the canonical location rather than the plugin's, for two reasons.
+// Every writer of this file is a person at a terminal, so the reader has to be made to agree
+// with the writer and not the other way round. And design.md section 13.3 promises that one
+// directory holds all of the governor's state and uninstall removes it: a config in a
+// plugin-scoped directory named after whichever route the plugin loaded by is a path
+// uninstall can silently stop covering. The rule is the one section 13.3a states for every
+// environment-resolved path: a gate-started process and a terminal-started one must resolve
+// it identically, so nothing that decides behaviour may read a variable only one of them has.
 //
 // It resolves a name and does not touch the filesystem. A governor that has never been
 // configured has no config file, and a doctor or a statusline that conjured a directory
 // while merely asking where one would be is exactly what section 13.3 exists to prevent.
 func Path() (string, error) {
-	if d := os.Getenv(DataDirEnv); d != "" {
-		return filepath.Join(d, File), nil
-	}
 	dir, err := transport.StateDir()
 	if err != nil {
 		return "", err

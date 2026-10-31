@@ -5,10 +5,14 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"os"
+	"os/exec"
+	"path/filepath"
 	"time"
 
 	"github.com/peter3605/claude-governor/internal/calibrate"
 	"github.com/peter3605/claude-governor/internal/config"
+	"github.com/peter3605/claude-governor/internal/transport"
 )
 
 // calibrateBudget bounds the whole command.
@@ -34,6 +38,14 @@ const calibrateBudget = 30 * time.Second
 // does NOT write a setpoint or an EWMA window — both would be numbers no code reads, and the
 // reasoning for each is recorded in internal/calibrate's package comment.
 func runCalibrate(args []string, stdout, stderr io.Writer) int {
+	return calibrateCommand(args, stdout, stderr, true)
+}
+
+// calibrateCommand is runCalibrate with one switch: whether to check the running daemon
+// afterwards. install turns it off because install replaces a drifted daemon itself
+// (refreshDaemonConfig), and telling someone mid-install to run the command they are
+// already running is noise.
+func calibrateCommand(args []string, stdout, stderr io.Writer, checkDaemon bool) int {
 	fs := flag.NewFlagSet("governor calibrate", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	dryRun := fs.Bool("dry-run", false, "measure and print, but write nothing")
@@ -107,5 +119,63 @@ func runCalibrate(args []string, stdout, stderr io.Writer) int {
 	} else {
 		fmt.Fprintf(stdout, "\nwritten to %s\n", path)
 	}
+	if checkDaemon {
+		noteDaemonDrift(stdout)
+	}
 	return 0
+}
+
+// noteDaemonDrift says so when the running daemon has not picked up the config just written.
+//
+// A daemon of this build reloads config.json on its next sampling tick, so this waits for that
+// and says nothing when it lands — the ordinary case. What is left is a daemon that cannot
+// reload: one older than GOV-44, or one reading another path. Before GOV-44 every calibration
+// written under a running daemon silently did not apply until something restarted it.
+//
+// It REPORTS rather than restarts, the rule GOV-43 chose for every surface that is not
+// install: replacing the process that holds the socket is install's job, and the line names
+// the install that does it.
+func noteDaemonDrift(stdout io.Writer) {
+	deadline := time.Now().Add(configReloadWait)
+	why := ""
+	for {
+		c := query(io.Discard, transport.Dial{}, time.Now().Add(statusBudget))
+		if c.Down {
+			return
+		}
+		if c.Reply.Config == nil {
+			why = "it is older than config reporting, so it cannot reload a calibration"
+		} else {
+			path, disk, found, err := readDiskConfig()
+			if err != nil {
+				return
+			}
+			why = calibrationDrift(c.Reply.Config, c.Reply.Ceiling, path, disk, found)
+		}
+		if why == "" || time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	if why != "" {
+		fmt.Fprintf(stdout, "\nThe running daemon is still on its old numbers: %s.\n", why)
+		fmt.Fprintf(stdout, "They take effect when it is replaced: %s\n", calibrateFix())
+	}
+}
+
+// calibrateFix is the install that replaces the daemon: this binary by absolute path when it
+// is not the bare `governor` on PATH, for installFix's reason (GOV-43/GOV-45 — a bare name may
+// resolve to an older, shadowing copy).
+func calibrateFix() string {
+	self, err := os.Executable()
+	if err != nil {
+		return "governor install"
+	}
+	if onPath, err := exec.LookPath("governor"); err == nil && sameFile(onPath, self) {
+		return "governor install"
+	}
+	if abs, err := filepath.Abs(self); err == nil {
+		self = abs
+	}
+	return self + " install"
 }

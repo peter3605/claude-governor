@@ -91,6 +91,7 @@ func machineWithSurface(t *testing.T, live []signals.LiveSession, hooksAt, daemo
 				d.surface.note(version, tool)
 			}
 		}
+		loadsItsConfig(d)
 	})
 	for _, id := range registered {
 		pid := 0

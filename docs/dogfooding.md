@@ -365,3 +365,66 @@ roughly budget + 3.75 for as long as the build runs. While it runs, `t.weight` i
 the limit, so every other request is refused until it finishes. That is the intended trade:
 a build too large for the machine serializes the machine rather than never running, and the
 overshoot is bounded by one build.
+
+## Three daemons, one config: calibration that never loaded (GOV-44)
+
+On 2026-10-31 one `governor doctor` run printed `calibration ... b_max 4 slots`, read from
+`~/.claude/governor/config.json`, and `budget 6 slots, the most this host allows, with nothing
+cutting it`, read from the daemon. Both were green. They cannot both be true, and the daemon log
+shows which one was wrong and why.
+
+### What the log contains
+
+`~/.claude/governor/daemon.log`, lines 1252–1259. The log has no timestamp on start lines, so the
+times below come from the `calibrated_at` each daemon quotes and from the first `budget peak`
+line after each start. Same binary, same machine, a few minutes apart:
+
+| # | Started by | Log | Ceiling served |
+|---|---|---|---|
+| 1 | `governor install`, ~19:06Z | `run-queue threshold 6.08, calibrated for this host (2026-10-31T19:03:33Z)` | 4 |
+| 2 | the gate's lazy start, 19:24Z | **no calibration line at all**, then `budget peak in_use=1/6` at 15:24:40-04:00 | **6** |
+| 3 | by hand, after `calibrate` at 19:14:30Z | `run-queue threshold 4.72, calibrated for this host (2026-10-31T19:14:30Z)` | 4 |
+
+Daemon 2 is the defect. It read no calibration, so it served the ceiling derived from 8 cores
+(8 / 1.2, with no efficiency-core discount) and cut at the compiled-in run-queue threshold of
+2.0. The calibrated values were `b_max` 4 and 4.72. So it was wrong in both directions at once:
+it admitted too much, and it throttled far too early on run queue. The story text says the
+config held 4.72 "throughout". The log disagrees for daemon 1: it loaded a calibration from
+19:03:33Z with threshold 6.08, and 4.72 was written at 19:14:30Z. That does not change the
+finding, because daemons 1 and 3 each loaded whatever calibration was on disk when they
+started, and daemon 2 loaded nothing.
+
+### Why
+
+`config.Path()` returned `$CLAUDE_PLUGIN_DATA/config.json` when that variable was set.
+`transport.DefaultEndpoint()` never looked at it. `calibrate` and `install` run from a terminal,
+where the variable is unset, so they wrote the state directory's `config.json`. A daemon a gate
+starts is a child of a hook, which Claude Code gives the variable. So daemon 2 bound the correct
+socket and read `~/.claude/plugins/data/build-governor-skills-dir/config.json`, which did not
+exist. A missing config returned an empty `Config` with no error and no log line, which is why
+the log has nothing where daemon 2's calibration line should be.
+
+The hook environment is confirmed by what the hooks wrote, not just by the code:
+`~/.claude/plugins/data/build-governor-skills-dir/onboarded` is stamped `2026-10-31T19:17:16Z`,
+and only the SessionStart hook resolving `${CLAUDE_PLUGIN_DATA}` to that directory writes there.
+No `config.json` exists under any `~/.claude/plugins/data/*/` on this machine, so nothing was
+ever written to the path daemon 2 read.
+
+### And a fourth, still running when GOV-44 started
+
+The daemon that was running when GOV-44 started had logged `run-queue threshold 4.81,
+calibrated for this host (2026-10-31T22:23:56Z)` when it started (log line 1264). But
+`config.json` held 5.02, calibrated at 22:33:16Z. That is install
+again. It starts the daemon and then calibrates, deliberately, so the probe measures a machine
+with the governor running. The daemon read the file only at startup, so every install left it
+on the previous calibration. This one is not about the environment. It is the same symptom,
+though, and the same doctor check that was missing would have caught it.
+
+### What changed
+
+- `config.Path()` resolves the state directory and nothing else (design.md §13.3a has the
+  rule and the audit of every environment-resolved path).
+- Each daemon logs the config path it resolved and either what it found or `not found, using
+  built-in defaults`. It also reports what it loaded in `status`, re-reads the file when the
+  file changes, and doctor's new `loaded` check fails when the daemon and the file disagree. That
+  check compares the path, the calibration, and the live ceiling and run-queue threshold.

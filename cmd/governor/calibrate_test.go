@@ -11,6 +11,7 @@ import (
 
 	"github.com/peter3605/claude-governor/internal/budget"
 	"github.com/peter3605/claude-governor/internal/config"
+	"github.com/peter3605/claude-governor/internal/transport"
 )
 
 // TestCalibrateWritesNumbersTheDaemonActuallyReads is the test this story most needed, and it
@@ -28,7 +29,7 @@ import (
 // file reaches the controller that cuts the budget.
 func TestCalibrateWritesNumbersTheDaemonActuallyReads(t *testing.T) {
 	dir := t.TempDir()
-	t.Setenv(config.DataDirEnv, dir)
+	t.Setenv(transport.StateDirEnv, dir)
 
 	const calibrated = 4.25
 	writeConfig(t, filepath.Join(dir, config.File), map[string]any{
@@ -38,7 +39,7 @@ func TestCalibrateWritesNumbersTheDaemonActuallyReads(t *testing.T) {
 	})
 
 	var diag bytes.Buffer
-	c := loadCalibration(&diag)
+	c, _ := loadCalibration(&diag)
 	if got := resolveRunQueueMax(c, &diag); got != calibrated {
 		t.Errorf("the daemon resolved a run-queue threshold of %v, want the calibrated %v", got, calibrated)
 	}
@@ -59,10 +60,10 @@ func TestCalibrateWritesNumbersTheDaemonActuallyReads(t *testing.T) {
 // that is a state rather than a fault — so it must get the compiled-in threshold and the
 // per-tick ceiling, not a zero of either.
 func TestAnUncalibratedMachineBehavesExactlyAsItDidBefore(t *testing.T) {
-	t.Setenv(config.DataDirEnv, t.TempDir()) // no config.json written
+	t.Setenv(transport.StateDirEnv, t.TempDir()) // no config.json written
 
 	var diag bytes.Buffer
-	c := loadCalibration(&diag)
+	c, _ := loadCalibration(&diag)
 
 	// Zero from resolveRunQueueMax means "use the package constant" — it is what
 	// budget.Controller.RunQueueMax documents as its unset value.
@@ -104,14 +105,15 @@ func TestACalibratedCeilingOnlyEverLowersTheDerivedOne(t *testing.T) {
 // that belonged to something other than the variable it thought it was changing.
 func TestTheSweepEnvironmentStillBeatsACalibratedThreshold(t *testing.T) {
 	dir := t.TempDir()
-	t.Setenv(config.DataDirEnv, dir)
+	t.Setenv(transport.StateDirEnv, dir)
 	t.Setenv(runQueueMaxEnv, "8.0")
 	writeConfig(t, filepath.Join(dir, config.File), map[string]any{
 		"schema": config.Schema, "run_queue_max": 4.25,
 	})
 
 	var diag bytes.Buffer
-	if got := resolveRunQueueMax(loadCalibration(&diag), &diag); got != 8.0 {
+	c, _ := loadCalibration(&diag)
+	if got := resolveRunQueueMax(c, &diag); got != 8.0 {
 		t.Errorf("resolved %v with the sweep variable set to 8.0 and a calibrated 4.25 on disk, want 8.0", got)
 	}
 }
@@ -132,12 +134,12 @@ func TestAnUnreadableConfigLeavesTheDaemonRunningOnDefaults(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			dir := t.TempDir()
-			t.Setenv(config.DataDirEnv, dir)
+			t.Setenv(transport.StateDirEnv, dir)
 			if err := os.WriteFile(filepath.Join(dir, config.File), []byte(tc.body), 0o600); err != nil {
 				t.Fatal(err)
 			}
 			var diag bytes.Buffer
-			c := loadCalibration(&diag)
+			c, _ := loadCalibration(&diag)
 			if got := resolveRunQueueMax(c, &diag); got != 0 {
 				t.Errorf("resolved %v from an unreadable config, want 0 so the compiled-in default stands", got)
 			}
@@ -156,7 +158,7 @@ func TestAnUnreadableConfigLeavesTheDaemonRunningOnDefaults(t *testing.T) {
 // one command that can violate that — honouring the refusal means not proceeding to Save.
 func TestCalibrateRefusesToOverwriteAConfigItCannotRead(t *testing.T) {
 	dir := t.TempDir()
-	t.Setenv(config.DataDirEnv, dir)
+	t.Setenv(transport.StateDirEnv, dir)
 	path := filepath.Join(dir, config.File)
 	const original = `{"schema": 99, "run_queue_max": 4.25}`
 	if err := os.WriteFile(path, []byte(original), 0o600); err != nil {
@@ -183,7 +185,7 @@ func TestCalibrateRefusesToOverwriteAConfigItCannotRead(t *testing.T) {
 // the story explicitly wants people to do, mid-session — a destructive act.
 func TestCalibratePreservesEverythingItDoesNotOwn(t *testing.T) {
 	dir := t.TempDir()
-	t.Setenv(config.DataDirEnv, dir)
+	t.Setenv(transport.StateDirEnv, dir)
 	path := filepath.Join(dir, config.File)
 	writeConfig(t, path, map[string]any{
 		"schema":           config.Schema,
@@ -232,7 +234,7 @@ func TestCalibratePreservesEverythingItDoesNotOwn(t *testing.T) {
 // promises to write nothing at all.
 func TestCalibrateDryRunWritesNothing(t *testing.T) {
 	dir := t.TempDir()
-	t.Setenv(config.DataDirEnv, dir)
+	t.Setenv(transport.StateDirEnv, dir)
 
 	var stdout, stderr bytes.Buffer
 	if code := runCalibrate([]string{"--dry-run", "--no-probe"}, &stdout, &stderr); code != 0 {
@@ -253,7 +255,7 @@ func TestCalibrateDryRunWritesNothing(t *testing.T) {
 // differ, which they will because the machine moves.
 func TestCalibrateIsIdempotentInTheWayInstallNeeds(t *testing.T) {
 	dir := t.TempDir()
-	t.Setenv(config.DataDirEnv, dir)
+	t.Setenv(transport.StateDirEnv, dir)
 	path := filepath.Join(dir, config.File)
 
 	var stdout, stderr bytes.Buffer
@@ -285,7 +287,7 @@ func TestCalibrateIsIdempotentInTheWayInstallNeeds(t *testing.T) {
 // the config is the interface between two commands that never run in the same process.
 func TestCalibrationIsReadableByTheStoreItWasWrittenBy(t *testing.T) {
 	dir := t.TempDir()
-	t.Setenv(config.DataDirEnv, dir)
+	t.Setenv(transport.StateDirEnv, dir)
 
 	var stdout, stderr bytes.Buffer
 	if code := runCalibrate([]string{"--no-probe", "--quiet"}, &stdout, &stderr); code != 0 {

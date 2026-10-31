@@ -1711,7 +1711,7 @@ claude-governor/                  the repo
 state  → ~/.claude/governor/      sock, daemon.pid, daemon.log, daemon.start, statusline.json,
                                   statusline.json.*, onboarded, surface.json, surface.json.tmp,
                                   config.json, samples.jsonl, sampler.lock, sampler.log
-config → ${CLAUDE_PLUGIN_DATA}/config.json, falling back to the state directory
+config → the state directory's config.json, always (GOV-44; §13.3a)
 ```
 
 **The installed tree is SIX files**: `.claude-plugin/plugin.json`, `hooks/hooks.json`, `.mcp.json`,
@@ -1818,17 +1818,21 @@ interact with the lazy-start cooldown, and with two installs coexisting (a dev b
 turn, dropping every live lease each time. A rule that flips between two builds is worse than
 saying so.
 
-**And a restart from the gate is, today, a restart without calibration (GOV-44).** The only
-way a hook can start a daemon is `lazystart.go`, and a daemon started that way inherits
-`CLAUDE_PLUGIN_DATA` from the hook. `config.Path()` honours that variable and
-`transport.DefaultEndpoint()` does not, so the daemon binds the right socket but reads
-`$CLAUDE_PLUGIN_DATA/config.json` rather than the file `governor calibrate` wrote. Measured
-2026-10-31: install's daemon logged `run-queue threshold 4.72, calibrated for this host`; a
-lazy-started one logged no calibration line and served ceiling 6 against a calibrated `b_max`
-of 4. A restart-on-mismatch rule would swap a stale but calibrated daemon for a current but
-uncalibrated one. The fix line is therefore `governor install`, which starts the daemon in the
-install's environment and does load calibration. Revisit this decision once GOV-44 lands; until
-then a hook restarting the daemon is a regression. The gate is not involved either: hashing a binary on every spawn is hot-path cost,
+**A restart from the gate was, until GOV-44, a restart without calibration — and that reason
+is now gone; the decision stands on the others.** The only way a hook can start a daemon is
+`lazystart.go`, and a daemon started that way inherits `CLAUDE_PLUGIN_DATA` from the hook.
+`config.Path()` honoured that variable and `transport.DefaultEndpoint()` did not, so the daemon
+bound the right socket but read `$CLAUDE_PLUGIN_DATA/config.json` rather than the file `governor
+calibrate` wrote. Measured 2026-10-31 (docs/dogfooding.md): install's daemon at 19:06Z logged
+`run-queue threshold 6.08` from the calibration then on disk; a lazy-started one at 19:24Z logged
+no calibration line and served ceiling 6 against a calibrated `b_max` of 4. GOV-44 made
+`config.Path()` ignore the plugin variable (§13.3a), so a gate-started daemon now loads the same
+file a terminal-started one does, and every daemon reloads `config.json` when it changes. A
+restart from a hook would therefore no longer trade a stale calibrated daemon for a current
+uncalibrated one. **That does not reopen report-never-restart.** The two reasons above it — the
+lazy-start cooldown interaction, and two coexisting installs killing each other's daemon in
+turn — are untouched by GOV-44, and either alone is enough. If the decision is revisited, it is
+on those grounds, and this paragraph should say so when it is. The gate is not involved either: hashing a binary on every spawn is hot-path cost,
 and the gate's only channel to a person is a deny.
 
 GOV-B07 added the other half of that. Claude Code runs a status line on events — an assistant
@@ -2474,10 +2478,10 @@ Uninstall is only verifiable if this list is exhaustive, so it is normative.
 | `~/.claude/governor/onboarded` | `session start`, only in the fallback below, and only when the directory already exists | uninstall |
 | `~/.claude/governor/surface.json` | daemon, when it first sees a spawn tool name it has not recorded for that Claude Code version (GOV-30) | uninstall |
 | `~/.claude/governor/surface.json.tmp` | daemon, staging the file above before the rename | uninstall |
-| `~/.claude/governor/config.json` | `calibrate`, **only** when `${CLAUDE_PLUGIN_DATA}` is unset — see below | uninstall |
+| `~/.claude/governor/config.json` | `calibrate` (and `install`, which runs it), always — whatever `${CLAUDE_PLUGIN_DATA}` says (GOV-44, §13.3a) | uninstall |
 | `~/.claude/governor/` | daemon (`transport.Listen`) | uninstall, only once it is empty; `--purge` regardless |
-| `~/.claude/plugins/data/build-governor-skills-dir/` (`${CLAUDE_PLUGIN_DATA}`: config, onboarding marker) | Claude Code creates it; the governor writes config.json and `onboarded` | uninstall `--purge` only |
-| `~/.claude/plugins/data/build-governor-claude-governor/` (`${CLAUDE_PLUGIN_DATA}` when the plugin loaded through the marketplace entry) | Claude Code creates it; the governor writes the same two files | uninstall `--purge` only |
+| `~/.claude/plugins/data/build-governor-skills-dir/` (`${CLAUDE_PLUGIN_DATA}`: the onboarding marker) | Claude Code creates it; the governor writes `onboarded`. Builds before GOV-44 could resolve `config.json` here, though no writer of it ran in a plugin context | uninstall `--purge` only |
+| `~/.claude/plugins/data/build-governor-claude-governor/` (`${CLAUDE_PLUGIN_DATA}` when the plugin loaded through the marketplace entry) | Claude Code creates it; the governor writes `onboarded` | uninstall `--purge` only |
 | `~/.claude/plugins/data/claude-governor-skills-dir/` (`${CLAUDE_PLUGIN_DATA}` under the plugin's name before the rename) | an install from before GOV-19 | uninstall `--purge` only |
 | `~/.claude/skills/claude-governor/` (the whole tree an install from before the rename wrote) | an install from before GOV-19 | **install**, and uninstall — only when its manifest is named `claude-governor` and it holds a governor binary |
 
@@ -2545,19 +2549,17 @@ ordinary case is byte-identical, formatting and key order included, not merely e
 There is a test that asserts this over a recursive digest of the whole home directory rather
 than over this table, because this table being exhaustive is the thing under test.
 
-`${CLAUDE_PLUGIN_DATA}` is set by Claude Code for a plugin. When it is unset — a binary run
-by hand, or a `doctor` run outside a plugin context — `config.json` resolves to the state
-directory above, beside the socket, rather than to a location of its own. One directory holds
-all of the governor's state, and a second home for the config would be a path uninstall
-silently stops covering.
+`config.json` lives in the state directory, beside the socket, and nowhere else. Until GOV-44 it
+followed `${CLAUDE_PLUGIN_DATA}` when that was set, which meant a terminal (where `calibrate`
+runs) and a hook-started daemon resolved two different files; §13.3a records that and the rule
+that replaced it. One directory holds all of the governor's state, and a second home for the
+config was a path uninstall could silently stop covering — and, as it turned out, a path the
+writer and the reader did not agree on.
 
-**So `config.json` has two rows in this table, and a plain uninstall removes exactly one of
-them** — the state-directory copy, on the same rule `onboarded` follows: in a plugin context
-your calibration survives an ordinary uninstall and only `--purge` discards it, because
-reinstalling is the same machine and re-measuring it is work you already did; outside one there
-is no such directory and it goes with everything else.
+**So a plain uninstall removes `config.json`**, and the next install recalibrates — which install
+does on every run anyway, so nothing a person did is lost.
 
-GOV-25 is why both rows exist. Before it, `install` wrote no config at all, so the state-
+GOV-25 is why the state-directory row exists. Before it, `install` wrote no config at all, so the state-
 directory path was reachable only by running `calibrate` by hand and its absence from
 `stateFiles` cost nothing. The moment install started calibrating, an uninstall left
 `config.json` behind and `~/.claude/governor/` could never empty — and every existing test
@@ -2566,10 +2568,10 @@ and that fixture keeps the state directory outside it. `TestUninstallEmptiesTheS
 is the one that now covers it, asserted against a listing rather than against `stateFiles`, so
 a file missing from both cannot pass.
 
-`onboarded` is the record that the first-run notice has been shown (GOV-22), and it lives
-beside `config.json` for `config.json`'s reason: one directory holds the governor's state, and
-a second home for a file is a path uninstall silently stops covering. In a plugin context that
-is `${CLAUDE_PLUGIN_DATA}`, so a plain uninstall **keeps** it and only `--purge` removes it —
+`onboarded` is the record that the first-run notice has been shown (GOV-22). It is the one file
+that still follows `${CLAUDE_PLUGIN_DATA}`, and §13.3a's rule is why that is allowed: it is
+written and read by the SessionStart hook and by nothing else, so both ends always resolve it in
+the same environment. In a plugin context it is therefore in `${CLAUDE_PLUGIN_DATA}`, so a plain uninstall **keeps** it and only `--purge` removes it —
 which is the behaviour the notice wants. Reinstalling after an ordinary uninstall is the same
 machine and the same person, and re-showing a notice they have already read and acted on is
 nagging; `--purge` says "forget everything about me", and a genuine fresh start should be
@@ -2649,9 +2651,61 @@ One consequence worth stating: while the hooks are installed, `settings.json` ca
 map key ordering rather than the user's. No value is altered, and uninstall restores the
 original bytes.
 
+### 13.3a Paths resolved from the environment
+
+**The rule (GOV-44): a gate-started process and a terminal-started one must resolve every path
+that decides behaviour identically.** Nothing a daemon reads to decide behaviour may depend on a
+variable that only one of those environments has. A path may follow such a variable only when
+every reader and every writer of it runs in that same environment.
+
+It is a rule because breaking it failed silently. The daemon resolved its socket through
+`GOVERNOR_ENDPOINT` → `GOVERNOR_STATE_DIR` → `HOME` and its config through `CLAUDE_PLUGIN_DATA` →
+the state directory. A daemon a gate started — a hook's child, carrying `CLAUDE_PLUGIN_DATA` —
+bound the right socket and read the wrong config **in the same process**, so everything that
+talks to the daemon worked and nothing looked broken. A missing config was not logged either.
+Measured on 2026-10-31: docs/dogfooding.md, "Three daemons, one config".
+
+Who has what. Claude Code sets `CLAUDE_PLUGIN_DATA` for the plugin's hooks, and so for their
+children, which includes a daemon `lazystart.go` forks from a gate (it passes its whole
+environment on, deliberately, so that `GOVERNOR_ENDPOINT` and `GOVERNOR_STATE_DIR` carry
+through). The Bash tool's shell is not one of those processes: `echo $CLAUDE_PLUGIN_DATA` there
+prints nothing (measured 2026-10-31). A terminal has neither variable. The hook's value was
+confirmed on this machine by what the hooks wrote, not just inferred from the code:
+`~/.claude/plugins/data/build-governor-skills-dir/onboarded`, stamped `2026-10-31T19:17:16Z`, can
+only have been put there by the SessionStart hook resolving `${CLAUDE_PLUGIN_DATA}` to that
+directory. Hooks receiving it as an environment variable, not only as a `${…}` expansion, was
+measured earlier (hook-surface.md §23), and so was the MCP server (§20.3). The status line is run
+by `settings.json`, not by the plugin, and whether it gets the variable is **unmeasured**. Nothing
+the status line reads depends on it.
+
+| Variable | Set by | Inherited by | What reads it | Gate-started vs terminal-started daemon |
+|---|---|---|---|---|
+| `GOVERNOR_STATE_DIR` | a person or a test, never Claude Code | every child, gate-forked daemon included | `transport.StateDir` → socket, pid file, log, **config** (since GOV-44), `trace.StateDir` → samples | **Same.** Both inherit whatever the person's environment had, and in normal use neither has it set |
+| `GOVERNOR_ENDPOINT` | a person or a test, never Claude Code | the same | `transport.DefaultEndpoint` → the socket | **Same**, for the same reason |
+| `HOME` | the login session | everything | the fallback under both of the above | **Same** |
+| `CLAUDE_PLUGIN_DATA` | Claude Code, for plugin processes | hooks and the MCP server (measured, hook-surface.md §23, §20.3) and a gate-forked daemon. **Not** a terminal or the Bash tool's shell (measured, §24) | the onboarding marker (`onboardPath`); doctor's hook-command expansion. **Until GOV-44, `config.Path`** | **Different, and now harmless.** No longer consulted by anything a daemon reads. The marker's only reader and writer is the SessionStart hook, which always has the variable |
+| `CLAUDE_PLUGIN_ROOT` | Claude Code, for plugin processes | hooks — it expands in their command strings (§13.3, hook-surface.md) | doctor's hook-command expansion, falling back to the plugin tree it found | Not read by the daemon at all |
+| `GOVERNOR_RUNQUEUE_MAX` | `tools/sweep` only | every child | the daemon's run-queue threshold, ahead of the config | **Same** unless set in Claude Code's own environment, which nothing does; reported in `status` as `run_queue_override` so a daemon running one is not called stale |
+| `CLAUDE_SESSION_ID` | Claude Code | the processes it starts | `boost`, to know which session is asking | Not read by the daemon |
+
+**Before GOV-44, two rows differed and nothing said so.** The socket row agreed and the config
+row did not. The test that keeps them agreeing is
+`TestACalibrationReachesADaemonTheGateStarted`: the real binary calibrates from an environment
+with no plugin variable, a real gate holding the plugin variable starts the daemon, and the two
+must report the same `b_max` and `run_queue_max`.
+
+**A same-family failure the audit turned up: install calibrated under its own daemon.**
+`install` starts the daemon and then runs `calibrate`, on purpose, so the probe measures the
+machine as the governor will actually find it. But the daemon read `config.json` only at
+startup, so every install left it serving the calibration from *before* the install. On
+2026-10-31 the live daemon was cutting at 4.81 while disk said 5.02. The daemon now re-reads the
+file when its mtime or size changes, and install waits for that to land before its doctor runs.
+Replacing the daemon instead would have broken the rule that a second install is a no-op:
+every calibration differs at least in `calibrated_at`.
+
 ### 13.4 Config and upgrade
 
-Config is `${CLAUDE_PLUGIN_DATA}/config.json` carrying `"schema": 1`. Unknown keys warn and
+Config is `<state dir>/config.json` — `~/.claude/governor/config.json` by default — carrying `"schema": 1`. A daemon reads it at startup, logs the path it resolved and what it found there, re-reads it when it changes (once per sampling tick, never on the hot path), and reports what it loaded in `status`, where `doctor`'s `loaded` check compares it with the file (GOV-44). Unknown keys warn and
 are preserved, never crash — a config written by a newer version must not brick an older
 binary. Migration happens on read; the write is atomic (temp file, rename).
 
