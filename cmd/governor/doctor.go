@@ -1576,7 +1576,7 @@ func (d *diagnosis) checkBinary() {
 	if err != nil {
 		d.add("binary", fail,
 			fmt.Sprintf("%s did not answer `version` (%v)", short(bin), err),
-			"governor install")
+			installFix(bin))
 		return
 	}
 	var diffs []string
@@ -1593,7 +1593,7 @@ func (d *diagnosis) checkBinary() {
 		d.add("binary", fail,
 			fmt.Sprintf("the hooks run %s, which is a different build: %s",
 				short(bin), strings.Join(diffs, ", ")),
-			"governor install")
+			installFix(bin))
 		return
 	}
 	// Every number matches and the bytes do not: a different build wearing the same version.
@@ -1603,7 +1603,7 @@ func (d *diagnosis) checkBinary() {
 	d.add("binary", fail,
 		fmt.Sprintf("the hooks run %s, a DIFFERENT BUILD reporting the same version (%s) — "+
 			"the install is stale", short(bin), v.binary),
-		"governor install")
+		installFix(bin))
 }
 
 // checkDaemonBuild compares the build of the RUNNING DAEMON with the binary the hooks run.
@@ -1652,30 +1652,58 @@ func (d *diagnosis) checkDaemonBuild() {
 		d.add("build", fail,
 			fmt.Sprintf("%s predates build reporting, so it is an older build than the hooks run (%s) — "+
 				"fixes since it started are not running", running, short(bin)),
-			"governor install")
+			installFix(bin))
 		return
 	case buildUnknown:
 		d.add("build", unverified,
 			fmt.Sprintf("%s could not read its own executable, so its build is unknown", running),
-			"governor install")
+			installFix(bin))
 		return
 	}
 	want, err := digest(bin)
 	if err != nil {
 		d.add("build", unverified,
 			fmt.Sprintf("cannot read %s to compare with the daemon's build (%v)", short(bin), err),
-			"governor install")
+			installFix(bin))
 		return
 	}
 	if d.reply.Build != want {
 		d.add("build", fail,
 			fmt.Sprintf("%s is build %s, but the hooks run build %s (%s) — the daemon is stale",
 				running, shortBuild(d.reply.Build), shortBuild(want), short(bin)),
-			"governor install")
+			installFix(bin))
 		return
 	}
 	d.add("build", pass,
 		fmt.Sprintf("the daemon is running the hooked binary (build %s)", shortBuild(want)), "")
+}
+
+// installFix is the install command that actually fixes a stale finding, given the hooked
+// binary bin.
+//
+// "governor install" is right only when bare `governor` on PATH is the build you want
+// installed, and after an upgrade it usually is not. Measured on 2026-10-31 (GOV-43):
+// `brew upgrade` put 0.1.2 at /opt/homebrew/bin/governor, and `/opt/homebrew/bin/governor
+// doctor` failed `binary` and `build` with "fix: governor install". But `governor` resolved to
+// ~/.local/bin/governor, install's own link to the hooked 0.1.1 binary. That install copied
+// 0.1.1 onto itself, reported every path "unchanged", and left the old daemon running.
+//
+// So when doctor is a different file from the hooked binary, it is the newer build the person
+// just ran, and the fix names it by absolute path. When doctor IS the hooked binary, the bare
+// name is right: there is nothing newer to name, and reinstalling the hooked binary is what
+// restarts a daemon of an older build.
+func installFix(bin string) string {
+	self, err := os.Executable()
+	if err != nil {
+		return "governor install"
+	}
+	if abs, err := filepath.Abs(self); err == nil {
+		self = abs
+	}
+	if sameFile(bin, self) {
+		return "governor install"
+	}
+	return self + " install"
 }
 
 func orUnknown(s string) string {

@@ -354,9 +354,13 @@ lease cannot be reclaimed at all, and names the restart that clears it.
 ### The status line says `stale daemon: governor install`
 
 Run `governor install`. In `governor doctor` this is the **`build`** check: it compares the
-running daemon's build with the binary the hooks run. A `brew upgrade` alone does not cause
-it, because brew changes neither the hooked binary nor the daemon. Until you run `governor
-install` after a `brew upgrade`, you are simply still on the old version.
+running daemon's build with the binary the hooks run.
+
+**After a `brew upgrade`, use the full path:** `$(brew --prefix)/bin/governor install`. Brew
+changes neither the hooked binary nor the daemon, and a bare `governor` usually resolves to
+`~/.local/bin/governor`, a link to the old hooked copy. Running that reinstalls the old version
+over itself and reports "unchanged". `$(brew --prefix)/bin/governor doctor` shows the right
+command in its fix lines.
 
 ### The status line says `governor: ungoverned - restart to enable`
 

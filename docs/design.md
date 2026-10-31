@@ -2300,8 +2300,9 @@ rather than implementation:
 - **`build` compares the RUNNING DAEMON with the binary the hooks run**, which neither `binary`
   (two files on disk) nor `protocol` (the wire version) does. GOV-43: a daemon 40 days older
   than the install passed every other check. It fails on a different digest and on an absent
-  one, since a daemon with no `build` field is older than the field, and its fix is `governor
-  install`, which replaces exactly that daemon (§13.4). A daemon reporting `"unknown"` is
+  one, since a daemon with no `build` field is older than the field. Its fix is `governor
+  install`, which replaces exactly that daemon (§13.4), spelled with doctor's own absolute path
+  whenever doctor is not the hooked binary: a bare `governor` can be the hooked copy. A daemon reporting `"unknown"` is
   `unknown`, not a failure.
 
 - **A finding can be `skip`.** With the daemon down there is no protocol version to compare
@@ -2801,22 +2802,43 @@ GOV-43 clause 1:
 | Route | What an upgrade changes | Replaces the running daemon? |
 |---|---|---|
 | `governor install` (and `install.sh`, which ends in it) | renames the new binary into `bin/`, rewrites the plugin tree | **yes**: on a new digest, or on a daemon whose version or build differs |
-| `brew upgrade governor` | replaces `/opt/homebrew/bin/governor` only. The formula is `bin.install` with no `post_install`, and its caveat tells the user to run `governor install` | **no**. Neither the hooked binary in `~/.claude/skills/build-governor/bin/` nor the daemon changes until the user runs `governor install` |
+| `brew upgrade governor` | replaces `/opt/homebrew/bin/governor` only. The formula is `bin.install` with no `post_install`, and its caveat tells the user to run `governor install` | **no**. Neither the hooked binary in `~/.claude/skills/build-governor/bin/` nor the daemon changes until the user runs `$(brew --prefix)/bin/governor install`. The bare name is shadowed (below) |
 | marketplace (`claude plugin update build-governor@claude-governor`) | re-runs the command source, `governor plugin-path`, which prints the tree install wrote. That source is in `.claude-plugin/marketplace.json`; `runPluginPath` stats two files and writes nothing | **no**. It copies no binary and touches no daemon. The update is only as new as the last `governor install` |
 
-So after a `brew upgrade`, the brew binary is new while the hooks and the daemon are still the
-old build, and they agree with each other. Nothing is stale *relative to the hooks*. The machine
-simply has not been upgraded yet, and `governor doctor` resolves to `~/.local/bin/governor`,
-which is the hooked binary, so its binary check reports `staleness unchecked`. The fix for both
-routes is the same command the caveat already names. `/opt/homebrew/bin/governor doctor` names
-it explicitly, because there the binary check compares two different files.
+**Observed on the v0.1.2 upgrade, 2026-10-31.** Before/after snapshots were taken of the daemon
+pid, the digests of the hooked and brew binaries, and `governor version`.
 
-Measured on this machine on 2026-10-31 from the formula, the marketplace manifest, and the
-installed state. Brew 0.1.1 is installed, byte-identical to the hooked binary, and no
-`build-governor` marketplace registration exists. **Not yet observed as an actual upgrade:**
-v0.1.1 is the newest release, so there is nothing to `brew upgrade` to, and a marketplace
-command source can only be accepted in a person's own terminal (§13.2a). Both rows are to be
-re-confirmed against the release that carries GOV-43.
+- **`brew upgrade governor` (0.1.1 → 0.1.2):** the only change was `/opt/homebrew/bin/governor`
+  (`8b2429c6…` → `c2b90e01…`). The daemon pid and the hooked binary were unchanged.
+  `/opt/homebrew/bin/governor doctor` failed `binary` ("binary 0.1.1 vs 0.1.2") and `build` ("the
+  running daemon (0.1.1, up since 2026-10-31T19:36:31Z) predates build reporting").
+- **Marketplace** (`claude plugin marketplace add`, `claude plugin install
+  build-governor@claude-governor`, accepted in the terminal, then `claude plugin marketplace
+  update` and `claude plugin update`): no change in any snapshot field. `update` reported
+  "already at the latest version (0.1.1-54a79d5d92e2)". The plugin's version is the one
+  `install` wrote into the tree, so the marketplace route can never report a newer version than
+  the last `governor install`.
+- **Then `governor install` upgraded nothing, and that was the real finding.** Brew warned
+  that `/opt/homebrew/bin/governor` is shadowed by `~/.local/bin/governor`. That path is
+  install's own link to the hooked binary (`installLink`), written whenever `~/.local/bin`
+  exists, even when install was launched from brew. So bare `governor install` ran 0.1.1, found
+  every path "unchanged", saw a daemon that matched its own version, and left everything as it
+  was. Doctor, run from 0.1.1 again, went green with `staleness unchecked`.
+
+- **`/opt/homebrew/bin/governor install` replaced it.** Run by absolute path at 18:32:48 local, it
+  renamed 0.1.2 over the hooked binary (mtime 18:32:48) and started a new daemon. The log reads
+  `listening on … (budget 4, 0.1.2 build c2b90e01746f)` and the 0.1.1 daemon is gone. A second
+  run reported every path `unchanged` and `daemon already running`. `doctor` then passed all 15
+  checks, including `ok build — the daemon is running the hooked binary (build c2b90e01746f)`. The
+  new daemon logged the run-queue threshold from *before* that install recalibrated, because
+  install starts the daemon and calibrates afterwards. That is GOV-B22, not this.
+
+Two fixes followed in GOV-43. When doctor is a different file from the hooked binary, a stale
+`binary` or `build` finding names doctor's own path (`/opt/homebrew/bin/governor install`)
+rather than the bare name. The formula's caveat spells the command `#{opt_bin}/governor
+install` and says to run it after every upgrade. The link that causes the shadowing is a design
+question for install and uninstall (§13.3), so it was filed as its own story rather than
+patched here.
 
 **Why pid 23289 survived 40 days.** It was started on 2026-09-20 from the pre-rename tree
 `~/.claude/skills/claude-governor/bin/governor`, a 0.0.0-dev build. On 2026-10-31, v0.1.1 arrived

@@ -696,8 +696,10 @@ func TestDoctorCatchesAStaleInstallThatReportsTheSameVersion(t *testing.T) {
 	if !strings.Contains(got.detail, "stale") {
 		t.Errorf("the finding does not call the install stale: %q\n%s", got.detail, out)
 	}
-	if got.fix != "governor install" {
-		t.Errorf("the finding does not name the fix every other finding names: %q\n%s", got.fix, out)
+	// The fix names THIS binary by path, not bare `governor`: doctor is a different, newer
+	// file than the hooked one, and a bare name can resolve to the hooked copy (GOV-43).
+	if want := selfBinary(t) + " install"; got.fix != want {
+		t.Errorf("fix = %q, want %q\n%s", got.fix, want, out)
 	}
 	// The version is not evidence of staleness here and the report must not imply it is.
 	if strings.Contains(got.detail, "vs") {
