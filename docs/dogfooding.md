@@ -250,3 +250,118 @@ its control variable away from agent count entirely.
 
 The honest summary is that **this note's question has been superseded by a better-instrumented
 one**, and the four days were spent on the answer instead of on more of the same evidence.
+
+---
+
+## Budget 1 in the daemon log, 2026-09-23 to 2026-10-31 (GOV-41)
+
+GOV-41 was filed on the reading that a freshly started daemon serves budget 1 until its first
+sample lands, and that this window is where Peter's one-slot status line came from. The first
+half is true and is fixed. The second half is refuted by the same log it was drawn from, and
+this section records both, because the misattribution is the more expensive finding.
+
+### What the log contains
+
+From `~/.claude/governor/daemon.log`, every `park` and `deny` from 2026-09-23 on (the number
+after the slash is the budget the request was judged against):
+
+| Date | Events at budget 1 | Notes |
+|---|---|---|
+| 09-23 | 9 parks, 5 denies | Heavy builds parked at `slots=3.75/1`; the limit then reads **4 five seconds later** (00:41:38 → 00:41:43) |
+| 09-24 | 5 parks, 5 denies | two sessions (`6d417582`, `c22fc656`) denied `reason=capacity` at `slots=1.00/1` |
+| 10-04, 10-24, 10-31 | 1 park each | |
+| 10-27 | 2 parks | |
+| 10-29 | 3 parks | a Heavy build at `slots=3.75/1` at 09:13; the limit reads **3** at 09:38 |
+
+### Why none of it is the cold window
+
+**One daemon produced every line.** pid 23289, started 2026-09-20 23:26 from
+`~/.claude/skills/claude-governor/bin/governor` (`governor 0.0.0-dev`), still running on
+2026-10-31 with 40 days of uptime. The last `listening on` line in the log is line 456, on
+09-20. A cold window lasts one priming sample plus one 1-second tick after a start, and there
+were no starts after 09-20. The first event in the table above is more than two days into the
+daemon's life.
+
+**The limit moves while the daemon is warm.** 1 → 4 in five seconds on 09-23 is the AIMD climb
+(one slot per tick after a cut), and 1 → 3 in 25 minutes on 10-29 is the same loop under
+sustained load. A controller that had never been given a ceiling cannot climb to one.
+
+**"No cut line" was the binary, not the state.** The status reading that prompted GOV-41
+(budget 2, ceiling 4, no cut) came from that same daemon. Its build predates GOV-34 (merged
+2026-09-21 00:45), which is the change that added the `cut` field. That binary has no way to
+name a cut, so a missing cut line says nothing about whether one happened. Thermal has never
+read `serious` on this machine (312,515 samples, GOV-15), so the cuts in the table were
+almost certainly the run queue crossing the calibrated 5.11, which a running Heavy build
+causes by itself.
+
+**Two things follow, and both were filed rather than fixed here.** v0.1.1 is installed and
+Peter's sessions still talk to a 40-day-old pre-release daemon, because nothing on upgrade
+replaces a running daemon and both speak protocol 1. And whether the run-queue cuts are
+correct or over-eager (GOV-B12's dead band) is open again, and has to be measured on a
+current daemon that can name its cuts.
+
+### The defect that was real
+
+`observeThisMachine` built the controller without `Max`, and `sample()` was the only writer
+of it, behind the first EWMA reading. Until then `Controller.start()` returned `Floor`. GOV-41
+sets `Max` at construction from `signals.CPUCapacity()` capped by the calibrated B_MAX, through
+the same `ceiling()` the sampler uses. `TestAColdDaemonServesItsCeilingNotTheFloor` holds it at
+the admission path with a sampler that never answers. With the assignment removed, the test
+fails with "answered budget 1, want its ceiling 10".
+
+Its practical cost was small, and this is stated so that nobody re-derives the story's
+original impact claim. The request that starts a daemon lands on an empty lease table, and
+`Table.Acquire` admits anything into an empty table, so the gate that started the daemon
+always got its slot. Only a second concurrent request inside the first second paid.
+
+### Does a daemon that has not sampled say so? (clause 3)
+
+Yes, already, and no new field was added. Every signal in a status reply (`cpu`,
+`cpu_instant`, `run_queue`, `cpu_capacity`, and the rest) is null until the first tick
+publishes, and `TestSignalsAreAbsentUntilATickLands` holds that. What made the cold state
+misleading was that it paired those nulls with a budget at the floor and no cut, which reads
+like a machine floored for no reason. After the fix, the cold state answers the ceiling with
+no cut, which is exactly what `start()` documents a never-stepped controller should answer.
+The new test asserts all three together: budget = ceiling, no cut, and `cpu` null. A separate
+"has not stepped" flag would duplicate what the null signals already say.
+
+### Zero values filled by the first sample (clause 4)
+
+Every field the daemon or its controller leaves at a zero value until a sample lands:
+
+| Field | Zero value means | Verdict |
+|---|---|---|
+| `Controller.Max` | Floor (budget 1) | **Wrong. Fixed by GOV-41.** |
+| `Controller.b` / `started` | `started=false` makes `Budget()` call `start()` | Safe: the flag guards it |
+| `Controller.clean` | 0 clean ticks, so the hold-after-thermal branch fires for three ticks | Safe: it holds `b`, which starts at `Max`, so it delays nothing |
+| `Controller.cut` | no cut | Correct: nothing has cut a controller that has not stepped |
+| `daemon.latest` | an all-zero `Sample`, which would read as an idle machine | Safe: `latestOK` guards every reader and status reports null |
+| `daemon.cpuAvg` | nil until the first tick | Safe: nil-checked, and `EWMA.Value` carries a `primed` flag |
+
+Not filled by a sample, and checked anyway: `calibratedBMax` (0 means uncalibrated, set at
+construction from config), `peak` (a count that is correctly 0 at start), and the
+`machine*` cache (a zero `machineAt` forces a refresh). `thermal` is read live on every
+status call, not from a sample.
+
+One adjacent case is outside this class but has the same shape. `hostSampler.Sample` is
+documented to leave a field at zero when that one reading fails. A failed load-average read
+therefore reports `RunQueue` 0, which looks like an idle machine and feeds the loop. That
+zero comes from a failed read, not from construction, so it is noted here rather than fixed.
+
+### Work-conserving admission once the ceiling is set (clause 5)
+
+**The rule is unchanged and still right.** `fitsLocked` admits anything into an empty table,
+ahead of fair share, because otherwise a request heavier than the whole budget could never
+run. A Heavy build weighs 4.5 / 1.2 = 3.75 slots, and on this host the ceiling is 4, so after
+the fix a Heavy build on a cold daemon fits without needing the escape. The 3.75/1 grants in
+the table were the escape doing its job against a budget the loop had cut.
+
+On a host whose real ceiling is below 3.75 (anything with fewer than 4.5 cores after
+calibration), a Heavy build runs only alone, or as a session's first slot. Two paths admit
+it. On an empty table, the rule above applies. On a non-empty one, `fitsLocked`'s first-slot
+branch (invariant 6) admits it if the table is under budget and the session holds nothing.
+That branch does not compare the request's weight to the room left, so the table can reach
+roughly budget + 3.75 for as long as the build runs. While it runs, `t.weight` is at or above
+the limit, so every other request is refused until it finishes. That is the intended trade:
+a build too large for the machine serializes the machine rather than never running, and the
+overshoot is bounded by one build.

@@ -38,6 +38,8 @@ type reply struct {
 	Waiting   int             `json:"waiting"`
 	WaitMS    int             `json:"wait_ms"`
 	Denials   int             `json:"denials"`
+	Ceiling   int             `json:"ceiling"`
+	Cut       string          `json:"cut"`
 	Share     int             `json:"share"`
 	Source    string          `json:"source"`
 	Supported []int           `json:"supported"`

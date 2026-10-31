@@ -848,13 +848,29 @@ func (d *daemon) observeThisMachine() {
 	// built by a test has neither, and so keeps the fixed budget it was constructed with —
 	// which is what lets a lease test assert against a number it chose.
 	cal := loadCalibration(d.diag)
-	d.loop = &budget.Controller{RunQueueMax: resolveRunQueueMax(cal, d.diag)}
 	d.calibratedBMax = cal.BMax
+	// MAX IS SET HERE, NOT LEFT FOR THE FIRST TICK (GOV-41). Controller.start() begins at the
+	// ceiling precisely because the daemon is started lazily by a gate, but with Max unset
+	// the ceiling it begins at is zero, which reads as Floor: every daemon answered budget 1
+	// from its first request until the first sample landed, and that request is always the
+	// one that started it. sample() still recomputes Max every tick, so a cgroup quota that
+	// changes under a running daemon is still followed; this only fills the gap before that.
+	capacity, _ := hostCapacity()
+	d.loop = &budget.Controller{
+		Max:         d.ceiling(capacity),
+		RunQueueMax: resolveRunQueueMax(cal, d.diag),
+	}
 	d.sources = []budget.Source{budget.LocalSource{
 		Live:  d.liveBudget,
 		InUse: d.table.InUse,
 	}}
 }
+
+// hostCapacity reads this host's CPU capacity for the controller's starting ceiling. A
+// variable rather than a direct call so the GOV-41 test can pin a capacity whose ceiling is
+// above the floor on any runner — on a two-core CI host the real one would floor anyway, and
+// the test could not tell the fix from the bug.
+var hostCapacity = signals.CPUCapacity
 
 // runQueueMaxEnv overrides internal/budget.RunQueueMax for one daemon.
 //

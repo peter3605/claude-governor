@@ -228,6 +228,15 @@ func (s *hostSampler) Host(ctx context.Context) (Host, error) {
 // hours and a transient failure to read, say, load average is not a reason to lose the CPU
 // trace for that second. The error return is reserved for a failure that invalidates the
 // whole reading, of which there are currently none.
+// CPUCapacity is the same capacity reading a Sample carries, without taking a sample.
+//
+// It exists for the daemon's first second (GOV-41). A Sample is a delta against the previous
+// one, so the first reading lands a full tick after start — and until it does, a controller
+// with no capacity has no ceiling and answers the floor. Capacity is a level, not a rate, so
+// it can be read at construction; this is that read, through the same build-tagged pair the
+// sampler uses, so the two can never disagree about what the host has.
+func CPUCapacity() (float64, string) { return cpuCapacity() }
+
 func (s *hostSampler) Sample(ctx context.Context) (Sample, error) {
 	start := time.Now()
 	out := Sample{Thermal: ReadThermal(), Cores: runtime.NumCPU()}
