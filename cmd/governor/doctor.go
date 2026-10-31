@@ -221,6 +221,7 @@ func (d *diagnosis) run() {
 	d.checkSpawnTools()
 	d.checkProtocol()
 	d.checkBinary()
+	d.checkDaemonBuild()
 	d.checkConfig()
 	d.checkCalibration()
 	d.checkBudget()
@@ -1603,6 +1604,85 @@ func (d *diagnosis) checkBinary() {
 		fmt.Sprintf("the hooks run %s, a DIFFERENT BUILD reporting the same version (%s) — "+
 			"the install is stale", short(bin), v.binary),
 		"governor install")
+}
+
+// checkDaemonBuild compares the build of the RUNNING DAEMON with the binary the hooks run.
+//
+// Neither neighbouring check covers it, and GOV-43 is what that cost. checkProtocol fires
+// only when the wire version differs, and checkBinary compares the hooked binary with the
+// binary running doctor — files on disk, both of them. Nothing compared the process holding
+// the socket with either, so on 2026-10-31 a daemon started on 2026-09-20 from a 0.0.0-dev
+// build served every session for 40 days with v0.1.1 installed, every check here green, and
+// every fix shipped in between not running anywhere.
+//
+// The daemon's build is the digest of its own executable taken at startup (build.go); the
+// hooks' build is the digest of the file they name. Same predicate `governor install` uses,
+// so the fix line is the one that clears it: install replaces a daemon whose build differs.
+func (d *diagnosis) checkDaemonBuild() {
+	if !d.up {
+		d.add("build", skip, "no daemon to compare builds with (see daemon above)", "")
+		return
+	}
+	if d.reply.V != protocolVersion || d.reply.Reason != "" {
+		d.add("build", skip, "the daemon speaks another protocol (see protocol above)", "")
+		return
+	}
+	bins := map[string]bool{}
+	for _, w := range wantedHooks {
+		if ref := d.findHook(w); ref != nil && ref.bin != "" {
+			bins[ref.bin] = true
+		}
+	}
+	if len(bins) != 1 {
+		d.add("build", skip, "no single hooked binary to compare the daemon with (see binary above)", "")
+		return
+	}
+	bin := sortedKeys(bins)[0]
+	running := fmt.Sprintf("the running daemon (%s", orUnknown(d.reply.BinaryVersion))
+	if d.reply.DaemonStarted != "" {
+		running += ", up since " + d.reply.DaemonStarted
+	}
+	running += ")"
+
+	switch d.reply.Build {
+	case "":
+		// The pid 23289 shape exactly: same protocol, a version string that proves nothing,
+		// and no build field because the build predates it — which settles that it is older
+		// than the binary the hooks run, since that binary is new enough to ask.
+		d.add("build", fail,
+			fmt.Sprintf("%s predates build reporting, so it is an older build than the hooks run (%s) — "+
+				"fixes since it started are not running", running, short(bin)),
+			"governor install")
+		return
+	case buildUnknown:
+		d.add("build", unverified,
+			fmt.Sprintf("%s could not read its own executable, so its build is unknown", running),
+			"governor install")
+		return
+	}
+	want, err := digest(bin)
+	if err != nil {
+		d.add("build", unverified,
+			fmt.Sprintf("cannot read %s to compare with the daemon's build (%v)", short(bin), err),
+			"governor install")
+		return
+	}
+	if d.reply.Build != want {
+		d.add("build", fail,
+			fmt.Sprintf("%s is build %s, but the hooks run build %s (%s) — the daemon is stale",
+				running, shortBuild(d.reply.Build), shortBuild(want), short(bin)),
+			"governor install")
+		return
+	}
+	d.add("build", pass,
+		fmt.Sprintf("the daemon is running the hooked binary (build %s)", shortBuild(want)), "")
+}
+
+func orUnknown(s string) string {
+	if s == "" {
+		return "version unknown"
+	}
+	return s
 }
 
 // hookedVersions is what `governor version` reports.

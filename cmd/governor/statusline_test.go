@@ -85,6 +85,7 @@ func statusDaemon(t *testing.T, reply any) (string, *atomic.Int64, func() []byte
 	if err != nil {
 		t.Fatalf("marshal reply: %v", err)
 	}
+	raw = stampCurrentBuild(t, raw)
 	line := append(raw, '\n')
 	endpoint := listenerFunc(t, func(c net.Conn, request []byte) {
 		calls.Add(1)
@@ -99,6 +100,45 @@ func statusDaemon(t *testing.T, reply any) (string, *atomic.Int64, func() []byte
 		return last
 	}
 }
+
+// stampCurrentBuild gives a canned status reply this build's digest when it names no build.
+//
+// Since GOV-43 a reply with no build field is a daemon older than the field, and the status
+// line says it is stale. These fixtures are about rendering everything else, and a scripted
+// daemon that silently read as a 40-day-old one would put that clause in every expected line.
+// A test about staleness sets "build" itself — to another digest, or to "" via a raw reply
+// that omits it — and this leaves an explicit value alone. A reply that is not a JSON object
+// (a refusal shape, garbage) is passed through untouched.
+func stampCurrentBuild(t *testing.T, raw []byte) []byte {
+	t.Helper()
+	var obj map[string]any
+	if json.Unmarshal(raw, &obj) != nil {
+		return raw
+	}
+	if b, ok := obj["build"]; ok && b != "" {
+		return raw
+	}
+	if _, ok := obj["build"]; ok {
+		// Present and empty: a statusResponse literal that did not set Build. Treat it as
+		// unset. A test that means "no build field" uses noBuild.
+		delete(obj, "build")
+	}
+	if _, explicit := obj[noBuildKey]; explicit {
+		delete(obj, noBuildKey)
+		out, _ := json.Marshal(obj)
+		return out
+	}
+	obj["build"] = thisBuild()
+	out, err := json.Marshal(obj)
+	if err != nil {
+		t.Fatalf("restamp reply: %v", err)
+	}
+	return out
+}
+
+// noBuildKey, set to anything in a map reply, asks statusDaemon to serve that reply with no
+// build field at all — the shape of every daemon from before GOV-43.
+const noBuildKey = "__no_build__"
 
 // statuslineContentBudget is the budget the tests that assert WHAT WAS RENDERED run under,
 // and it is deliberately a hundred times the product's own statuslineBudget.

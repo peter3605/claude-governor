@@ -135,6 +135,11 @@ type statusResponse struct {
 	// as "no ceiling reported" and is answered with a pass rather than a guess.
 	Ceiling int    `json:"ceiling"`
 	Cut     string `json:"cut"`
+	// BinaryVersion and Build say which binary is holding the socket (GOV-24, GOV-43). Build
+	// is the one that can tell two builds apart; see build.go. An absent Build is a daemon
+	// older than the field, and the status line and doctor both read that as stale.
+	BinaryVersion string `json:"binary_version"`
+	Build         string `json:"build"`
 }
 
 // cachedStatus is one status reply plus when it was taken.
@@ -151,6 +156,11 @@ type cachedStatus struct {
 	At    time.Time      `json:"at"`
 	Down  bool           `json:"down"`
 	Reply statusResponse `json:"reply"`
+	// Self is the digest of the binary that wrote this entry, keyed by its path, size and
+	// mtime so the next statusline can reuse it instead of re-hashing itself on every miss
+	// (GOV-43, build.go). It lives in this file rather than a new one so that section 13.3's
+	// path list does not grow.
+	Self *selfBuild `json:"self,omitempty"`
 }
 
 func runStatusline(_ []string, stdout, stderr io.Writer) int {
@@ -290,6 +300,11 @@ type statusView struct {
 	// while two subagents ran, and the reasonable conclusion drawn from it was that the
 	// governor was working and the machine was quiet.
 	Ungoverned bool
+
+	// StaleDaemon is set when the daemon holding the socket is a different build from the
+	// binary rendering this line (GOV-43): an upgrade landed on disk and the old process is
+	// still the one answering, so whatever the upgrade fixed is not running.
+	StaleDaemon bool
 }
 
 // fetch resolves the current status for the statusline, from the cache if it is fresh and
@@ -301,10 +316,50 @@ type statusView struct {
 // if it is abandoned partway.
 func fetch(diag io.Writer, dialer transport.Dialer, deadline time.Time, session string) (statusView, *cachedStatus) {
 	if c, ok := readCache(time.Now()); ok {
-		return view(c, session), nil
+		// The entry may have been written by a different binary — two installs coexisting is
+		// a supported shape — so the digest is re-derived for THIS executable. When the entry
+		// describes this same file that is a stat and nothing more.
+		self := currentSelfBuild(c.Self)
+		return withBuildVerdict(view(c, session), c, self), nil
 	}
 	c := query(diag, dialer, deadline)
-	return view(c, session), &c
+	self := currentSelfBuild(previousSelf())
+	if self.Digest != "" {
+		c.Self = &self
+	}
+	return withBuildVerdict(view(c, session), c, self), &c
+}
+
+// withBuildVerdict marks the view stale when the daemon is positively a different build from
+// the binary rendering the line (GOV-43).
+//
+// REPORT, NEVER RESTART. A status line that restarted the daemon on mismatch would, with two
+// installs coexisting — a dev build in ~/.local/bin and the plugin's — have each session's
+// line kill the other's daemon in turn, and every restart drops every live lease. Saying so
+// costs nothing and cannot thrash; the person runs the fix once.
+func withBuildVerdict(v statusView, c cachedStatus, self selfBuild) statusView {
+	if v.OK && daemonBuildVerdict(c.Reply.Build, self.Digest) {
+		v.StaleDaemon = true
+	}
+	return v
+}
+
+// previousSelf reads the Self record from the cache file whatever its age. The status in an
+// expired entry is useless; the digest in it is still right if the binary has not changed.
+func previousSelf() *selfBuild {
+	path, ok := statuslineCachePath()
+	if !ok {
+		return nil
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return nil
+	}
+	var c cachedStatus
+	if json.Unmarshal(raw, &c) != nil {
+		return nil
+	}
+	return c.Self
 }
 
 // query asks the daemon, once, with no cache on either side of it.
@@ -465,6 +520,13 @@ func clauses(v statusView, mine bool) []string {
 		slots += fmt.Sprintf(" (%d yours)", v.Mine)
 	}
 	out = append(out, slots)
+	if v.StaleDaemon {
+		// Second, beside the count rather than instead of it: the old daemon IS still
+		// governing, so the count is true. What is false is the belief that the installed
+		// version is the one doing it, and this clause is the only place that is ever visible
+		// without running doctor. It names the fix, which is the whole of it.
+		out = append(out, "stale daemon: governor install")
+	}
 	if v.Boosted {
 		// Beside the pin, and for a stronger version of the same reason. A boosted session
 		// looks exactly like an ordinary one from the outside, so this clause is the only

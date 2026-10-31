@@ -866,7 +866,7 @@ func startDaemon(p paths, replaced bool, stdout, stderr io.Writer) {
 		return
 	}
 	if daemonAnswers(endpoint) {
-		state := inspectDaemon(endpoint)
+		state := inspectDaemon(endpoint, p.binary)
 		if !replaced && state.current {
 			fmt.Fprintf(stdout, "\ndaemon already running on %s\n", endpoint)
 			return
@@ -949,7 +949,12 @@ type daemonState struct {
 // costs an ungoverned spawn; this one costs a daemon restart, and a restart is cheap — it
 // drops reservations, not work. Guessing the other way leaves a stale daemon on the socket
 // for the rest of its life, which is the defect this whole path exists to close.
-func inspectDaemon(endpoint string) daemonState {
+//
+// installed is the binary install would start a daemon from. Its digest is compared with the
+// build the daemon reports (GOV-43): the version comparison alone passed a daemon of another
+// build reporting the same version, which is every pair of development builds and every
+// local build made after a release.
+func inspectDaemon(endpoint, installed string) daemonState {
 	ctx, cancel := context.WithTimeout(context.Background(), daemonInspectTimeout)
 	defer cancel()
 
@@ -976,6 +981,7 @@ func inspectDaemon(endpoint string) daemonState {
 		V             int    `json:"v"`
 		Reason        string `json:"reason"`
 		BinaryVersion string `json:"binary_version"`
+		Build         string `json:"build"`
 	}
 	if err := json.Unmarshal([]byte(line), &reply); err != nil {
 		return daemonState{why: "its answer could not be parsed"}
@@ -992,6 +998,23 @@ func inspectDaemon(endpoint string) daemonState {
 	}
 	if reply.BinaryVersion != binaryVersion {
 		return daemonState{why: fmt.Sprintf("it is version %s, this binary is %s", reply.BinaryVersion, binaryVersion)}
+	}
+	if reply.Build == "" {
+		// Same version string, no build field: a daemon from before GOV-43, which is older
+		// than this binary whatever version it calls itself. This is the 2026-10-31 case —
+		// a 0.0.0-dev daemon 40 days old answering exactly like a current one.
+		return daemonState{why: "it predates build reporting, so it is an older build"}
+	}
+	if reply.Build == buildUnknown {
+		return daemonState{why: "it could not say which build it is"}
+	}
+	want, err := digest(installed)
+	if err != nil {
+		return daemonState{why: fmt.Sprintf("the installed binary could not be read (%v)", err)}
+	}
+	if reply.Build != want {
+		return daemonState{why: fmt.Sprintf("it is build %s, the installed binary is build %s",
+			shortBuild(reply.Build), shortBuild(want))}
 	}
 	return daemonState{current: true}
 }

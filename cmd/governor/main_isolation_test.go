@@ -58,6 +58,12 @@ func TestMain(m *testing.M) {
 	// filed from. strays_test.go puts the real scan back for the tests that are about it.
 	scanForStrays = noStrays
 
+	// Hash this test binary once, up front (GOV-43). The statusline digests its own executable
+	// on a cache miss, and the test binary is large enough that doing it first inside some
+	// test's 50 ms statusline budget would make that test's outcome depend on the disk.
+	currentSelfBuild(nil)
+	thisBuild()
+
 	code := m.Run()
 
 	// Reap before removing, and in that order (GOV-B11). A daemon still running here holds a
