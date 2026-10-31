@@ -113,6 +113,18 @@ Someone ran `pause`. Nothing is being capped. The slot count is hidden on purpos
 pause it would read like a limit that is not being enforced. With a deadline it reads
 `governor: gating paused 14m left`.
 
+### Governed by an older daemon
+
+```
+1/4 slots - stale daemon: governor install
+```
+
+The daemon answering is a different build from the one installed, usually because an upgrade
+put a new binary on disk while the old daemon kept running. It is still capping spawns, so the
+count is real, but fixes in the new version are not running. Run `governor install`: it
+replaces that daemon and leaves everything else alone. Nothing restarts it automatically
+([§9](design.md#9-package) says why).
+
 ### Not governed: this window started too early
 
 ```
@@ -338,6 +350,13 @@ background or one that exceeded its timeout
 A burst of failing builds can therefore hold slots for a few minutes after the work has
 stopped. The slots come back on their own. `governor doctor`'s **`leases`** check fails when a
 lease cannot be reclaimed at all, and names the restart that clears it.
+
+### The status line says `stale daemon: governor install`
+
+Run `governor install`. In `governor doctor` this is the **`build`** check: it compares the
+running daemon's build with the binary the hooks run. A `brew upgrade` alone does not cause
+it, because brew changes neither the hooked binary nor the daemon. Until you run `governor
+install` after a `brew upgrade`, you are simply still on the old version.
 
 ### The status line says `governor: ungoverned - restart to enable`
 

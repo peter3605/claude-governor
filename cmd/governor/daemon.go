@@ -355,6 +355,13 @@ type statusReply struct {
 	// wire format left `install` no way to see that the daemon was stale. `install` reads
 	// this to decide whether the running daemon is the one it just wrote.
 	BinaryVersion string `json:"binary_version,omitempty"`
+	// Build is the sha256 of the executable this daemon was started from, taken at startup
+	// (GOV-43; see build.go). BinaryVersion cannot tell two builds apart when both call
+	// themselves 0.0.0-dev, or when a local build follows a release; this can. "unknown" when
+	// the daemon could not read itself. Absent from a daemon older than the field — which is
+	// itself the answer: that daemon is older than any binary able to ask. Additive, no
+	// protocol bump, for the reason given above BinaryVersion.
+	Build string `json:"build,omitempty"`
 	// DaemonStarted is when this daemon came up, RFC3339. See daemon.started.
 	DaemonStarted string `json:"daemon_started,omitempty"`
 	// HooksInstalled is the mtime of the gate's hooks file, RFC3339, empty when there is no
@@ -482,6 +489,8 @@ type daemon struct {
 	// has since been replaced" — the session table is in memory and does not survive a
 	// restart, and `governor install` restarts the daemon on every upgrade.
 	started time.Time
+	// build is this process's build digest (build.go), reported in status.
+	build string
 	// liveSessions enumerates the Claude Code sessions running on this machine, and
 	// hooksInstalledAt reports when the gate's hooks file was written. Both are injectable
 	// because both read a directory this package does not own, and a test that had to
@@ -674,6 +683,11 @@ func runDaemon(args []string, stdout, stderr io.Writer) int {
 		}
 	}
 
+	// The build digest is taken FIRST, before the socket is bound and before anything can
+	// rename a newer binary over this one's path. Hashed later, it would describe whatever
+	// file the path names by then rather than the code this process is running. build.go.
+	thisBuild()
+
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
@@ -703,7 +717,8 @@ func runDaemon(args []string, stdout, stderr io.Writer) int {
 	if err := writeDaemonPID(ep, stderr); err == nil {
 		defer removeDaemonPID(ep)
 	}
-	fmt.Fprintf(stdout, "governor daemon listening on %s (budget %d)\n", ep, *limit)
+	fmt.Fprintf(stdout, "governor daemon listening on %s (budget %d, %s build %s)\n",
+		ep, *limit, binaryVersion, shortBuild(d.build))
 
 	d.serve(ctx, ln)
 	return 0
@@ -816,6 +831,7 @@ func newDaemonWithLeases(limit int, diag io.Writer, opt lease.Options) *daemon {
 		denials:          newDenyLog(nil),
 		diag:             &syncWriter{w: diag},
 		started:          time.Now(),
+		build:            thisBuild(),
 		liveSessions:     noLiveSessions,
 		hooksInstalledAt: func() time.Time { return time.Time{} },
 		// Pathless by default, for the same reason liveSessions defaults to noLiveSessions:
@@ -1644,6 +1660,7 @@ func (d *daemon) status(req request) statusReply {
 		// Parked acquires, from the FIFO of design.md section 6.2.
 		Waiting:           d.waits.len(),
 		BinaryVersion:     binaryVersion,
+		Build:             d.build,
 		Thermal:           d.thermal(),
 		Sources:           sources,
 		DaemonStarted:     d.started.UTC().Format(time.RFC3339),

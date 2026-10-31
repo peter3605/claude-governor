@@ -315,6 +315,12 @@ func TestEveryFailureNamesACommandToRun(t *testing.T) {
 			w := newWorld(t)
 			w.writeConfig(fmt.Sprintf(`{"schema": %d}`, configSchemaVersion+1))
 		},
+		"daemon is another build (GOV-43)": func(t *testing.T) {
+			w := newWorld(t)
+			endpoint, _ := startTestDaemonConfigured(t, 4, lease.Options{}, func(d *daemon) { d.build = "" })
+			t.Setenv(transport.EndpointEnv, endpoint)
+			w.writeHooks(w.settings, selfBinary(t), goodHooks())
+		},
 		"endpoint is not unix": func(t *testing.T) {
 			newWorld(t)
 			t.Setenv(transport.EndpointEnv, "tcp://127.0.0.1:9999")

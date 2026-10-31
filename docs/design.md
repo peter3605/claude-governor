@@ -1474,7 +1474,7 @@ per connection. Deliberately boring — this is a hot path.
 // -> status (statusline, doctor, /governor)
 {"v":1,"op":"status"}
 {"v":1,"budget":6,"in_use":4,"waiting":1,"cpu":0.61,"thermal":"nominal",
- "binary_version":"1.2.0","sources":[{"name":"local","budget":6}],"sessions":[...],
+ "binary_version":"1.2.0","build":"9f2c…","sources":[{"name":"local","budget":6}],"sessions":[...],
  "pinned":false,"paused":false}
 // -> control (the manual overrides of section 9.1). `control` and `limit` are NEW KEYS and
 //    had to be: this connection's decode struct already carries `action` (the session verb)
@@ -1514,6 +1514,17 @@ builds can both speak protocol v1 and still be different binaries. `governor ins
 it to tell a current daemon from a stale one (section 13.4). It is additive — an older
 reader ignores it — and it is absent from a daemon that predates it, which install reads as
 "not this binary" rather than as "unknown".
+
+`build` is the sha256 of the executable the daemon was started from, taken once at start-up
+before the socket is bound (GOV-43). `binary_version` cannot tell builds apart when both call
+themselves `0.0.0-dev`, or when a local build follows a release; `build` can. It is the same
+digest `install` uses to decide whether it has anything to copy, so "same build" means one thing
+everywhere. It is taken at start-up and never later on purpose: §13.4 installs by `rename(2)`,
+which leaves the daemon on the old inode while its path names the new file, so a digest taken
+lazily after an upgrade would describe the new binary and report the stale daemon as current.
+`"unknown"` means the daemon could not read itself, and every reader treats that as no evidence.
+**Absent** means a daemon older than the field, which is older than any binary able to ask, and
+every reader treats that as stale. Additive; no protocol bump.
 
 The `waiting` line is the one message that is not the end of an exchange, and it is
 **compatible in both directions** — which is what let it be added without a version bump. A
@@ -1791,6 +1802,34 @@ governed idle session shows. A person watched that line read zero while two suba
 concluded the governor was working. The count was the thing being misread, so the count is
 what goes; and this is the one state where what a reader needs is not a number but an
 instruction.
+
+GOV-43 added a clause that joins the count rather than replacing it: `1/4 slots - stale
+daemon: governor install`, when the daemon's `build` (§7) differs from the binary rendering the
+line, or is absent. The old daemon is still governing, so the count is true. What is false is
+the belief that the installed version is the one doing it, and on 2026-10-31 that belief had
+been false for 40 days. The clause comes second so a narrow terminal drops cpu and thermal
+first. The status line hashes its own executable on a cache miss and keeps the digest in
+`statusline.json`, keyed by path, size and mtime, so the hash is paid once per binary rather
+than once per second.
+
+**It reports and never restarts, and that was a decision.** A restart-on-mismatch rule would
+interact with the lazy-start cooldown, and with two installs coexisting (a dev build in
+`~/.local/bin` and the plugin's) it would have each session's line kill the other's daemon in
+turn, dropping every live lease each time. A rule that flips between two builds is worse than
+saying so.
+
+**And a restart from the gate is, today, a restart without calibration (GOV-44).** The only
+way a hook can start a daemon is `lazystart.go`, and a daemon started that way inherits
+`CLAUDE_PLUGIN_DATA` from the hook. `config.Path()` honours that variable and
+`transport.DefaultEndpoint()` does not, so the daemon binds the right socket but reads
+`$CLAUDE_PLUGIN_DATA/config.json` rather than the file `governor calibrate` wrote. Measured
+2026-10-31: install's daemon logged `run-queue threshold 4.72, calibrated for this host`; a
+lazy-started one logged no calibration line and served ceiling 6 against a calibrated `b_max`
+of 4. A restart-on-mismatch rule would swap a stale but calibrated daemon for a current but
+uncalibrated one. The fix line is therefore `governor install`, which starts the daemon in the
+install's environment and does load calibration. Revisit this decision once GOV-44 lands; until
+then a hook restarting the daemon is a regression. The gate is not involved either: hashing a binary on every spawn is hot-path cost,
+and the gate's only channel to a person is a deny.
 
 GOV-B07 added the other half of that. Claude Code runs a status line on events — an assistant
 message, a compact, a permission-mode change, a settings change — and on nothing else unless
@@ -2258,6 +2297,12 @@ rather than implementation:
 - **`binary` compares bytes, not just version numbers**, because on a development build the
   numbers are the same for every build ever made. GOV-B13; §13.4 has the reasoning, what the
   omission cost, and the one case the check cannot answer.
+- **`build` compares the RUNNING DAEMON with the binary the hooks run**, which neither `binary`
+  (two files on disk) nor `protocol` (the wire version) does. GOV-43: a daemon 40 days older
+  than the install passed every other check. It fails on a different digest and on an absent
+  one, since a daemon with no `build` field is older than the field, and its fix is `governor
+  install`, which replaces exactly that daemon (§13.4). A daemon reporting `"unknown"` is
+  `unknown`, not a failure.
 
 - **A finding can be `skip`.** With the daemon down there is no protocol version to compare
   and no lease table to read, and reporting those as further *failures* would print four
@@ -2476,6 +2521,9 @@ it added" and "removes things it did not":
   `stateFiles`.
 - **`samples.jsonl` survives a plain uninstall**, per the Phase 0 table below. It is the
   measurement the setpoint is derived from and it is not reconstructable.
+- **GOV-43's build check adds no row.** The daemon digests its own executable in memory and
+  reports it in `status`. `doctor` digests the hooked binary and records nothing. The status
+  line keeps its own digest in a field of `statusline.json`, a file already in the table.
 - **GOV-B13's staleness check adds no row.** `doctor` now digests
   `~/.claude/skills/build-governor/bin/governor` and the binary running the check, and
   writes neither — no cache, no stamp, no recorded digest. The row above is unchanged and
@@ -2736,6 +2784,49 @@ nothing, and a second install of the same binary must remain a no-op. Every ambi
 — unparseable, silent, or from a daemon too old to carry `binary_version` — counts as *not*
 current, because a needless restart costs reservations while a missed one costs governance for
 the life of the process.
+
+**The second signal compared a version string, and that was not enough (GOV-43).** Two builds
+that both report `0.0.0-dev`, or a local build made after a release, answered "current" to the
+interrogation. Where the binary on disk was already current, so the digest signal did not fire
+either, the old daemon stayed. The interrogation now also compares the daemon's `build` (§7)
+with the digest of the installed binary. An absent `build` means a daemon older than the field
+and is not current. `"unknown"` is not current either, by the same "ambiguous resolves to
+restart" rule. `TestInstallReplacesADaemonOfAnotherBuildWhoseBinaryIsAlreadyCurrent` stages
+exactly this, with a rebuilt same-version daemon on the socket and a correct binary on disk,
+and fails with the build comparison removed.
+
+**Only `governor install` replaces a daemon. No other route does.** Recorded per route for
+GOV-43 clause 1:
+
+| Route | What an upgrade changes | Replaces the running daemon? |
+|---|---|---|
+| `governor install` (and `install.sh`, which ends in it) | renames the new binary into `bin/`, rewrites the plugin tree | **yes**: on a new digest, or on a daemon whose version or build differs |
+| `brew upgrade governor` | replaces `/opt/homebrew/bin/governor` only. The formula is `bin.install` with no `post_install`, and its caveat tells the user to run `governor install` | **no**. Neither the hooked binary in `~/.claude/skills/build-governor/bin/` nor the daemon changes until the user runs `governor install` |
+| marketplace (`claude plugin update build-governor@claude-governor`) | re-runs the command source, `governor plugin-path`, which prints the tree install wrote. That source is in `.claude-plugin/marketplace.json`; `runPluginPath` stats two files and writes nothing | **no**. It copies no binary and touches no daemon. The update is only as new as the last `governor install` |
+
+So after a `brew upgrade`, the brew binary is new while the hooks and the daemon are still the
+old build, and they agree with each other. Nothing is stale *relative to the hooks*. The machine
+simply has not been upgraded yet, and `governor doctor` resolves to `~/.local/bin/governor`,
+which is the hooked binary, so its binary check reports `staleness unchecked`. The fix for both
+routes is the same command the caveat already names. `/opt/homebrew/bin/governor doctor` names
+it explicitly, because there the binary check compares two different files.
+
+Measured on this machine on 2026-10-31 from the formula, the marketplace manifest, and the
+installed state. Brew 0.1.1 is installed, byte-identical to the hooked binary, and no
+`build-governor` marketplace registration exists. **Not yet observed as an actual upgrade:**
+v0.1.1 is the newest release, so there is nothing to `brew upgrade` to, and a marketplace
+command source can only be accepted in a person's own terminal (§13.2a). Both rows are to be
+re-confirmed against the release that carries GOV-43.
+
+**Why pid 23289 survived 40 days.** It was started on 2026-09-20 from the pre-rename tree
+`~/.claude/skills/claude-governor/bin/governor`, a 0.0.0-dev build. On 2026-10-31, v0.1.1 arrived
+by `brew install` at 13:37 (Cellar timestamp), which by the table above touches no daemon. Every
+protocol-1 hook found that daemon healthy until `governor install` rewrote the plugin tree at
+15:06 and the daemon log shows a new `listening` line. No version-string check had flagged
+it before then, because nothing was comparing the running daemon with anything. With GOV-43 the first status line rendered by an installed v0.1.1 hook binary reads
+`stale daemon: governor install`, because that daemon sends no `build`. `doctor`'s `build`
+check fails with the same fix, and that `governor install` replaces it, whatever version
+either side reports.
 
 In-flight leases are lost across the replacement, and that is correct rather than merely
 tolerated: a lease is a reservation, not something a running agent holds, so no agent is
