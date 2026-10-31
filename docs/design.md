@@ -956,6 +956,11 @@ Anything other than `nominal` takes `B` to `B_min` immediately, with hysteresis 
 back up: require `nominal` for three consecutive ticks before the additive increase resumes,
 so the budget does not oscillate against the thermal governor.
 
+> **Superseded as to the trigger by §5.2 (GOV-15):** the floor fires at `serious` and above,
+> not at `fair` — `signals.Thermal.Severe()`, which is what the daemon passes the loop. The
+> paragraph above is the original rule, kept as written; §5.2 has the measurement that
+> narrowed it.
+
 **Built (GOV-13).** The shim is cgo, inline Objective-C in `internal/signals/thermal_darwin.go`
 under `//go:build darwin && cgo`, linking `Foundation` and nothing else — no subprocess, no
 `sudo`, no third-party dependency. `internal/signals/thermal_other.go` carries the complement

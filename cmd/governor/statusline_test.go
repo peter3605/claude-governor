@@ -975,6 +975,13 @@ func TestTheDocsIllustrateTheStatusLineThatActuallyRenders(t *testing.T) {
 	} {
 		renders[render(v, 0)] = name
 	}
+	// The guide's lines (GOV-36), from the same corpus TestTheGuideShowsEveryLineTheStatusLine
+	// CanPrint holds the guide to, so a line the guide illustrates is one this guard knows.
+	for _, g := range guideStatusLines() {
+		if _, dup := renders[g.line]; !dup {
+			renders[g.line] = "guide.md, " + g.name
+		}
+	}
 
 	// Shape, not a list of known strings: a list cannot notice a sixth illustration being
 	// added. Matched anywhere in the span rather than anchored, because the illustration this
@@ -987,6 +994,8 @@ func TestTheDocsIllustrateTheStatusLineThatActuallyRenders(t *testing.T) {
 	for _, doc := range []string{
 		filepath.Join("..", "..", "docs", "design.md"),
 		filepath.Join("..", "..", "README.md"),
+		filepath.Join("..", "..", "docs", "guide.md"),
+		filepath.Join("..", "..", "docs", "how-it-works.md"),
 	} {
 		b, err := os.ReadFile(doc)
 		if err != nil {
@@ -1009,8 +1018,8 @@ func TestTheDocsIllustrateTheStatusLineThatActuallyRenders(t *testing.T) {
 	}
 	for line, view := range renders {
 		if _, ok := illustrated[line]; !ok {
-			t.Errorf("render prints %q for %s, and neither design.md nor README.md "+
-				"illustrates it", line, view)
+			t.Errorf("render prints %q for %s, and none of design.md, README.md, guide.md "+
+				"or how-it-works.md illustrates it", line, view)
 		}
 	}
 }

@@ -17,6 +17,10 @@ any difference in a digest of the whole directory; on every push the same check 
 Debian and Alpine containers, and on every release on a clean macOS machine, from the published
 download.
 
+**New here?** [The guide](docs/guide.md) covers living with it: the status line, what a refusal
+means, overrides, troubleshooting, uninstalling. [How it works](docs/how-it-works.md) is the
+ten-minute tour of the design. [`docs/`](docs/README.md) indexes everything else.
+
 **What it is: a jobserver for Claude Code subagents.**
 
 Run several Claude Code sessions at once on a laptop and they will happily saturate it —
