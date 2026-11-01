@@ -673,6 +673,14 @@ func (in *installer) planLink() {
 		in.record(in.p.link, "skipped", dir+" does not exist")
 		return
 	}
+	if other := in.otherGovernorOnPath(); other != "" {
+		if target, err := os.Readlink(in.p.link); err == nil && target == in.p.binary {
+			in.record(in.p.link, "removed", "it shadowed "+other+", which is already on your PATH")
+			return
+		}
+		in.record(in.p.link, "skipped", "`governor` is already on your PATH at "+other)
+		return
+	}
 	if target, err := os.Readlink(in.p.link); err == nil && target == in.p.binary {
 		in.record(in.p.link, "unchanged", "")
 		return
@@ -790,10 +798,35 @@ func (in *installer) installBinary(self string) error {
 // Something else already at that name is left strictly alone. It is far more likely to be
 // another tool than a stale link of ours, and the failure mode of guessing wrong is
 // deleting a binary the user depends on.
+//
+// THE LINK IS WRITTEN ONLY WHEN NO OTHER `governor` IS ON PATH (GOV-45). It exists to put
+// the command on PATH for the install.sh route, whose binary runs from a temp directory and
+// is gone a moment later. On the brew route `governor` is already on PATH, and a link in
+// ~/.local/bin — earlier on PATH than /opt/homebrew/bin on most machines — shadows it. That is
+// what the real v0.1.2 upgrade hit (design.md section 13.4): `brew upgrade` replaced the brew
+// binary, bare `governor install` resolved to the link, ran the OLD hooked copy, reported
+// every path unchanged and left the old daemon running. A convenience that makes upgrades
+// silently do nothing is not a convenience.
+//
+// So when another `governor` is on PATH the link is not written, and a link that is exactly
+// ours (pointing at the hooked binary, the one uninstall would remove) is retired: an earlier
+// install wrote it, and it is the thing doing the shadowing. Anything else at the name is
+// still left strictly alone.
 func (in *installer) installLink() error {
 	dir := filepath.Dir(in.p.link)
 	if fi, err := os.Stat(dir); err != nil || !fi.IsDir() {
 		in.record(in.p.link, "skipped", dir+" does not exist, so `governor` is not on your PATH")
+		return nil
+	}
+	if other := in.otherGovernorOnPath(); other != "" {
+		if target, err := os.Readlink(in.p.link); err == nil && target == in.p.binary {
+			if err := os.Remove(in.p.link); err != nil {
+				return fmt.Errorf("remove %s: %w", in.p.link, err)
+			}
+			in.record(in.p.link, "removed", "it shadowed "+other+", which is already on your PATH")
+			return nil
+		}
+		in.record(in.p.link, "skipped", "`governor` is already on your PATH at "+other)
 		return nil
 	}
 	if target, err := os.Readlink(in.p.link); err == nil {
@@ -818,6 +851,34 @@ func (in *installer) installLink() error {
 	}
 	in.record(in.p.link, "created", "→ "+in.p.binary)
 	return nil
+}
+
+// otherGovernorOnPath is the first executable `governor` on PATH that is neither our link nor
+// the hooked binary itself, or "" when there is none.
+//
+// Our link is excluded by name, and by resolving to the hooked binary, so a PATH that spells
+// ~/.local/bin two ways still finds nothing. The hooked binary is excluded by file identity, NOT by
+// content: right after a brew install the hooked copy has exactly the brew binary's bytes,
+// and it is the brew binary that must be found.
+func (in *installer) otherGovernorOnPath() string {
+	link := filepath.Clean(in.p.link)
+	for _, dir := range filepath.SplitList(os.Getenv("PATH")) {
+		if dir == "" || !filepath.IsAbs(dir) {
+			// A relative PATH entry depends on the directory install happened to be run
+			// from, which is no basis for a decision about the user's machine.
+			continue
+		}
+		cand := filepath.Join(dir, "governor")
+		if filepath.Clean(cand) == link || sameFile(cand, in.p.binary) {
+			continue
+		}
+		fi, err := os.Stat(cand)
+		if err != nil || !fi.Mode().IsRegular() || fi.Mode().Perm()&0o111 == 0 {
+			continue
+		}
+		return cand
+	}
+	return ""
 }
 
 // report prints one line per path, aligned, with verb prefixed for --dry-run.

@@ -357,10 +357,11 @@ Run `governor install`. In `governor doctor` this is the **`build`** check: it c
 running daemon's build with the binary the hooks run.
 
 **After a `brew upgrade`, use the full path:** `$(brew --prefix)/bin/governor install`. Brew
-changes neither the hooked binary nor the daemon, and a bare `governor` usually resolves to
-`~/.local/bin/governor`, a link to the old hooked copy. Running that reinstalls the old version
-over itself and reports "unchanged". `$(brew --prefix)/bin/governor doctor` shows the right
-command in its fix lines.
+changes neither the hooked binary nor the daemon. If you last installed with 0.1.2 or earlier,
+a bare `governor` may still resolve to `~/.local/bin/governor`, a link to the old
+hooked copy, and running that reinstalls the old version over itself and reports "unchanged".
+The full-path install removes that link, so a bare `governor` reaches brew's binary from then
+on. `$(brew --prefix)/bin/governor doctor` shows the right command in its fix lines.
 
 ### The status line says `governor: ungoverned - restart to enable`
 
@@ -442,7 +443,8 @@ governor uninstall
 ```
 
 If `governor` is not on your `PATH` (install links it into `~/.local/bin` only when that
-directory already exists), run it from the plugin:
+directory already exists and no other `governor`, such as brew's, is on your `PATH`), run it from
+the plugin:
 
 ```sh
 ~/.claude/skills/build-governor/bin/governor uninstall
