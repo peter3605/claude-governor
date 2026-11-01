@@ -19,7 +19,8 @@ download.
 
 **New here?** [The guide](docs/guide.md) covers living with it: the status line, what a refusal
 means, overrides, troubleshooting, uninstalling. [How it works](docs/how-it-works.md) is the
-ten-minute tour of the design. [`docs/`](docs/README.md) indexes everything else.
+ten-minute tour of the design. [`docs/`](docs/README.md) indexes everything else. Building,
+testing or releasing it yourself: [CONTRIBUTING.md](CONTRIBUTING.md).
 
 **What it is: a jobserver for Claude Code subagents.**
 
