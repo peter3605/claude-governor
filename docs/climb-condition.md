@@ -346,6 +346,12 @@ elif run_queue <= 1.5 and demand:     B = min(B_max, B + 1)    # room
 else:                                 B = B                    # busy and coping
 ```
 
+> **GOV-46 added two paths up that this shape did not have**, and narrowed `demand` to mean
+> "while leases are held". A budget that was at the ceiling follows a raised ceiling, and an
+> idle governor (no lease held, nothing waiting, run queue at or under 1.5 for 60 ticks) returns
+> to `B_max`. Without them, a low budget suppressed the demand the climb needed and stayed low
+> on an idle machine. design.md §5.2 states the rule; docs/dogfooding.md has the evidence.
+
 Three things changed and each is forced by a measurement rather than chosen.
 
 **Utilisation left the cut, and it had to.** The branches are evaluated in order, so any

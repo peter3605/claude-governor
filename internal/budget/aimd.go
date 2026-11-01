@@ -31,9 +31,13 @@ type Reading struct {
 	RunQueue float64
 	// ThermalSevere is `serious` or `critical`, NOT `fair`. See Controller.Step.
 	ThermalSevere bool
-	// DemandWaiting is whether anything is actually asking for a slot. Without it the first
-	// fan-out after an idle period arrives with an unearned budget.
+	// DemandWaiting is whether anything is actually asking for a slot. It gates the one-slot
+	// climb while the machine is in use; see Step for why it no longer gates anything else.
 	DemandWaiting bool
+	// InUse is whether any lease is held. Together with DemandWaiting it tells an IDLE
+	// governor — nothing running under it, nothing asking — from one whose budget is simply
+	// not being asked for more (GOV-46).
+	InUse bool
 }
 
 // Setpoint is the host utilisation the loop aims to sit under.
@@ -181,6 +185,24 @@ const RunQueueBand = 0.5
 // budget does not oscillate against the platform's own governor.
 const NominalTicksBeforeIncrease = 3
 
+// IdleTicksBeforeReset is how long the governor must be idle, with the signal that cut it
+// recovered, before a cut budget returns to the ceiling without waiting for demand (GOV-46).
+//
+// THE NUMBER IS THE INSTRUMENT'S, NOT A TUNING. The signal that says "recovered" is loadavg1, a
+// one-minute decaying average, and RunQueueMax's comment records that it cannot see a short
+// build at all. Sixty one-second ticks is one full window of that average with nothing held
+// and nothing waiting, so the reading the reset trusts is about the machine after the load,
+// not the tail of the load itself. It also clears the gap between one build and the next in
+// a session working through a task, which is seconds; a reset inside that gap would be the
+// "unearned budget for the next fan-out" DemandWaiting exists to prevent.
+//
+// ANY FINITE VALUE FIXES THE DEFECT, and that is why it is not swept. The bug it closes was a
+// budget stranded at 1 against a ceiling of 4 for the six weeks of 2026-09-23 to 10-31
+// (docs/dogfooding.md); what this constant decides is only how soon after the machine goes
+// quiet the budget is whole again, against a cost — a fan-out arriving at the ceiling and
+// being cut fast — that a freshly started daemon already pays by design (Controller.start).
+const IdleTicksBeforeReset = 60
+
 // MaxSlots is the most build concurrency a host should ever allow, in slots.
 //
 // DERIVED FROM THE MACHINE, NOT A CONSTANT — the project rule that defaults come from the
@@ -241,8 +263,14 @@ type Controller struct {
 	clean int
 	// started is false until the first Step, so that B begins at Max rather than at zero.
 	started bool
-	// cut names the signal that last took the budget below its ceiling, or is empty while
-	// the budget is AT the ceiling and nothing is holding it down.
+	// seen is the ceiling the previous tick ran under, so a ceiling that RISES can be told
+	// apart from a budget that is low because something cut it (GOV-46 case a).
+	seen int
+	// quiet counts consecutive ticks on which the governor was idle and the cutting signal
+	// had recovered; at IdleTicksBeforeReset a cut budget returns to the ceiling.
+	quiet int
+	// cut names the signal holding the budget below its ceiling NOW, or is empty when nothing
+	// is: the budget is at the ceiling, or the signal that cut it has recovered.
 	//
 	// GOV-34 ADDED IT SO A REFUSAL CAN SAY WHY. The budget on the wire has always been the
 	// EFFECTIVE one — the daemon passes one `limit` to both the admission test and the
@@ -251,10 +279,17 @@ type Controller struct {
 	// them either. The refusal text and doctor both quote this; neither derives it, because
 	// a second copy of the branch conditions below is a second thing that can drift.
 	//
-	// It is the LAST cause, not a set, and it is cleared the moment the budget reaches the
-	// ceiling again rather than when the signal recovers. A budget still climbing back after
-	// a run-queue spike is still a budget the run queue cut, and saying so is the honest
-	// answer to "why is this machine only allowing three".
+	// IT IS CLEARED WHEN THE SIGNAL RECOVERS, NOT WHEN THE BUDGET REACHES THE CEILING, and
+	// GOV-46 reversed the old rule. This comment used to argue that a budget climbing back
+	// after a spike is still a budget the run queue cut. On 2026-11-01 that rule printed
+	// `cut run queue (ceiling 4)` at cpu 0.42 on an idle machine, minutes after the run queue
+	// had recovered, and sent its reader to debug a signal that was already fine. Cut() is
+	// documented as what holds the budget down NOW, and the field now means that.
+	//
+	// "Recovered" is the loop's own climb condition, not merely "no longer cutting". Between
+	// the climb level and the cut level the loop HOLDS, and there the run queue genuinely is
+	// what keeps the budget where it is; the field keeps naming it. For thermal it is the end
+	// of the hysteresis, which holds the floor on purpose and is thermal's doing until it ends.
 	cut string
 }
 
@@ -371,14 +406,52 @@ func Climbing(r Reading, climbAt float64) bool {
 // machine — utilisation over the setpoint cut on its own, so "busy" and "in trouble" were the
 // same reading and the budget had nowhere to stand between the floor and a cut. RunQueueBand
 // is the width of that resting place.
+//
+// A BUDGET BELOW ITS CEILING WITH NOTHING CUTTING IT IS RECONCILED, NOT STRANDED (GOV-46). Two
+// events put it there and they get two mechanisms, because they are not the same event:
+//
+//   - THE CEILING ROSE. A budget that was AT the old ceiling was held there by the ceiling and
+//     by nothing else, so it moves up with the ceiling on the same tick. This is not
+//     demand-gated: no signal cut it and no load earned the old value, so there is nothing to
+//     re-earn, and a daemon restarted under the new config would begin at the new ceiling
+//     anyway (start). A budget that a signal had cut is left alone — the ceiling moving says
+//     nothing about the load that cut it.
+//   - THE CUT RECOVERED AND THE GOVERNOR WENT IDLE. With nothing held, nothing waiting, and the
+//     run queue at or below the climb level for IdleTicksBeforeReset ticks, the budget returns
+//     to the ceiling. This is not demand-gated either, and the reason is the feedback trap it
+//     closes: a low budget admits fewer builds, fewer builds queue, and the queue was the only
+//     thing that could raise the budget. An idle governor is in the state a fresh daemon is in,
+//     and start() already answers that state — begin at the ceiling, cut fast.
+//
+// WHAT STAYS DEMAND-GATED, AND WHY. The one-slot climb while leases are held. There, a budget
+// below the ceiling that nobody is asking to exceed is not stranded — it is unused — and
+// raising it would hand the next arrival room the loop never saw the machine cope with. That
+// is the "unearned budget" DemandWaiting has always guarded against, in the case it was
+// written for. Invariant 4 is untouched: nothing here lowers the budget, and both new paths
+// only ever move it up to the ceiling.
 func (c *Controller) Step(r Reading) int {
-	if !c.started {
-		c.b = c.start()
-		c.started = true
-	}
 	max := c.Max
 	if max < Floor {
 		max = Floor
+	}
+	if !c.started {
+		c.b = c.start()
+		c.started = true
+		c.seen = max
+	}
+	if max > c.seen && c.b >= c.seen {
+		// Case (a). Before the switch, so a machine that is busy on this very tick still cuts
+		// from the new ceiling — the same "begin high, cut fast" shape as start().
+		c.b = max
+	}
+	c.seen = max
+
+	climbing := Climbing(r, c.climbRunQueue())
+	idle := climbing && !r.DemandWaiting && !r.InUse && !r.ThermalSevere
+	if idle {
+		c.quiet++
+	} else {
+		c.quiet = 0
 	}
 
 	switch {
@@ -423,11 +496,20 @@ func (c *Controller) Step(r Reading) int {
 		// for three consecutive ticks, so the budget does not oscillate against the
 		// platform's own governor (design.md section 5.3).
 		c.clean++
-	case Climbing(r, c.climbRunQueue()) && r.DemandWaiting:
-		// DemandWaiting gates the increase: do not climb when nobody is asking, or the first
-		// fan-out after an idle period arrives with an unearned budget.
+	case climbing && r.DemandWaiting:
+		// DemandWaiting gates the increase while the machine is in use: do not climb when
+		// nobody is asking, or the next arrival gets room the loop never saw the machine cope
+		// with. The signal has recovered, so it is no longer what holds the budget down.
+		c.cut = ""
 		if c.b < max {
 			c.b++
+		}
+	case climbing:
+		// Recovered, and nobody is asking for more. Nothing holds the budget down; it is
+		// unused, or — once the governor has been idle long enough — reset (case b).
+		c.cut = ""
+		if idle && c.quiet >= IdleTicksBeforeReset {
+			c.b = max
 		}
 	}
 

@@ -653,7 +653,8 @@ figure — the same answer a non-cgroup machine gives.
 > not an input at all, because it saturates at 1.0 under exactly the load this governor exists
 > for and cannot distinguish two builds from eight ([climb-condition.md](climb-condition.md)).
 > Additive increase, multiplicative decrease, the thermal floor and the `demand_waiting` guard
-> all survive both changes untouched. The constants below are derived against build slots and
+> all survive both changes. GOV-46 later narrowed the guard to the in-use case, for the reason
+> given below. The constants below are derived against build slots and
 > the reasoning lives at each constant in `internal/budget/aimd.go`.
 
 Borrowed from TCP congestion control, and the right shape for the same reason: reclaim
@@ -667,7 +668,12 @@ if thermal is serious or critical:    B = B_min                # hard floor
 elif run_queue > 2.0:                 B = max(B_min, B // 2)   # multiplicative decrease
 elif run_queue <= 1.5 and demand_waiting:
                                       B = min(B_max, B + 1)    # additive increase
+elif run_queue <= 1.5 and idle for 60 ticks:
+                                      B = B_max                # idle reset (GOV-46)
 else:                                 B = B                    # busy and coping: hold
+
+# before the branches: if B_max rose and B was at the old B_max, B = new B_max  (GOV-46)
+# idle = no lease held and nothing waiting
 
 B_min = 1
 B_max = floor(usable_cores / 1.2)          # slots, one slot = one Medium build
@@ -686,8 +692,31 @@ where it is meant to sit under build load: the machine busy, the queue shallow, 
 steady. The two thresholds are one constant and a band — `RunQueueMax` and `RunQueueBand` — so
 that moving the cut moves the climb with it and the gap keeps its width.
 
-`demand_waiting` gates the increase: do not climb the budget when nobody is asking for a
-slot, or the first fan-out after an idle period arrives with an unearned budget.
+`demand_waiting` gates the one-slot increase **while leases are held**. In that case a budget
+below `B_max` that nobody is asking to exceed is unused, not stranded, and raising it would give
+the next arrival room the loop never saw the machine cope with.
+
+**A budget below `B_max` with nothing cutting it is reconciled, not left where it is (GOV-46).**
+Until GOV-46 the demand guard applied to every climb, and that set a trap. A low budget admits
+fewer builds, so less work queues, so the demand signal the climb needs never arrives. On
+2026-11-01 it left an idle machine at budget 1 against a ceiling of 4, and it explains why the
+2026-09-23 to 10-31 parks lasted six weeks (docs/dogfooding.md). Two events cause this state,
+and each has its own rule; neither waits for demand:
+
+- **The ceiling rose.** A budget that was *at* the old `B_max` was held there by the ceiling
+  alone, so it moves up to the new `B_max` on the same tick, before the branches run. A busy
+  tick then cuts from the new ceiling. A budget that a signal had cut stays where it is,
+  because the ceiling moving says nothing about the load.
+- **The cut recovered and the governor went idle.** Once no lease has been held, nothing has
+  waited, and the run queue has been at or under the climb level for 60 consecutive ticks (one
+  `loadavg1` window), `B` returns to `B_max`. An idle governor is in the same state as a fresh
+  daemon, and the loop answers both the same way: begin at the ceiling, cut fast. The 60 ticks
+  keep the gap between two builds of the same task from counting as idle.
+
+**The `cut` a status or refusal reports names what holds the budget now.** It is cleared when
+its signal recovers, meaning the run queue is back at the climb level or thermal's hysteresis
+has ended, not when `B` gets back to `B_max`. Inside the hold band it still names the run
+queue, because there the run queue really is what keeps `B` where it is.
 
 **Built and tuned in GOV-15** (`internal/budget/aimd.go`). Every constant is derived from the
 312,515-sample Phase 0 trace and the reasoning is written at the constant, not here. Four
@@ -2306,7 +2335,8 @@ rather than implementation:
   than the install passed every other check. It fails on a different digest and on an absent
   one, since a daemon with no `build` field is older than the field. Its fix is `governor
   install`, which replaces exactly that daemon (§13.4), spelled with doctor's own absolute path
-  whenever doctor is not the hooked binary: a bare `governor` can be the hooked copy. A daemon reporting `"unknown"` is
+  unless bare `governor` on `PATH` is doctor itself: a bare `governor` can be the hooked copy
+  or an older brew release. The same rule covers every fix line doctor prints (GOV-46). A daemon reporting `"unknown"` is
   `unknown`, not a failure.
 
 - **A finding can be `skip`.** With the daemon down there is no protocol version to compare
@@ -2929,10 +2959,18 @@ A machine upgrades from a release that predates GOV-45, and that release's link 
 until the first brew-route install of a newer one runs and retires it. Until then, bare
 `governor` is still the hooked copy, so a caveat or fix line saying `governor install` would
 send the person to run the old build again, which is the exact failure being fixed. The full
-path is correct on every machine, before or after the link is gone: doctor names itself only
-when it is a different file from the hooked binary, which is precisely when the bare name could
-resolve to the wrong one. The caveat costs one longer line, and a bare-name line that sometimes
-does nothing costs an upgrade.
+path is correct on every machine, before or after the link is gone. The caveat costs one longer
+line, and a bare-name line that sometimes does nothing costs an upgrade.
+
+**GOV-46 made the rule about the bare name, not about the hooked binary.** GOV-43 kept the bare
+name whenever doctor *was* the hooked binary, on the reasoning that nothing newer existed to
+name. GOV-45 broke that reasoning. With the `~/.local/bin` link retired, bare `governor` on a
+brew machine is the brew binary, which can be older than the hooked one. The budget check's
+`kill … && governor install` would then have reinstalled an older release. So every governor
+command doctor prints now goes through one helper, `governorCommand`. It uses the bare name only
+when `exec.LookPath("governor")` is the very file running doctor, and doctor's absolute path
+otherwise. `TestEveryDoctorFixLineNamesABinaryThatWorks` reads every string literal in doctor.go
+and fails on a bare `governor install`, `calibrate`, `doctor` or `uninstall`.
 
 **Why pid 23289 survived 40 days.** It was started on 2026-09-20 from the pre-rename tree
 `~/.claude/skills/claude-governor/bin/governor`, a 0.0.0-dev build. On 2026-10-31, v0.1.1 arrived

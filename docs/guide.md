@@ -332,8 +332,9 @@ or command that settles them.
 1. `governor status` shows the budget, what is in use, and what is waiting.
 2. `governor doctor`, **`budget` check.** It warns when the budget is below this machine's
    ceiling and names the signal cutting it, such as the run queue or thermal pressure. That is
-   the loop working, and the budget climbs back as the machine quietens
-   ([§5.2](design.md#52-aimd)). It also warns when someone pinned the budget and names the
+   the loop working. Once the signal recovers, the line says nothing is cutting the budget. It
+   then rises one slot a tick while builds are waiting, and returns to the ceiling after a
+   minute with nothing running ([§5.2](design.md#52-aimd)). It also warns when someone pinned the budget and names the
    `resume` that lifts it.
 3. **`calibration` check.** "Never been measured", or "calibrated on a different machine",
    means the limits are somebody else's. Run `governor calibrate` while working, then restart

@@ -17,6 +17,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/peter3605/claude-governor/internal/budget"
 	"github.com/peter3605/claude-governor/internal/config"
 	"github.com/peter3605/claude-governor/internal/lease"
 	"github.com/peter3605/claude-governor/internal/transport"
@@ -354,7 +355,7 @@ func (d *diagnosis) checkSpawnTools() {
 		d.add("spawn", unverified, fmt.Sprintf(
 			"%s — the daemon does not report which spawn tools it has caught, so nothing here confirms the matcher fires",
 			names),
-			"restart the daemon on this binary with `governor install` — a daemon older than "+
+			"restart the daemon on this binary with `"+governorCommand("install")+"` — a daemon older than "+
 				"this build keeps no record of what the gate caught")
 		return
 	}
@@ -455,7 +456,7 @@ func (d *diagnosis) checkSpawnTools() {
 	if len(missing) > 1 {
 		fix = "spawn a subagent in a session on each of those versions"
 	}
-	d.add("spawn", unverified, detail, fix+", then re-run `governor doctor` — if it still says "+
+	d.add("spawn", unverified, detail, fix+", then re-run `"+governorCommand("doctor")+"` — if it still says "+
 		"this afterwards, the matcher is not firing and those spawns are not being governed")
 }
 
@@ -534,7 +535,7 @@ func (d *diagnosis) checkSessions() {
 		d.add("sessions", unverified,
 			"not verified — the daemon did not say which sessions are live "+
 				"(a daemon older than this binary, or a host with no session registry)",
-			"upgrade the daemon with `governor install` if it is older than this binary; "+
+			"upgrade the daemon with `"+governorCommand("install")+"` if it is older than this binary; "+
 				"otherwise this host keeps no session registry and there is nothing to fix")
 		return
 	}
@@ -779,8 +780,8 @@ func (d *diagnosis) checkDaemon() {
 		d.add("daemon", fail,
 			fmt.Sprintf("the socket path is %d bytes, past this platform's limit of %d — nothing can bind or connect there",
 				len(path), transport.MaxSocketPath),
-			fmt.Sprintf("point the state directory somewhere shorter: %s=$HOME/.claude/governor, then: governor install",
-				transport.StateDirEnv))
+			fmt.Sprintf("point the state directory somewhere shorter: %s=$HOME/.claude/governor, then: %s",
+				transport.StateDirEnv, governorCommand("install")))
 		return
 	}
 
@@ -799,7 +800,7 @@ func (d *diagnosis) checkDaemon() {
 		d.add("daemon", fail,
 			fmt.Sprintf("nothing answering on %s (%s) — every spawn on this machine is ungoverned",
 				short(endpoint), short(reason)),
-			"governor install")
+			governorCommand("install"))
 		return
 	}
 	d.up = true
@@ -848,7 +849,7 @@ func (d *diagnosis) checkSocket() {
 		}
 		d.add("socket", fail,
 			fmt.Sprintf("a daemon answered but there is no socket at %s", short(path)),
-			"restart the daemon so the endpoint and the socket agree: governor install")
+			"restart the daemon so the endpoint and the socket agree: "+governorCommand("install"))
 		return
 	}
 	if err != nil {
@@ -863,7 +864,7 @@ func (d *diagnosis) checkSocket() {
 		d.add("socket", fail,
 			fmt.Sprintf("%s exists and is not a socket (mode %s) — the daemon refuses to replace it",
 				short(path), fi.Mode()),
-			fmt.Sprintf("mv %s %s.bak && governor install", path, path))
+			fmt.Sprintf("mv %s %s.bak && %s", path, path, governorCommand("install")))
 		return
 	}
 
@@ -911,7 +912,7 @@ type socketFacts struct {
 func (f socketFacts) faults() (problems, fixes []string) {
 	if f.ownerKnown && f.owner != f.self {
 		problems = append(problems, fmt.Sprintf("owned by uid %d, not by you (uid %d)", f.owner, f.self))
-		fixes = append(fixes, fmt.Sprintf("stop that user's daemon, then: rm %s && governor install", f.path))
+		fixes = append(fixes, fmt.Sprintf("stop that user's daemon, then: rm %s && %s", f.path, governorCommand("install")))
 	}
 	if f.perm&0o077 != 0 {
 		problems = append(problems, fmt.Sprintf("mode %04o: other users on this machine can take leases from your budget", f.perm))
@@ -1096,7 +1097,7 @@ func (d *diagnosis) checkHooks() {
 	sources, err := hookSources()
 	if err != nil {
 		d.add("hooks", fail, fmt.Sprintf("cannot locate the settings file: %v", err),
-			"set HOME, then: governor install")
+			"set HOME, then: "+governorCommand("install"))
 		return
 	}
 	// The first source is the settings file, and it is the one a report names: it is where
@@ -1153,7 +1154,7 @@ func (d *diagnosis) checkHooks() {
 	// them run a command that refuses.
 	if len(unreadable) > 0 {
 		d.add("hooks", fail, strings.Join(unreadable, "; "),
-			"fix or move that file, then: governor install")
+			"fix or move that file, then: "+governorCommand("install"))
 		return
 	}
 	// Missing and broken are reported together rather than one at a time. A settings file
@@ -1174,7 +1175,7 @@ func (d *diagnosis) checkHooks() {
 			len(gates), shortList(gates), len(gates)))
 	}
 	if len(problems) > 0 {
-		d.add("hooks", fail, strings.Join(problems, "; "), "governor install")
+		d.add("hooks", fail, strings.Join(problems, "; "), governorCommand("install"))
 		return
 	}
 	// Every file above can be right and none of it loaded. A marketplace plugin of the same
@@ -1407,7 +1408,7 @@ func (d *diagnosis) checkOneMatcher(w wantedHook) {
 	}
 	want := strings.Join(w.covers, "|")
 
-	fix := fmt.Sprintf("set \"matcher\": %q on that hook, or re-run: governor install", want)
+	fix := fmt.Sprintf("set \"matcher\": %q on that hook, or re-run: %s", want, governorCommand("install"))
 
 	if ref.matcher == "" {
 		// An absent matcher is not a missing hook — the harness runs an unmatched hook for
@@ -1485,7 +1486,7 @@ func (d *diagnosis) checkProtocol() {
 	}
 	detail += " — every hook is failing open, so nothing is governed"
 	d.add("protocol", fail, detail,
-		"restart the daemon on the same build as the hooks: governor install")
+		"restart the daemon on the same build as the hooks: "+governorCommand("install"))
 }
 
 // checkBinary compares the binary the hooks run with the one running this check.
@@ -1529,7 +1530,7 @@ func (d *diagnosis) checkBinary() {
 		d.add("binary", fail,
 			fmt.Sprintf("the hooks point at %d different binaries: %s",
 				len(bins), shortList(sortedKeys(bins))),
-			"governor install")
+			governorCommand("install"))
 		return
 	}
 	bin := sortedKeys(bins)[0]
@@ -1563,7 +1564,7 @@ func (d *diagnosis) checkBinary() {
 		// could not look". Passing here is how a check that cannot verify starts lying.
 		d.add("binary", unverified,
 			fmt.Sprintf("cannot compare %s with this build (%v)", short(bin), err),
-			"governor install")
+			governorCommand("install"))
 		return
 	}
 	if same {
@@ -1577,7 +1578,7 @@ func (d *diagnosis) checkBinary() {
 	if err != nil {
 		d.add("binary", fail,
 			fmt.Sprintf("%s did not answer `version` (%v)", short(bin), err),
-			installFix(bin))
+			governorCommand("install"))
 		return
 	}
 	var diffs []string
@@ -1594,7 +1595,7 @@ func (d *diagnosis) checkBinary() {
 		d.add("binary", fail,
 			fmt.Sprintf("the hooks run %s, which is a different build: %s",
 				short(bin), strings.Join(diffs, ", ")),
-			installFix(bin))
+			governorCommand("install"))
 		return
 	}
 	// Every number matches and the bytes do not: a different build wearing the same version.
@@ -1604,7 +1605,7 @@ func (d *diagnosis) checkBinary() {
 	d.add("binary", fail,
 		fmt.Sprintf("the hooks run %s, a DIFFERENT BUILD reporting the same version (%s) — "+
 			"the install is stale", short(bin), v.binary),
-		installFix(bin))
+		governorCommand("install"))
 }
 
 // checkDaemonBuild compares the build of the RUNNING DAEMON with the binary the hooks run.
@@ -1647,26 +1648,26 @@ func (d *diagnosis) checkDaemonBuild() {
 		d.add("build", fail,
 			fmt.Sprintf("%s predates build reporting, so it is an older build than the hooks run (%s) — "+
 				"fixes since it started are not running", running, short(bin)),
-			installFix(bin))
+			governorCommand("install"))
 		return
 	case buildUnknown:
 		d.add("build", unverified,
 			fmt.Sprintf("%s could not read its own executable, so its build is unknown", running),
-			installFix(bin))
+			governorCommand("install"))
 		return
 	}
 	want, err := digest(bin)
 	if err != nil {
 		d.add("build", unverified,
 			fmt.Sprintf("cannot read %s to compare with the daemon's build (%v)", short(bin), err),
-			installFix(bin))
+			governorCommand("install"))
 		return
 	}
 	if d.reply.Build != want {
 		d.add("build", fail,
 			fmt.Sprintf("%s is build %s, but the hooks run build %s (%s) — the daemon is stale",
 				running, shortBuild(d.reply.Build), shortBuild(want), short(bin)),
-			installFix(bin))
+			governorCommand("install"))
 		return
 	}
 	d.add("build", pass,
@@ -1699,7 +1700,7 @@ func (d *diagnosis) hookedBinary() (string, bool) {
 // check read only one side. checkCalibration still reads the file and checkBudget still reads
 // the daemon; this is the line that reads both and fails when they disagree.
 //
-// THE FIX IS installFix AND IT WORKS BECAUSE inspectDaemon APPLIES THE SAME PREDICATE.
+// THE FIX IS governorCommand("install") AND IT WORKS BECAUSE inspectDaemon APPLIES THE SAME PREDICATE.
 // `governor install` replaces a running daemon whose loaded config differs from disk exactly
 // as it replaces one whose build differs, so the fix line clears the finding — GOV-43's rule
 // that a fix line must name the command that actually clears it, held here too.
@@ -1713,10 +1714,7 @@ func (d *diagnosis) checkDaemonConfig() {
 		d.add(name, skip, "the daemon speaks another protocol (see protocol above)", "")
 		return
 	}
-	fix := "governor install"
-	if bin, ok := d.hookedBinary(); ok {
-		fix = installFix(bin)
-	}
+	fix := governorCommand("install")
 	if d.reply.Config == nil {
 		// Older than config reporting. That is NOT always a stale build the check above has
 		// caught: a doctor newer than the hooks meets a daemon of the hooks' build, which
@@ -1749,32 +1747,37 @@ func (d *diagnosis) checkDaemonConfig() {
 	}
 }
 
-// installFix is the install command that actually fixes a stale finding, given the hooked
-// binary bin.
+// governorCommand is `governor <sub>` spelled so that it runs THIS binary: the bare name when
+// bare `governor` on PATH is this very file, and this binary's absolute path otherwise. Every
+// fix line doctor prints that names a governor command goes through it (GOV-46 clause 4), and
+// TestEveryDoctorFixLineNamesABinaryThatWorks holds the file to that.
 //
-// "governor install" is right only when bare `governor` on PATH is the build you want
-// installed, and after an upgrade it usually is not. Measured on 2026-10-31 (GOV-43):
-// `brew upgrade` put 0.1.2 at /opt/homebrew/bin/governor, and `/opt/homebrew/bin/governor
-// doctor` failed `binary` and `build` with "fix: governor install". But `governor` resolved to
-// ~/.local/bin/governor, install's own link to the hooked 0.1.1 binary. That install copied
-// 0.1.1 onto itself, reported every path "unchanged", and left the old daemon running.
+// THE BARE NAME IS RIGHT ONLY WHEN IT RESOLVES HERE, and two releases in a row found out it
+// often does not. GOV-43, 2026-10-31: `brew upgrade` put 0.1.2 at /opt/homebrew/bin/governor,
+// `/opt/homebrew/bin/governor doctor` said "fix: governor install", and bare `governor`
+// resolved to ~/.local/bin/governor — install's own link to the hooked 0.1.1 — which copied
+// 0.1.1 onto itself and left the old daemon running. GOV-43 fixed that for the case where
+// doctor is a different file from the hooked binary and kept the bare name otherwise. Then
+// GOV-45 stopped writing the ~/.local/bin link, so on a brew machine bare `governor` became
+// whatever else is on PATH — an older brew release on the machine that found GOV-46 — and the
+// "doctor IS the hooked binary, so the bare name is fine" branch began naming a DOWNGRADE.
 //
-// So when doctor is a different file from the hooked binary, it is the newer build the person
-// just ran, and the fix names it by absolute path. When doctor IS the hooked binary, the bare
-// name is right: there is nothing newer to name, and reinstalling the hooked binary is what
-// restarts a daemon of an older build.
-func installFix(bin string) string {
+// So the rule is stated as the property, not as a guess about which install route is in use:
+// name a command that runs this binary. When doctor is newer than the hooked binary this is
+// still GOV-43's fix — doctor's own path — and when it is the hooked binary it is that path,
+// which is the build already hooked and the one a reinstall should restart.
+func governorCommand(sub string) string {
 	self, err := os.Executable()
 	if err != nil {
-		return "governor install"
+		return "governor " + sub
 	}
 	if abs, err := filepath.Abs(self); err == nil {
 		self = abs
 	}
-	if sameFile(bin, self) {
-		return "governor install"
+	if onPath, err := exec.LookPath("governor"); err == nil && sameFile(onPath, self) {
+		return "governor " + sub
 	}
-	return self + " install"
+	return self + " " + sub
 }
 
 func orUnknown(s string) string {
@@ -1860,20 +1863,20 @@ func (d *diagnosis) checkConfig() {
 	}
 	if err := json.Unmarshal(raw, &doc); err != nil {
 		d.add("config", fail, fmt.Sprintf("%s is not valid JSON (%v)", short(path), err),
-			fmt.Sprintf("mv %s %s.bak && governor calibrate", path, path))
+			fmt.Sprintf("mv %s %s.bak && %s", path, path, governorCommand("calibrate")))
 		return
 	}
 	if doc.Schema == nil {
 		d.add("config", fail,
 			fmt.Sprintf("%s carries no \"schema\" key, so nothing can tell which version wrote it", short(path)),
-			fmt.Sprintf("mv %s %s.bak && governor calibrate", path, path))
+			fmt.Sprintf("mv %s %s.bak && %s", path, path, governorCommand("calibrate")))
 		return
 	}
 	if *doc.Schema > configSchemaVersion {
 		d.add("config", fail,
 			fmt.Sprintf("%s is schema %d and this binary understands %d — it was written by a newer governor",
 				short(path), *doc.Schema, configSchemaVersion),
-			"upgrade this binary, or: mv "+path+" "+path+".bak && governor calibrate")
+			"upgrade this binary, or: mv "+path+" "+path+".bak && "+governorCommand("calibrate"))
 		return
 	}
 	if *doc.Schema < configSchemaVersion {
@@ -1943,11 +1946,11 @@ func (d *diagnosis) checkLeases() {
 	// a daemon only when none is answering, so telling someone to run it while the stuck one
 	// is still up would name a command that does nothing. The pid file GOV-21 added is what
 	// makes the first half precise.
-	fix := "restart the daemon to clear them: kill $(cat " + short(d.pidPath()) + ") && governor install"
+	fix := "restart the daemon to clear them: kill $(cat " + short(d.pidPath()) + ") && " + governorCommand("install")
 	if ownerless > 0 {
 		// The cause, not the symptom: an ownerless lease means the session was never
 		// registered, which means the SessionStart hook did not run.
-		fix = "register sessions so their leases can be reclaimed — check the SessionStart hook is wired: governor install"
+		fix = "register sessions so their leases can be reclaimed — check the SessionStart hook is wired: " + governorCommand("install")
 	}
 	d.add("leases", fail,
 		fmt.Sprintf("%d of %d leases cannot be reclaimed by their owner: %s",
@@ -2012,14 +2015,20 @@ func (d *diagnosis) checkBudget() {
 				"build-governor:governor limit N")
 
 	case r.Ceiling > r.Budget:
-		// Below the ceiling with nothing claiming responsibility. The controller sets its cut
-		// and its budget under one lock, so this should be unreachable; reporting it as a
-		// definite state rather than passing over it is what would surface the day it is not.
+		// Below the ceiling with nothing holding it there. Until GOV-46 the comment here
+		// called this unreachable and its fix restarted the daemon, and on 2026-11-01 it was
+		// reached twice in an hour: a ceiling raised by a config reload that the budget did
+		// not follow, and a run-queue cut the budget could not climb back from on an idle
+		// machine. Both are reconciled by the loop now (Controller.Step), so what remains
+		// here is a recovered signal and a budget on its way back: it rises a slot a tick
+		// when something waits, and returns to the ceiling once the governor has been idle
+		// for budget.IdleTicksBeforeReset. Still a warning, because if the strand ever came
+		// back this is the line that would show it.
 		d.add("budget", warn,
-			fmt.Sprintf("%d of a possible %d slots, and the daemon reports no signal cutting it",
-				r.Budget, r.Ceiling),
-			"restart the daemon so the control loop re-reads the host: kill $(cat "+
-				short(d.pidPath())+") && governor install")
+			fmt.Sprintf("%d of a possible %d slots and nothing cutting it: the budget climbs as "+
+				"builds wait, and returns to the ceiling after %ds idle",
+				r.Budget, r.Ceiling, int((time.Duration(budget.IdleTicksBeforeReset)*sampleInterval).Seconds())),
+			"nothing to fix — to override it now: build-governor:governor limit N")
 
 	case r.Ceiling > 0:
 		d.add("budget", pass,
@@ -2178,7 +2187,7 @@ func (d *diagnosis) checkCalibration() {
 	if c.CalibratedAt == "" {
 		d.add("calibration", warn,
 			"this host has never been measured, so the budget runs on constants measured on another machine",
-			"governor calibrate")
+			governorCommand("calibrate"))
 		return
 	}
 
@@ -2189,7 +2198,7 @@ func (d *diagnosis) checkCalibration() {
 		if now := runtime.NumCPU(); now != cores {
 			d.add("calibration", warn,
 				fmt.Sprintf("calibrated on a %d-core machine and this one has %d — the numbers are somebody else's", cores, now),
-				"governor calibrate")
+				governorCommand("calibrate"))
 			return
 		}
 	}

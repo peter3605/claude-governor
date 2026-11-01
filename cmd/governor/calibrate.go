@@ -5,9 +5,6 @@ import (
 	"flag"
 	"fmt"
 	"io"
-	"os"
-	"os/exec"
-	"path/filepath"
 	"time"
 
 	"github.com/peter3605/claude-governor/internal/calibrate"
@@ -163,19 +160,8 @@ func noteDaemonDrift(stdout io.Writer) {
 	}
 }
 
-// calibrateFix is the install that replaces the daemon: this binary by absolute path when it
-// is not the bare `governor` on PATH, for installFix's reason (GOV-43/GOV-45 — a bare name may
-// resolve to an older, shadowing copy).
+// calibrateFix is the install that replaces the daemon, spelled by governorCommand so that it
+// runs this binary rather than whatever bare `governor` resolves to (GOV-43/GOV-45/GOV-46).
 func calibrateFix() string {
-	self, err := os.Executable()
-	if err != nil {
-		return "governor install"
-	}
-	if onPath, err := exec.LookPath("governor"); err == nil && sameFile(onPath, self) {
-		return "governor install"
-	}
-	if abs, err := filepath.Abs(self); err == nil {
-		self = abs
-	}
-	return self + " install"
+	return governorCommand("install")
 }

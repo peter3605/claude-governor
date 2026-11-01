@@ -181,9 +181,15 @@ func TestASustainedOverloadReachesTheFloorQuickly(t *testing.T) {
 	}
 }
 
-// The increase is gated on something actually asking. Without this the first fan-out after an
-// idle period arrives with an unearned budget.
-func TestAnIdleMachineWithNoDemandDoesNotClimb(t *testing.T) {
+// The one-slot climb is still gated on something actually asking, WHILE THE MACHINE IS IN USE.
+// A budget below the ceiling that nobody is asking to exceed is unused, not stranded, and
+// raising it would hand the next arrival room the loop never saw the machine cope with.
+//
+// GOV-46 narrowed this from "an idle machine" to "an in-use machine". The old test drove the
+// budget to the floor and asserted it stayed there through fifty quiet ticks with nothing
+// waiting — which was the defect: on 2026-11-01 a finished test suite left an idle machine at
+// budget 1 against a ceiling of 4 (TestARecoveredCutReturnsToTheCeilingOnAnIdleMachine).
+func TestAnInUseMachineWithNoDemandDoesNotClimb(t *testing.T) {
 	c := &Controller{Max: MaxSlots(8)}
 	// Drive it to the floor first, so there is somewhere to climb from.
 	for i := 0; i < 10; i++ {
@@ -193,12 +199,135 @@ func TestAnIdleMachineWithNoDemandDoesNotClimb(t *testing.T) {
 		t.Fatalf("budget = %d, want the floor before this test starts", c.Budget())
 	}
 
-	for i := 0; i < 50; i++ {
-		c.Step(Reading{CPU: 0.0, RunQueue: 0.0, DemandWaiting: false})
+	for i := 0; i < 5*IdleTicksBeforeReset; i++ {
+		c.Step(Reading{CPU: 0.0, RunQueue: 0.0, DemandWaiting: false, InUse: true})
 	}
 	if got := c.Budget(); got != Floor {
-		t.Errorf("budget climbed to %d with nothing waiting for a slot; the first fan-out "+
-			"after an idle period would arrive with an unearned budget", got)
+		t.Errorf("budget climbed to %d with leases held and nothing waiting for a slot; the "+
+			"next arrival would get room the loop never saw the machine cope with", got)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// GOV-46: a budget below its ceiling with nothing cutting it is reconciled
+// ---------------------------------------------------------------------------
+
+// Case (a), as observed on 2026-11-01: GOV-44's config reload raised the ceiling from 3 to 4
+// and the budget stayed at 3, with doctor reporting "3 of a possible 4 slots, and the daemon
+// reports no signal cutting it". The budget was held at 3 by the ceiling and nothing else, so it
+// follows the ceiling up — with nothing waiting, because nothing ever cut it.
+func TestARaisedCeilingIsReachedWithoutDemand(t *testing.T) {
+	for _, inUse := range []bool{false, true} {
+		c := &Controller{Max: 3}
+		for i := 0; i < 5; i++ {
+			c.Step(Reading{CPU: 0.2, RunQueue: 0.3, InUse: inUse})
+		}
+		if c.Budget() != 3 {
+			t.Fatalf("budget = %d, want the ceiling of 3 before it moves", c.Budget())
+		}
+		c.Max = 4
+		c.Step(Reading{CPU: 0.2, RunQueue: 0.3, InUse: inUse})
+		if got := c.Budget(); got != 4 {
+			t.Errorf("in use %v: budget = %d one tick after the ceiling rose from 3 to 4, want 4: "+
+				"nothing held it at 3 but the old ceiling", inUse, got)
+		}
+		if got := c.Cut(); got != "" {
+			t.Errorf("in use %v: Cut() = %q, want \"\"", inUse, got)
+		}
+	}
+}
+
+// A ceiling that moves says nothing about the load that cut the budget, so a budget a signal
+// is holding down stays down. Two events, two mechanisms (the story's last trap).
+func TestARaisedCeilingDoesNotLiftACutBudget(t *testing.T) {
+	c := &Controller{Max: 4}
+	for i := 0; i < 5; i++ {
+		c.Step(Reading{CPU: 0.95, RunQueue: RunQueueMax * 4, DemandWaiting: true})
+	}
+	if c.Budget() != Floor {
+		t.Fatalf("budget = %d, want the floor under sustained overload", c.Budget())
+	}
+	c.Max = 6
+	c.Step(Reading{CPU: 0.95, RunQueue: RunQueueMax * 4, DemandWaiting: true})
+	if got := c.Budget(); got != Floor {
+		t.Errorf("budget = %d after the ceiling rose under sustained overload, want the floor", got)
+	}
+}
+
+// And a busy tick on the very tick the ceiling rises cuts from the NEW ceiling: begin high, cut
+// fast, the shape start() already has.
+func TestARaisedCeilingOnABusyTickCutsFromTheNewCeiling(t *testing.T) {
+	c := &Controller{Max: 3}
+	c.Step(Reading{RunQueue: 0.3})
+	c.Max = 6
+	if got := c.Step(Reading{RunQueue: RunQueueMax * 4}); got != 3 {
+		t.Errorf("budget = %d, want 6/2 = 3: the cut applies to the raised ceiling", got)
+	}
+}
+
+// Case (b), as observed on 2026-11-01: the repo's own test suite drove run-queue cuts 4 to 2 to
+// 1, the suite finished and the machine went idle — in use 0, waiting 0, cpu 0.42, thermal
+// nominal — and the budget stayed at 1 with a ceiling of 4. It must reach the ceiling, with
+// nothing waiting, because a low budget suppresses the very queue the climb used to need.
+func TestARecoveredCutReturnsToTheCeilingOnAnIdleMachine(t *testing.T) {
+	c := &Controller{Max: 4}
+	c.Step(Reading{CPU: 0.3, RunQueue: 0.4})
+	for _, want := range []int{2, 1} {
+		if got := c.Step(Reading{CPU: 1.0, RunQueue: RunQueueMax + 1, InUse: true, DemandWaiting: true}); got != want {
+			t.Fatalf("budget = %d during the suite, want %d (the observed 4 -> 2 -> 1)", got, want)
+		}
+	}
+
+	idle := Reading{CPU: 0.42, RunQueue: 0.6}
+	reached := -1
+	for i := 1; i <= IdleTicksBeforeReset+NominalTicksBeforeIncrease+5; i++ {
+		if c.Step(idle) == 4 {
+			reached = i
+			break
+		}
+	}
+	if reached < 0 {
+		t.Fatalf("budget = %d after %d idle ticks against a ceiling of 4, want the ceiling: "+
+			"the observed strand", c.Budget(), IdleTicksBeforeReset+NominalTicksBeforeIncrease+5)
+	}
+	if reached < IdleTicksBeforeReset {
+		t.Errorf("the budget reset after %d idle ticks, before one loadavg1 window (%d): the gap "+
+			"between two builds in one session would hand the second an unearned budget",
+			reached, IdleTicksBeforeReset)
+	}
+	if got := c.Cut(); got != "" {
+		t.Errorf("Cut() = %q at the ceiling, want \"\"", got)
+	}
+}
+
+// The idle window is CONSECUTIVE ticks. A lease taken partway through — the next build in the
+// same task — starts it over, so a session working steadily never has its budget reset under it.
+func TestAnyActivityRestartsTheIdleWindow(t *testing.T) {
+	c := &Controller{Max: 4}
+	c.Step(Reading{RunQueue: 0.4})
+	for i := 0; i < 2; i++ {
+		c.Step(Reading{RunQueue: RunQueueMax + 1, InUse: true})
+	}
+	for round := 0; round < 5; round++ {
+		for i := 0; i < IdleTicksBeforeReset-1; i++ {
+			c.Step(Reading{RunQueue: 0.4})
+		}
+		c.Step(Reading{RunQueue: 0.4, InUse: true})
+	}
+	if got := c.Budget(); got != Floor {
+		t.Errorf("budget = %d, want the floor: no idle window was ever %d ticks long", got, IdleTicksBeforeReset)
+	}
+}
+
+// A machine that is quiet for this governor but still saturated by something else is not idle
+// in the sense that matters: the run queue has not recovered, so nothing resets.
+func TestAnIdleGovernorOnASaturatedMachineDoesNotReset(t *testing.T) {
+	c := &Controller{Max: 4}
+	for i := 0; i < 5*IdleTicksBeforeReset; i++ {
+		c.Step(Reading{CPU: 1.0, RunQueue: RunQueueMax + 1})
+	}
+	if got := c.Budget(); got != Floor {
+		t.Errorf("budget = %d, want the floor: the run queue never recovered", got)
 	}
 }
 

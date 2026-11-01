@@ -152,8 +152,10 @@ func TestDoctorCatchesADaemonOfAnotherBuild(t *testing.T) {
 			if !strings.Contains(got.detail, binaryVersion) {
 				t.Errorf("the finding does not name the daemon's version: %q", got.detail)
 			}
-			if got.fix != "governor install" {
-				t.Errorf("fix = %q, want governor install", got.fix)
+			// Doctor's own path, never the bare name (GOV-46 clause 4): bare `governor` can
+			// be an older copy elsewhere on PATH.
+			if want := selfBinary(t) + " install"; got.fix != want {
+				t.Errorf("fix = %q, want %q", got.fix, want)
 			}
 		})
 	}
