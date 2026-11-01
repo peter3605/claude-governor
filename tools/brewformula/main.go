@@ -116,7 +116,9 @@ func write(w io.Writer, version string, checksums io.Reader) error {
 // The command is spelled with #{opt_bin}, not as a bare `governor`, because after the first
 // install a bare `governor` can resolve to ~/.local/bin/governor, install's link to the
 // HOOKED binary, which shadows brew's. Measured on the v0.1.2 upgrade (GOV-43): the bare
-// command ran 0.1.1, reinstalled it over itself, and upgraded nothing.
+// command ran 0.1.1, reinstalled it over itself, and upgraded nothing. GOV-45 stopped install
+// writing that link over a governor already on PATH, and kept this spelling anyway: a machine
+// upgrading from an older release still has the link until this very command retires it.
 var formula = template.Must(template.New("formula").Parse(`class Governor < Formula
   desc "Machine-wide build and subagent budget for Claude Code sessions"
   homepage "https://github.com/{{.Repo}}"

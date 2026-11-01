@@ -2468,7 +2468,7 @@ Uninstall is only verifiable if this list is exhaustive, so it is normative.
 | `~/.claude/skills/` | install, only if absent | uninstall, only if it empties |
 | `~/.claude/settings.json` (`statusLine` key only) | install, merged | uninstall, previous value restored from backup |
 | `~/.claude/settings.json.governor-backup-<ts>` | install, only when a settings file existed | uninstall, unless `--keep-backup` |
-| `~/.local/bin/governor` | install, **only if `~/.local/bin` already exists** and nothing else is at that name | uninstall, only if it still links to our binary |
+| `~/.local/bin/governor` | install, **only if `~/.local/bin` already exists**, nothing else is at that name, **and no other `governor` is on `PATH`** (GOV-45); a link of ours found while another one is on `PATH` is removed by install | uninstall, only if it still links to our binary |
 | `~/.claude/governor/sock` | daemon | uninstall |
 | `~/.claude/governor/daemon.pid` | daemon | uninstall |
 | `~/.claude/governor/daemon.log` | install, when it starts the daemon | uninstall |
@@ -2502,6 +2502,27 @@ it added" and "removes things it did not":
   which works. Something else already at that name is left strictly alone in both directions —
   far more likely another tool than a stale link of ours, and the cost of guessing wrong is
   deleting a binary somebody depends on.
+- **The link is never written over a `governor` that is already on `PATH`** (GOV-45, the
+  decision rule in `installLink`). The link exists for the `install.sh` route, whose binary runs
+  from a temp directory that is gone a moment later. On the brew route `governor` is already on
+  `PATH`, and a link in `~/.local/bin` (earlier on `PATH` than `/opt/homebrew/bin` on most
+  machines) only shadows it, so that after `brew upgrade` the bare `governor install` runs the
+  OLD hooked copy and upgrades nothing (§13.4, measured on v0.1.2). The rule, in order:
+  1. `~/.local/bin` absent: **skip**, and name the full path instead.
+  2. Another executable `governor` anywhere on `PATH` (an absolute entry, not our link, not
+     the hooked binary by file identity): **skip**. If the name holds exactly our link (a
+     symlink to the hooked binary, the one uninstall would remove), **remove** it: an install
+     from before this rule wrote it, and it is what does the shadowing. Anything else at the
+     name is left alone, as above.
+  3. Otherwise **write** it, or leave it if it is already ours.
+
+  The link is skipped rather than **retargeted** at the brew binary on purpose. Retargeting
+  keeps `~/.local/bin` ahead of brew on `PATH` for no gain, and makes the PATH copy and the
+  hooked copy two different files by design, which doctor's `binary` check would then have to
+  explain on every machine rather than just after an upgrade. Uninstall is unaffected: it
+  removes the name only when it links to the hooked binary, so a link install did not write
+  is never touched, and a machine whose old link install retired comes back exactly as it was
+  before the first install. `TestABrewInstallRetiresTheLinkThatShadowedIt` holds that.
 - **`~/.claude/skills/` and `~/.claude/governor/` are removed only if empty.** `os.Remove`
   refuses a non-empty directory, which is exactly the test: a machine with other skills-dir
   plugins, or with `samples.jsonl` still in it, keeps the directory and loses only our files.
@@ -2893,6 +2914,25 @@ rather than the bare name. The formula's caveat spells the command `#{opt_bin}/g
 install` and says to run it after every upgrade. The link that causes the shadowing is a design
 question for install and uninstall (§13.3), so it was filed as its own story rather than
 patched here.
+
+**GOV-45 removed the shadowing.** install no longer writes `~/.local/bin/governor` when another
+`governor` is on `PATH`, and retires the link of ours that an earlier install left there (the
+rule is in §13.3). On a brew machine bare `governor` therefore resolves to the brew binary, and
+`TestABrewUpgradeIsActuallyInstalled` replays this upgrade end to end: `<brew bin>/governor
+install`, the brew symlink repointed at a different build, then bare `governor install`, which
+ends with the new build hooked and the new build's digest in the daemon's `build`. Run against
+the installer from before the change, it fails at "bare governor resolves to
+~/.local/bin/governor".
+
+**Both GOV-43 mitigations are KEPT, full path and all.** They are not redundant with the fix.
+A machine upgrades from a release that predates GOV-45, and that release's link stays on disk
+until the first brew-route install of a newer one runs and retires it. Until then, bare
+`governor` is still the hooked copy, so a caveat or fix line saying `governor install` would
+send the person to run the old build again, which is the exact failure being fixed. The full
+path is correct on every machine, before or after the link is gone: doctor names itself only
+when it is a different file from the hooked binary, which is precisely when the bare name could
+resolve to the wrong one. The caveat costs one longer line, and a bare-name line that sometimes
+does nothing costs an upgrade.
 
 **Why pid 23289 survived 40 days.** It was started on 2026-09-20 from the pre-rename tree
 `~/.claude/skills/claude-governor/bin/governor`, a 0.0.0-dev build. On 2026-10-31, v0.1.1 arrived

@@ -40,6 +40,11 @@ func stagedHome(t *testing.T) paths {
 	state := filepath.Join(sockDir(t), "gov")
 	t.Setenv(stateDirEnvForTest, state)
 	t.Setenv(endpointEnvForTest, "unix://"+filepath.Join(state, "sock"))
+	// install decides whether to write ~/.local/bin/governor from what else is on PATH
+	// (GOV-45), so a developer machine with brew's governor installed would otherwise run
+	// these tests down a different branch from CI. The brew route is staged explicitly,
+	// by onPath, where a test wants it.
+	t.Setenv("PATH", pathWithoutGovernor(os.Getenv("PATH")))
 
 	p, err := resolvePaths()
 	if err != nil {
@@ -194,11 +199,15 @@ func TestUninstallLeavesTheMachineByteIdentical(t *testing.T) {
 		// linkDir is whether ~/.local/bin exists, which is what decides whether install
 		// puts a symlink on the PATH.
 		linkDir bool
+		// brew is whether another governor is already on PATH, after ~/.local/bin — the
+		// brew route, where install must not write the link (GOV-45).
+		brew bool
 	}{
 		{name: "no settings file at all"},
 		{name: "a settings file the user configured", settings: realisticSettings},
 		{name: "an empty settings file", settings: "{}\n"},
 		{name: "with ~/.local/bin on the machine", settings: realisticSettings, linkDir: true},
+		{name: "the brew route, governor already on PATH", settings: realisticSettings, linkDir: true, brew: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			p := stagedHome(t)
@@ -208,6 +217,9 @@ func TestUninstallLeavesTheMachineByteIdentical(t *testing.T) {
 			}
 			if tc.linkDir {
 				mkdirAll(t, filepath.Dir(p.link))
+			}
+			if tc.brew {
+				onPath(t, p, "")
 			}
 
 			before := snapshot(t, p.home)
@@ -380,10 +392,25 @@ func TestUninstallKeepsChangesMadeSinceInstall(t *testing.T) {
 // the most famous member of the family — a second backup file left behind is the same
 // defect with a quieter symptom.
 func TestInstallTwiceChangesNothingTheSecondTime(t *testing.T) {
+	// Both routes: install.sh's, where the link is written, and brew's, where another
+	// governor is on PATH and it is not (GOV-45).
+	for _, brew := range []bool{false, true} {
+		name := "install.sh route"
+		if brew {
+			name = "brew route"
+		}
+		t.Run(name, func(t *testing.T) { installTwice(t, brew) })
+	}
+}
+
+func installTwice(t *testing.T, brew bool) {
 	p := stagedHome(t)
 	mkdirAll(t, filepath.Dir(p.settings))
 	writeFileT(t, p.settings, realisticSettings)
 	mkdirAll(t, filepath.Dir(p.link))
+	if brew {
+		onPath(t, p, "")
+	}
 
 	installOK(t)
 	afterFirst := snapshot(t, p.home)
