@@ -4,6 +4,9 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"net"
 	"os"
 	"path/filepath"
@@ -1190,5 +1193,104 @@ func TestDoctorIsQuietWhenNothingIsCuttingTheBudget(t *testing.T) {
 	got := want(t, found, "budget", "ok", out)
 	if strings.Contains(got.detail, "cut by") {
 		t.Errorf("the finding claims a cut on a machine at its ceiling: %q", got.detail)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// GOV-46 clause 4: every fix line names a binary that works
+// ---------------------------------------------------------------------------
+
+// TestEveryDoctorFixLineNamesABinaryThatWorks is the audit, kept as a test so it stays done.
+//
+// GOV-43 made the stale-build fix lines full-path and missed the budget check's `kill … &&
+// governor install`; GOV-45 then removed the ~/.local/bin link that had made the bare name
+// resolve to the hooked copy, so on a brew machine every remaining bare `governor install`
+// named whatever else was on PATH — on the machine that found GOV-46, an older release, which
+// the fix would have silently reinstalled. Checking one line at a time is how the last one was
+// missed, so this reads every string literal in doctor.go: any `governor install`, `governor
+// calibrate` or `governor doctor` in one must go through governorCommand instead.
+func TestEveryDoctorFixLineNamesABinaryThatWorks(t *testing.T) {
+	fset := token.NewFileSet()
+	f, err := parser.ParseFile(fset, "doctor.go", nil, 0)
+	if err != nil {
+		t.Fatalf("parse doctor.go: %v", err)
+	}
+	bare := regexp.MustCompile(`(^|[^-:\w/])governor (install|calibrate|doctor|uninstall)\b`)
+	// Not commands a person is told to type: the flag set's own name, and the sentence for a
+	// check that forgot its fix.
+	allowed := map[string]bool{
+		`"governor doctor"`: true,
+		`"no fix recorded for this check — that is a bug in governor doctor"`: true,
+	}
+	ast.Inspect(f, func(n ast.Node) bool {
+		lit, ok := n.(*ast.BasicLit)
+		if !ok || lit.Kind != token.STRING || allowed[lit.Value] {
+			return true
+		}
+		if bare.MatchString(lit.Value) {
+			t.Errorf("%s: %s names bare `governor`, which may resolve to another copy on PATH; "+
+				"spell it with governorCommand", fset.Position(lit.Pos()), lit.Value)
+		}
+		return true
+	})
+}
+
+// governorCommand is what makes those lines work, and its rule is a property rather than a
+// guess about install routes: the bare name only when bare `governor` on PATH IS this binary.
+func TestGovernorCommandRunsThisBinary(t *testing.T) {
+	self := selfBinary(t)
+
+	t.Run("an older governor elsewhere on PATH", func(t *testing.T) {
+		// The GOV-46 machine: GOV-45 retired the ~/.local/bin link, so bare `governor` is an
+		// older brew release. Naming it would downgrade the install.
+		dir := mkdir(t, filepath.Join(t.TempDir(), "brew"))
+		markedGovernor(t, dir, "governor", "0.1.1", protocolVersion, configSchemaVersion, "older brew")
+		t.Setenv("PATH", dir)
+		if got, want := governorCommand("install"), self+" install"; got != want {
+			t.Errorf("governorCommand = %q, want %q", got, want)
+		}
+	})
+	t.Run("no governor on PATH at all", func(t *testing.T) {
+		t.Setenv("PATH", t.TempDir())
+		if got, want := governorCommand("calibrate"), self+" calibrate"; got != want {
+			t.Errorf("governorCommand = %q, want %q", got, want)
+		}
+	})
+	t.Run("bare governor is this binary", func(t *testing.T) {
+		dir := t.TempDir()
+		if err := os.Symlink(self, filepath.Join(dir, "governor")); err != nil {
+			t.Fatalf("symlink: %v", err)
+		}
+		t.Setenv("PATH", dir)
+		if got := governorCommand("install"); got != "governor install" {
+			t.Errorf("governorCommand = %q, want the bare name when it resolves here", got)
+		}
+	})
+}
+
+// GOV-46 clause 1 as doctor sees it: a budget below its ceiling whose cut has recovered is not
+// reported as a cut, and is no longer answered with a restart — the loop reconciles it. The
+// restart line this replaced was also the fix line clause 4 was filed on.
+func TestDoctorDoesNotRestartARecoveringBudget(t *testing.T) {
+	w := newWorld(t)
+	endpoint, _ := startTestDaemonConfigured(t, 4, lease.Options{}, func(d *daemon) {
+		d.loop = &budget.Controller{Max: 6}
+		d.loop.Step(budget.Reading{RunQueue: budget.RunQueueMax * 4})
+		for i := 0; i < budget.NominalTicksBeforeIncrease+1; i++ {
+			d.loop.Step(budget.Reading{RunQueue: 0, InUse: true})
+		}
+		d.sources = []budget.Source{budget.LocalSource{Live: d.liveBudget, InUse: d.table.InUse}}
+	})
+	t.Setenv(transport.EndpointEnv, endpoint)
+	w.writeHooks(w.settings, selfBinary(t), goodHooks())
+	w.writeCalibration()
+
+	_, found, out := doctor(t)
+	got := want(t, found, "budget", "warn", out)
+	if strings.Contains(got.detail, "cut by") {
+		t.Errorf("a recovered signal is reported as a cut: %q", got.detail)
+	}
+	if strings.Contains(got.fix, "kill") || strings.Contains(got.fix, "install") {
+		t.Errorf("a recovering budget is answered with a restart: %q", got.fix)
 	}
 }

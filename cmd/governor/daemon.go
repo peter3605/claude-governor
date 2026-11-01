@@ -1087,6 +1087,9 @@ func (d *daemon) sample(ctx context.Context) {
 			// of its own and every acquire holds it, so nesting the two would put the
 			// sampling goroutine in a lock order no other path uses.
 			demand := d.waits.len() > 0
+			// The lease table likewise, and for the same lock-order reason. Held leases and
+			// waiters together are what tell an idle governor from an unused budget (GOV-46).
+			inUse := d.table.InUse() > 0
 			s, err := d.sampler.Sample(ctx)
 			if err != nil {
 				// A failed reading is not a reason to stop sampling, and not a reason to
@@ -1111,6 +1114,7 @@ func (d *daemon) sample(ctx context.Context) {
 					RunQueue:      s.RunQueue,
 					ThermalSevere: s.Thermal.Severe(),
 					DemandWaiting: demand,
+					InUse:         inUse,
 				})
 			}
 			d.signalsMu.Unlock()

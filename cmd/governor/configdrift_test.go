@@ -186,8 +186,8 @@ func TestDoctorFailsADaemonNotRunningTheConfigOnDisk(t *testing.T) {
 	if !strings.Contains(got.detail, "/elsewhere/config.json") {
 		t.Errorf("the finding does not name the file the daemon read: %q", got.detail)
 	}
-	if got.fix != "governor install" {
-		t.Errorf("fix = %q, want governor install", got.fix)
+	if want := selfBinary(t) + " install"; got.fix != want {
+		t.Errorf("fix = %q, want %q", got.fix, want)
 	}
 }
 

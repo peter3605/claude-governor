@@ -428,3 +428,78 @@ though, and the same doctor check that was missing would have caught it.
   built-in defaults`. It also reports what it loaded in `status`, re-reads the file when the
   file changes, and doctor's new `loaded` check fails when the daemon and the file disagree. That
   check compares the path, the calibration, and the live ceiling and run-queue threshold.
+
+## A budget below its ceiling that nothing was holding there (GOV-46)
+
+Found on 2026-11-01, twice within one hour, on a current daemon. That daemon can name its cut,
+which is the only reason the state was visible. The pre-GOV-34 daemon that served this machine
+for six weeks (previous section) had no `cut` field, so on it the same state looked exactly like
+a healthy one.
+
+### What was observed
+
+These are the readings recorded when the story was filed. Raw log lines were not attached to it,
+so none are quoted here.
+
+| | Event | What the daemon reported afterwards |
+|---|---|---|
+| (a) | GOV-44's config reload raised the ceiling from 3 to 4 | budget 3; doctor warned "3 of a possible 4 slots, and the daemon reports no signal cutting it" |
+| (b) | the repo's own test suite drove run-queue cuts 4 → 2 → 1, then finished | idle machine: in use 0, waiting 0, cpu 0.42, thermal nominal. Budget **1**, ceiling 4. `status` printed `cut run queue (ceiling 4)`, minutes after the run queue had recovered |
+
+### Why the budget stayed down
+
+There were two causes, one for each event, plus one reporting defect.
+
+- **(a) Nothing raised the budget when the ceiling went up.** `Step` lowered the budget when
+  the ceiling dropped below it, but nothing moved it up when the ceiling rose. A daemon
+  restarted under the new config would have begun at 4, through `start()`. The running one
+  stayed at 3.
+- **(b) The only way up was gated on demand, and a low budget suppresses demand.** The additive
+  increase fired only when `DemandWaiting` was true. A budget of 1 admits fewer concurrent
+  builds, so less work queues, so the signal the climb needed never arrives. An idle machine
+  has no waiters at all, so the budget stayed at 1 until the next time something actually
+  parked.
+- **The `cut` field outlived its signal.** It was cleared when the budget reached the ceiling,
+  not when the run queue recovered. So `status` blamed a signal that had already been fine for
+  minutes.
+
+### The six weeks before this, explained
+
+GOV-41 (previous section) established that the `slots=1.00/1` parks and denies from 2026-09-23
+to 10-31 were real run-queue cuts, and stopped there. Mechanism (b) explains why they lasted:
+after a cut, the budget could not climb back until enough demand arrived, and the low budget
+was itself holding demand down. The log's only escapes show the mechanism in reverse. On 09-23
+the limit went 1 → 4 in five seconds, immediately after nine Heavy builds parked at
+`slots=3.75/1`. On 10-29 it went 1 → 3 over 25 minutes, after a Heavy build parked at 09:13.
+The budget rose only when something parked, which is the one condition the climb accepted.
+
+This answers the question GOV-B23 was filed to measure ("what floors the budget at parks, on a
+daemon that can name its cut").
+
+### What changed
+
+- **A raised ceiling is followed straight away.** If the budget was at the old ceiling, it moves
+  to the new one on the same tick, without waiting for demand. A budget that a signal had cut
+  stays where it is.
+- **An idle governor returns to the ceiling.** After `IdleTicksBeforeReset` (60 one-second
+  ticks, one loadavg1 window) with nothing held, nothing waiting and the run queue at or below
+  the climb level, a cut budget goes back to the ceiling. This is the state a fresh daemon is
+  in, and `start()` already handles it by beginning at the ceiling and cutting fast.
+- **The one-slot climb is still demand-gated while leases are held.** In that case a budget
+  below the ceiling is unused, not stranded, and raising it would give the next arrival room the
+  loop never saw the machine cope with.
+- **`cut` now names what holds the budget at this moment.** It is cleared when its signal
+  recovers. It still names the run queue while the loop is holding between the climb and cut
+  levels, because there the run queue really is what keeps the budget where it is.
+- **Doctor's budget fix no longer restarts the daemon.** The restart was the workaround for
+  case (a). The loop now handles that case, so the line says there is nothing to fix.
+- **Every doctor fix line names a binary that works.** That restart line read
+  `kill … && governor install`. Since GOV-45, bare `governor` can resolve to an older brew
+  release, so running the line would have downgraded the install. Every governor command doctor
+  prints now goes through `governorCommand`, which uses the bare name only when it resolves to
+  the running binary. `TestEveryDoctorFixLineNamesABinaryThatWorks` reads every string literal
+  in doctor.go to keep it that way.
+
+Tests: `TestARaisedCeilingIsReachedWithoutDemand` and
+`TestARecoveredCutReturnsToTheCeilingOnAnIdleMachine` replay the two observations. Against the
+controller from before this change, both fail, along with the four tests of the new `cut` rule.

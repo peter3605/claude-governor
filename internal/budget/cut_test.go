@@ -32,20 +32,29 @@ func TestTheControllerNamesWhatCutTheBudget(t *testing.T) {
 		t.Errorf("Cut() = %q, want \"run queue\"", got)
 	}
 
-	// THE CAUSE OUTLIVES THE SIGNAL, DELIBERATELY. The run queue has recovered and the
-	// budget is climbing back one slot per tick, but it is still below the ceiling and the
-	// run queue is still why. Clearing it the moment the signal recovered would leave the
-	// most common state — a machine partway back up — with a cut budget and nothing to
-	// explain it, which is the state the 2026-09-21 report was written from.
+	// IN THE HOLD BAND THE RUN QUEUE STILL HOLDS IT. Above the climb level and at or under
+	// the cut level the loop neither cuts nor climbs, and the run queue really is what keeps
+	// the budget where it is, so the field keeps naming it.
+	hold := (RunQueueMax + (RunQueueMax - RunQueueBand)) / 2
+	c.Step(Reading{RunQueue: hold, DemandWaiting: true})
+	if got := c.Cut(); got != "run queue" {
+		t.Errorf("Cut() = %q in the hold band, want \"run queue\": it is still what holds the budget", got)
+	}
+
+	// THE FIELD NAMES WHAT HOLDS THE BUDGET NOW, NOT WHAT LAST CUT IT (GOV-46 clause 3). The
+	// run queue has recovered; the budget is still below the ceiling, climbing back. Until
+	// GOV-46 this asserted the opposite, and on 2026-11-01 that printed `cut run queue
+	// (ceiling 4)` at cpu 0.42 on an idle machine minutes after the run queue had recovered.
 	c.Step(Reading{RunQueue: 0, DemandWaiting: true})
 	if c.Budget() >= 6 {
 		t.Fatalf("budget = %d, want it still climbing back; this assertion needs headroom", c.Budget())
 	}
-	if got := c.Cut(); got != "run queue" {
-		t.Errorf("Cut() = %q while still below the ceiling, want it to keep naming the run queue", got)
+	if got := c.Cut(); got != "" {
+		t.Errorf("Cut() = %q against a recovered run queue, want \"\": the run queue is not "+
+			"holding the budget any more", got)
 	}
 
-	// Back at the ceiling, there is nothing left to explain.
+	// Back at the ceiling, there is still nothing to explain.
 	for i := 0; i < 10 && c.Budget() < 6; i++ {
 		c.Step(Reading{RunQueue: 0, DemandWaiting: true})
 	}
@@ -54,6 +63,39 @@ func TestTheControllerNamesWhatCutTheBudget(t *testing.T) {
 	}
 	if got := c.Cut(); got != "" {
 		t.Errorf("Cut() = %q at the ceiling, want \"\": nothing is holding it down", got)
+	}
+}
+
+// The same rule with nobody asking: a recovered signal on an in-use machine whose budget nobody
+// wants raised is not a cut either. The budget is unused, not held.
+func TestARecoveredSignalIsNotReportedAsACutWithoutDemand(t *testing.T) {
+	c := &Controller{Max: 6}
+	c.Step(Reading{RunQueue: RunQueueMax * 4})
+	for i := 0; i < NominalTicksBeforeIncrease+1; i++ {
+		c.Step(Reading{RunQueue: 0, InUse: true})
+	}
+	if c.Budget() >= 6 {
+		t.Fatalf("budget = %d, want it still below the ceiling for this assertion", c.Budget())
+	}
+	if got := c.Cut(); got != "" {
+		t.Errorf("Cut() = %q with the run queue recovered, want \"\"", got)
+	}
+}
+
+// Thermal's hysteresis holds the floor on purpose, so thermal is what holds it until the
+// hysteresis ends — and then it is not.
+func TestAThermalCutIsNamedUntilItsHysteresisEnds(t *testing.T) {
+	c := &Controller{Max: 6}
+	c.Step(Reading{ThermalSevere: true})
+	for i := 0; i < NominalTicksBeforeIncrease; i++ {
+		c.Step(Reading{RunQueue: 0, DemandWaiting: true})
+		if got := c.Cut(); got != "thermal" {
+			t.Fatalf("Cut() = %q during the thermal hysteresis (tick %d), want \"thermal\"", got, i)
+		}
+	}
+	c.Step(Reading{RunQueue: 0, DemandWaiting: true})
+	if got := c.Cut(); got != "" {
+		t.Errorf("Cut() = %q after the hysteresis ended, want \"\"", got)
 	}
 }
 

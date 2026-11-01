@@ -395,7 +395,7 @@ func TestAnOlderDaemonIsNotAccusedOfAnUngovernedMachine(t *testing.T) {
 	if strings.Contains(f.detail, "not firing") || strings.Contains(f.fix, "not firing") {
 		t.Errorf("an old daemon was reported as a dead matcher: %q / %q", f.detail, f.fix)
 	}
-	if !strings.Contains(f.fix, "governor install") {
+	if !strings.Contains(f.fix, governorCommand("install")) {
 		t.Errorf("the fix for an old daemon is to upgrade it: %q", f.fix)
 	}
 

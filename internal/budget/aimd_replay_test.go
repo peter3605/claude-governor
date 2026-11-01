@@ -158,9 +158,16 @@ func TestTheLoopReplayedAgainstARealTrace(t *testing.T) {
 		len(budgets), len(seen), reversals, 100*float64(atFloor)/float64(len(budgets)), c.Max)
 }
 
-// The same trace with nothing waiting for a slot. The budget must never climb, because
-// demand_waiting gates the increase — and it must still cut, because a machine that is
-// saturated is saturated whether or not this governor's queue has anyone in it.
+// The same trace with leases held and nothing waiting for a slot. The budget must never climb,
+// because demand_waiting gates the increase on an in-use machine — and it must still cut,
+// because a machine that is saturated is saturated whether or not this governor's queue has
+// anyone in it.
+//
+// InUse is held true since GOV-46: with nothing held AND nothing waiting the governor is idle,
+// and an idle governor returns a recovered budget to the ceiling on purpose
+// (TestARecoveredCutReturnsToTheCeilingOnAnIdleMachine). The trace is host load with no lease
+// record, so "something of ours is running throughout" is the reading that keeps this test
+// about the gate it names.
 func TestTheLoopDoesNotClimbOnARealTraceWithNoDemand(t *testing.T) {
 	trace := loadTrace(t)
 	c := &Controller{Max: MaxSlots(8)}
@@ -169,6 +176,7 @@ func TestTheLoopDoesNotClimbOnARealTraceWithNoDemand(t *testing.T) {
 	climbs := 0
 	for _, r := range trace {
 		r.DemandWaiting = false
+		r.InUse = true
 		b := c.Step(r)
 		if b > prev {
 			climbs++
