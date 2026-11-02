@@ -1181,7 +1181,10 @@ is genuinely stable (1.06x across halves, a 9%-wide interval) and sits 28% below
 which cannot be collected by correcting a constant, because `B` is global and one `go test` burst
 at ~4 cores a build would saturate a machine sized for pytest. Collecting it needs a lease that
 costs what its shape costs, which is a change to this section's arithmetic rather than to its
-numbers, and is filed as its own story rather than assumed here.
+numbers. **That was GOV-B15, and it was dropped on 2026-11-02**, not because the admission rule
+resisted it — leases already carry fractional weights and fair share already sums them — but
+because nothing the shipped product records can re-measure a shape's p90 on another host.
+docs/bash-corpus.md §10 carries the reasoning.
 
 **18.4% of calls taking a lease is a reduction, not cheapness.** It turns a 220× problem into
 roughly an 11× one. §4.4's performance budget was priced for a gate firing a few dozen times a
