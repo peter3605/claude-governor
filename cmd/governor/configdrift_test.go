@@ -210,10 +210,20 @@ func TestDoctorPassesADaemonRunningTheConfigOnDisk(t *testing.T) {
 // deliberately, so the probe measures the machine as the governor finds it. The daemon read
 // its config before that calibration existed. Before GOV-44 every first install therefore
 // left a daemon on built-in defaults — and the install-time doctor passed it.
+//
+// It is also the package's one install that runs the load probe (GOV-B24): every other real
+// install passes --no-probe, so this is what keeps install's probing path exercised.
 func TestInstallLeavesTheDaemonOnTheConfigItWrote(t *testing.T) {
 	p := stagedHome(t)
-	if code, out, errOut := runReal(t, p, "install"); code != 0 {
+	code, out, errOut := runRealWithProbe(t, p, "install")
+	if code != 0 {
 		t.Fatalf("install: exit %d\n%s\n%s", code, out, errOut)
+	}
+	// Not "measuring what": the probe may decline on a one-core or already-loaded runner, and
+	// that is the probe deciding, not the install skipping it. What must not appear is the
+	// line --no-probe prints.
+	if strings.Contains(out, "not measured (--no-probe)") {
+		t.Fatalf("the probing install skipped the probe:\n%s", out)
 	}
 	t.Cleanup(func() { runReal(t, p, "uninstall", "--purge") })
 
@@ -223,8 +233,28 @@ func TestInstallLeavesTheDaemonOnTheConfigItWrote(t *testing.T) {
 		t.Fatalf("install wrote no calibration to %s: %+v, %v", path, disk, err)
 	}
 	got := daemonLoadedConfig(t, "unix://"+filepath.Join(p.state, "sock"))
-	if got == nil || !got.Found || got.CalibratedAt != disk.CalibratedAt || got.RunQueueMax != disk.RunQueueMax {
+	// b_max as well: a probe the repetitions did not agree on keeps zero (GOV-47), and the
+	// daemon must then be serving that zero too rather than something it made up.
+	if got == nil || !got.Found || got.CalibratedAt != disk.CalibratedAt ||
+		got.RunQueueMax != disk.RunQueueMax || got.BMax != disk.BMax {
 		t.Fatalf("after install the daemon is running %+v, but install wrote %+v", got, disk)
+	}
+}
+
+// TestInstallNoProbeSkipsTheLoadProbe: --no-probe still calibrates — the ambient read and the
+// cut are written — but does not put the machine under load (GOV-B24).
+func TestInstallNoProbeSkipsTheLoadProbe(t *testing.T) {
+	p := stagedHome(t)
+	out := installOK(t)
+	if strings.Contains(out, "measuring what") {
+		t.Errorf("install --no-probe ran the load probe:\n%s", out)
+	}
+	if !strings.Contains(out, "not measured (--no-probe)") {
+		t.Errorf("install --no-probe did not say the probe was skipped:\n%s", out)
+	}
+	disk, err := (&config.FileStore{Path: filepath.Join(p.state, config.File)}).Load(context.Background())
+	if err != nil || disk.CalibratedAt == "" || disk.RunQueueMax == 0 {
+		t.Errorf("install --no-probe did not write the rest of the calibration: %+v, %v", disk, err)
 	}
 }
 
