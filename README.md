@@ -192,7 +192,9 @@ That installs a `SubagentStart`/`SubagentStop` hook that records each subagent, 
 `SessionStart` hook that lazily starts a 1 Hz sampler. Both append newline-delimited JSON to
 `~/.claude/governor/samples.jsonl`. Nothing gates, blocks or denies anything, the hooks exit 0
 whatever happens, and the sampler stops on its own once no session has been running for five
-minutes.
+minutes. The log is shared with the gate, which records every gated build there,
+and it rotates at 16 MiB keeping one older file. The sampler writes about 16 MB a day, so a
+Phase 0 run longer than a day or two should copy the file out as it goes.
 
 Each sample carries host CPU, load average, free memory and thermal state, plus the CPU of
 the `claude` process tree split two ways — the session processes alone, and those plus every

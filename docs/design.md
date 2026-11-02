@@ -1814,7 +1814,8 @@ claude-governor/                  the repo
 
 state  → ~/.claude/governor/      sock, daemon.pid, daemon.log, daemon.start, statusline.json,
                                   statusline.json.*, onboarded, surface.json, surface.json.tmp,
-                                  config.json, samples.jsonl, sampler.lock, sampler.log
+                                  config.json, samples.jsonl, samples.jsonl.1,
+                                  samples.pre-bound-<ts>.jsonl, sampler.lock, sampler.log
 config → the state directory's config.json, always (GOV-44; §13.3a)
 ```
 
@@ -1884,6 +1885,32 @@ It is `trace agent` (the `SubagentStart`/`SubagentStop` hook body), `trace sampl
 sampler), `trace ensure` (the `SessionStart` hook that lazily starts the sampler), and its own
 `trace install`/`trace uninstall` pair. It gates nothing and decides nothing; it only records
 to `samples.jsonl`.
+
+**`samples.jsonl` is not only Phase 0's (GOV-B26).** Since GOV-17 the gate appends a `build`
+record for every gated command, so every install writes to it whether or not `trace` was ever
+installed, and `doctor --report` reads it back. It is **bounded**: when the live file reaches
+16 MiB (`trace.MaxBytes`) it is renamed to `samples.jsonl.1`, replacing the previous one, so
+the log never takes more than about 32 MiB. The number was chosen against both writers. Build
+records arrive at about 50 KB a day on a heavily used machine, so each file holds about a year
+of them. The Phase 0 sampler writes about 16 MB a day, so each file holds about a day of it;
+anyone re-running Phase 0 for longer should copy the file out as it goes. Before the bound one
+machine reached 699 MB in six weeks. Three details are decisions:
+
+- **The check costs one `fstat` on a descriptor already open, after the write.** On the gate
+  that is after the decision is on stdout, so buildlog.go's ordering argument stands, and
+  `BenchmarkAppendBuild` measured no difference outside noise (27–34 µs per record either way,
+  darwin/arm64, 2026-11-02). The rename runs under a non-blocking `flock` and only while the
+  path still names the full file, so two appenders racing at the line cannot rotate twice and
+  discard a generation.
+- **A file over twice the bound is never rotated away.** No bounded binary can write one, so
+  it predates the bound, and it is renamed aside as `samples.pre-bound-<ts>.jsonl` and left
+  alone. Rotating it to `.1` would have the next rotation delete it, and bounding what is
+  written from now on must not quietly decide to delete what was written before.
+- **The sampler's long-lived writer follows the path, not its descriptor.** After every
+  record it checks the path still names its file and reopens if not. Without that, a person
+  compressing the log by hand leaves the sampler appending to a nameless inode that nothing
+  can read or delete until the process exits, and on 2026-11-02 one was found holding 724 MB
+  that way.
 
 It is a separate command family rather than a temporary meaning for `gate`, `confirm` and
 `release` on purpose: giving those a second definition now would leave the stories that
@@ -2400,7 +2427,8 @@ being asked of them is to run a hook on every `Bash` call and every subagent spa
 maintainer needs to diagnose a refusal without a follow-up question: version and install route,
 OS, architecture and core count, thermal source, the Claude Code versions of live sessions, the
 budget, doctor's findings exactly as the plain command prints them, the last 30 daemon log lines
-and the last 20 gated builds from `samples.jsonl` with their outcome, class, shapes and reason.
+and the last 20 gated builds from `samples.jsonl` with their outcome, class, shapes and reason —
+reading `samples.jsonl.1` too when the live file holds fewer, because the log rotates.
 It exits with doctor's own code. The block is safe to post in public, and two layers keep it
 that way (`cmd/governor/report.go`). The first is structure: a build record contributes only
 named fields, never its `cwd` or any field added later. The second is a scrubber that every line
@@ -2507,7 +2535,16 @@ Neither finding writes anything. `~/.claude/sessions/` is read-only to the gover
 no row to §13.3.
 
 GOV-B11 added `strays`, which is the only finding that reports on the **machine** rather than
-on this installation, and the only one that is a `warn`.
+on this installation, and the first that could be a `warn`.
+
+GOV-B26 added `tracelog`. It names every file of the trace log with its size on every run,
+and **warns** when one is over twice the bound (32 MiB). No bounded binary can write such a
+file, so a bounded log never trips the warning, and a log from before the bound always does.
+The fix names the file and says it is the user's to keep, compress or delete, and that
+`--purge` removes it. It is a check rather than only a sentence in the guide because the guide
+is read once and doctor is read whenever someone asks if the machine is healthy. The old log
+was the largest thing the governor put on a machine, and it was found only by listing the
+state directory after an uninstall. It writes nothing and adds no row to §13.3.
 
 - **`strays` names every long-lived governor daemon that is not this one**, with its pid,
   path, age and the socket it holds. It exists because four governor-shaped processes — two
@@ -2601,6 +2638,9 @@ Uninstall is only verifiable if this list is exhaustive, so it is normative.
 | `~/.claude/governor/surface.json` | daemon, when it first sees a spawn tool name it has not recorded for that Claude Code version (GOV-30) | uninstall |
 | `~/.claude/governor/surface.json.tmp` | daemon, staging the file above before the rename | uninstall |
 | `~/.claude/governor/config.json` | `calibrate` (and `install`, which runs it), always — whatever `${CLAUDE_PLUGIN_DATA}` says (GOV-44, §13.3a) | uninstall |
+| `~/.claude/governor/samples.jsonl` | the gate, one `build` record per gated command (§8); `trace agent` and `trace sample` too while Phase 0 is installed | uninstall `--purge` only — plain uninstall keeps it and names it with its size, see below |
+| `~/.claude/governor/samples.jsonl.1` | rotation of the file above at 16 MiB (GOV-B26) | uninstall `--purge` only |
+| `~/.claude/governor/samples.pre-bound-<ts>.jsonl` | rotation, setting aside a log written before the bound existed (GOV-B26) | uninstall `--purge` only |
 | `~/.claude/governor/` | daemon (`transport.Listen`) | uninstall, only once it is empty; `--purge` regardless |
 | `~/.claude/plugins/data/build-governor-skills-dir/` (`${CLAUDE_PLUGIN_DATA}`: the onboarding marker) | Claude Code creates it; the governor writes `onboarded`. Builds before GOV-44 could resolve `config.json` here, though no writer of it ran in a plugin context | uninstall `--purge` only |
 | `~/.claude/plugins/data/build-governor-claude-governor/` (`${CLAUDE_PLUGIN_DATA}` when the plugin loaded through the marketplace entry) | Claude Code creates it; the governor writes `onboarded` | uninstall `--purge` only |
@@ -2668,8 +2708,14 @@ it added" and "removes things it did not":
   machine that accrued residue under the old binary still has to come clean under the new one.
   A new random-suffixed path therefore goes in `stateGlobs` and in this table, not in
   `stateFiles`.
-- **`samples.jsonl` survives a plain uninstall**, per the Phase 0 table below. It is the
-  measurement the setpoint is derived from and it is not reconstructable.
+- **The trace log survives a plain uninstall, and uninstall says so by name and size.** GOV-B26
+  re-decided this once Phase 0 closed (2026-09-12) and kept it. The old reason was that the
+  file was the Phase 0 measurement. The reason now is that it is the user's only record of
+  what the gate decided for every gated build, and on a machine that ran Phase 0 it is still
+  the measurement the setpoint came from. Neither can be rebuilt. Keeping it used to be an
+  unbounded cost and now costs at most about 32 MiB. Deleting a user's history belongs to
+  `--purge`, the command that says it deletes. Plain uninstall prints `Trace log kept:` with
+  each file and its size, and the state directory stays until the user removes the log.
 - **GOV-43's build check adds no row.** The daemon digests its own executable in memory and
   reports it in `status`. `doctor` digests the hooked binary and records nothing. The status
   line keeps its own digest in a field of `statusline.json`, a file already in the table.
@@ -2774,7 +2820,7 @@ listed is a path uninstall silently stops covering. All of them go when Phase 1 
 |---|---|---|
 | `~/.claude/settings.json` (five `trace` hooks) | `trace install`, merged after backup | `trace uninstall`, surgically |
 | `~/.claude/settings.json.governor-trace-backup-<ts>` | `trace install` | `trace uninstall` |
-| `~/.claude/governor/samples.jsonl` | `trace agent`, `trace sample`, and the gate's build records (section 8) | by hand — it is the measurement, and deleting it on uninstall would throw away the phase |
+| `~/.claude/governor/samples.jsonl` (and its rotated `.1`) | `trace agent`, `trace sample` — and the gate, so it is in the main table above too | `uninstall --purge`, or by hand; `trace uninstall` leaves it (GOV-B26) |
 | `~/.claude/governor/sampler.lock` | `trace sample` | by hand |
 | `~/.claude/governor/sampler.log` | `trace sample` | by hand |
 | `bin/governor` in the repo, staged by hand in Phase 0 | by hand | by hand — GOV-21's `governor install` supersedes it, and installs into the plugin instead |

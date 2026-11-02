@@ -125,7 +125,9 @@ esac
 # enough that nothing FAILED: the checks that MUST be ok are named, and the set that may be
 # unverified is named EXACTLY. A count would let a new unknown in unnoticed, which is the
 # same hole GOV-30 closed.
-for check in daemon socket hooks matcher protocol binary config budget leases strays; do
+# tracelog (GOV-B26) is ok on any machine whose log a bounded binary wrote, which a fresh
+# install's always is; its warn means a pre-bound log, and a container has none.
+for check in daemon socket hooks matcher protocol binary config budget leases tracelog strays; do
 	grep -Eq "^ok +${check}( |$)" /tmp/doctor.out \
 		|| fail "doctor did not report 'ok $check' on a fresh install."
 done
