@@ -1,0 +1,47 @@
+name: pages
+
+# Publishes site/ — the landing page — to GitHub Pages (GOV-42).
+#
+# Only on a push to main that touches the page, so a change reaches the live site the moment it
+# merges and nobody copies a file by hand. The figures on the page are held to their sources by
+# cmd/governor/site_test.go, which ci.yml runs on the same push; this workflow does not re-run
+# it, because a page change only reaches main through a PR whose ci was green.
+#
+# The site is uploaded as an artifact rather than built from a branch, so Jekyll never runs on
+# it. site/.nojekyll is there anyway, for the day someone switches the source to a branch.
+#
+# ONE-TIME SETUP, BY A HUMAN: Settings -> Pages -> Source: "GitHub Actions". Until then the
+# deploy job fails with a 404 from the Pages API, which is the signal that the setting is off.
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'site/**'
+      - '.github/workflows/pages.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# One deploy at a time, and a newer push wins: a half-published older page is never wanted.
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    name: publish site/
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+      - id: deployment
+        uses: actions/deploy-pages@v4

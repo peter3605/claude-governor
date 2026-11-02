@@ -1,0 +1,917 @@
+<!DOCTYPE html>
+<html lang="en" class="no-js">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Build Governor</title>
+<meta name="description" content="A jobserver for Claude Code: one budget for builds and subagents across every session on the machine, from live run-queue depth and thermal state.">
+<link rel="canonical" href="https://peter3605.github.io/claude-governor/">
+<meta property="og:type" content="website">
+<meta property="og:site_name" content="Build Governor">
+<meta property="og:title" content="Build Governor: one budget behind every Claude Code session">
+<meta property="og:description" content="Six sessions, one laptop, everything crawls. A small daemon holds one machine-wide budget, and every session asks it before an expensive build.">
+<meta property="og:url" content="https://peter3605.github.io/claude-governor/">
+<meta property="og:image" content="https://peter3605.github.io/claude-governor/og.png">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:image:alt" content="Build Governor: six sessions, one laptop, everything crawls.">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="Build Governor: one budget behind every Claude Code session">
+<meta name="twitter:description" content="Six sessions, one laptop, everything crawls. A small daemon holds one machine-wide budget, and every session asks it before an expensive build.">
+<meta name="twitter:image" content="https://peter3605.github.io/claude-governor/og.png">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect width='16' height='16' fill='%230a0910'/%3E%3Crect x='3' y='3' width='10' height='10' fill='%23ffaa1d'/%3E%3C/svg%3E">
+<!--
+  THIS PAGE IS HELD TO THE PROJECT BY A TEST (GOV-42): cmd/governor/site_test.go.
+
+  Every measured figure on it is wrapped in data-fig="<key>", and the test recomputes each one
+  from its source of truth: internal/budget, internal/classify, the gate's own refusal and
+  status-line renderers, docs/control-proof.md, docs/bash-corpus.md, docs/design.md and
+  CHANGELOG.md. Any other digit in the visible text fails the test unless it is marked
+  data-nofig (an axis tick, a section ordinal) and so declared not to be a measurement.
+
+  It loads nothing from anywhere else. The fonts are files beside it, there is no analytics of
+  any kind, and the test fails on any src, stylesheet or url() that leaves this directory. The
+  page says "no telemetry"; a tracker here would make that the first lie a stranger reads.
+-->
+<style>
+@font-face { font-family: "DotGothic16"; font-style: normal; font-weight: 400; font-display: swap; src: url(fonts/dotgothic16-400.woff2) format("woff2"); }
+@font-face { font-family: "IBM Plex Mono"; font-style: normal; font-weight: 400; font-display: swap; src: url(fonts/ibmplexmono-400.woff2) format("woff2"); }
+@font-face { font-family: "IBM Plex Mono"; font-style: normal; font-weight: 500; font-display: swap; src: url(fonts/ibmplexmono-500.woff2) format("woff2"); }
+@font-face { font-family: "IBM Plex Mono"; font-style: normal; font-weight: 600; font-display: swap; src: url(fonts/ibmplexmono-600.woff2) format("woff2"); }
+@font-face { font-family: "IBM Plex Mono"; font-style: normal; font-weight: 700; font-display: swap; src: url(fonts/ibmplexmono-700.woff2) format("woff2"); }
+@font-face { font-family: "VT323"; font-style: normal; font-weight: 400; font-display: swap; src: url(fonts/vt323-400.woff2) format("woff2"); }
+
+/* One visual world: an amber-phosphor operations console, mis-registered.
+   Layout: a fixed tractor-feed rail on the left; content slammed alternately
+   against the left and right margins with deliberate voids between. */
+:root {
+  color-scheme: dark;
+  --void:    #0a0910;
+  --void-2:  #110f18;
+  --panel:   #171423;
+  --panel-2: #1e1a2c;
+  --rule:    #2d2740;
+  --rule-2:  #413858;
+  --amber:   #ffaa1d;
+  --amber-d: #b9741a;
+  --cyan:    #23d6da;
+  --magenta: #ff3d9a;
+  --bone:    #ece7de;
+  --dim:     #8b82a0;
+  --dimmer:  #5d5572;
+
+  --display: "DotGothic16", "Courier New", monospace;
+  --crt:     "VT323", "Courier New", monospace;
+  --mono:    "IBM Plex Mono", ui-monospace, Menlo, Consolas, monospace;
+}
+
+* { box-sizing: border-box; }
+html, body { max-width: 100%; overflow-x: hidden; }
+body {
+  margin: 0;
+  background: var(--void);
+  color: var(--bone);
+  font-family: var(--mono);
+  font-size: 14px;
+  line-height: 1.7;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* ---------- CRT overlays ---------- */
+.scan {
+  position: fixed; inset: 0; z-index: 90; pointer-events: none;
+  background: repeating-linear-gradient(
+    to bottom,
+    rgba(255,255,255,.028) 0px,
+    rgba(255,255,255,.028) 1px,
+    transparent 1px,
+    transparent 3px);
+  mix-blend-mode: overlay;
+}
+.vig {
+  position: fixed; inset: 0; z-index: 89; pointer-events: none;
+  background: radial-gradient(ellipse 130% 100% at 50% 45%, transparent 55%, rgba(0,0,0,.55) 100%);
+}
+
+/* ---------- tractor-feed rail ---------- */
+.rail {
+  position: fixed; left: 0; top: 0; bottom: 0; width: 34px; z-index: 40;
+  background: var(--void-2); border-right: 1px solid var(--rule);
+  background-image: radial-gradient(circle at 17px 14px, var(--void) 4.5px, transparent 5px);
+  background-size: 34px 34px;
+  pointer-events: none;
+}
+@media (max-width: 760px) { .rail { display: none; } }
+
+.page { padding-left: 34px; }
+@media (max-width: 760px) { .page { padding-left: 0; } }
+.bay { padding-left: 48px; padding-right: 48px; max-width: 1320px; }
+@media (max-width: 760px) { .bay { padding-left: 18px; padding-right: 18px; } }
+
+/* ---------- type ---------- */
+h1, h2 { font-family: var(--display); font-weight: 400; margin: 0; }
+h1 {
+  font-size: clamp(2.6rem, 8.2vw, 7.2rem);
+  line-height: .92; letter-spacing: -.02em;
+  text-transform: uppercase; text-wrap: balance;
+}
+h2 {
+  font-size: clamp(1.7rem, 4.4vw, 3.4rem);
+  line-height: 1.0; letter-spacing: -.01em;
+  text-transform: uppercase; margin-bottom: 26px; text-wrap: balance;
+}
+h3 {
+  font-family: var(--mono); font-size: .8rem; font-weight: 700;
+  letter-spacing: .22em; text-transform: uppercase;
+  color: var(--amber); margin: 40px 0 12px;
+}
+p { margin: 0 0 20px; color: var(--dim); max-width: 60ch; }
+p strong, li strong { color: var(--bone); font-weight: 600; }
+.lead { color: var(--bone); font-size: 1.02rem; }
+a { color: var(--cyan); text-underline-offset: 3px; }
+code, .n { font-variant-numeric: tabular-nums; }
+code { color: var(--amber); font-size: .92em; }
+:focus-visible { outline: 2px solid var(--cyan); outline-offset: 3px; }
+
+.tag {
+  font-size: .68rem; font-weight: 700; letter-spacing: .3em;
+  text-transform: uppercase; color: var(--dimmer);
+  display: block; margin-bottom: 20px;
+}
+.tag b { color: var(--magenta); font-weight: 700; }
+
+/* ---------- giant cropped numerals ---------- */
+.ord {
+  position: absolute; font-family: var(--display);
+  font-size: clamp(7rem, 20vw, 17rem); line-height: .7;
+  color: var(--rule); user-select: none; pointer-events: none;
+  z-index: 0;
+}
+
+/* ---------- hero ---------- */
+.hero { position: relative; padding-top: 70px; padding-bottom: 0; }
+.hero-grid {
+  display: grid; grid-template-columns: minmax(0, 7fr) minmax(0, 5fr);
+  gap: 0; align-items: start;
+}
+@media (max-width: 900px) { .hero-grid { grid-template-columns: 1fr; } }
+.hero h1 span { display: block; }
+.hero h1 .c1 { color: var(--bone); }
+.hero h1 .c2 { color: var(--amber); margin-left: .9em; }
+.hero h1 .c3 { color: var(--magenta); margin-left: -.03em; }
+.hero-sub {
+  margin-top: 34px; max-width: 46ch; font-size: .96rem;
+  color: var(--dim); border-left: 2px solid var(--magenta); padding-left: 18px;
+}
+.hero-def {
+  margin-top: 22px; max-width: 46ch; font-size: .96rem; color: var(--bone);
+}
+.hero-def b { color: var(--amber); }
+
+/* right column readout, deliberately crowded against the edge */
+.readout {
+  border: 1px solid var(--rule); background: var(--panel);
+  padding: 16px 18px; font-size: .74rem; color: var(--dim);
+  margin-top: 14px; margin-left: 12%;
+}
+@media (max-width: 900px) { .readout { margin-left: 0 !important; } }
+.readout div { display: flex; justify-content: space-between; gap: 14px; padding: 3px 0; }
+.readout div span:last-child { color: var(--bone); }
+.readout .ok { color: var(--cyan) !important; }
+.readout .bad { color: var(--magenta) !important; }
+.readout h4 {
+  margin: 0 0 12px; font-size: .68rem; letter-spacing: .24em;
+  text-transform: uppercase; color: var(--amber); font-weight: 700;
+  border-bottom: 1px solid var(--rule); padding-bottom: 10px;
+}
+
+/* ---------- install command ---------- */
+.cmd {
+  display: flex; border: 1px solid var(--amber); background: #1a1308;
+  max-width: 640px; margin-top: 30px;
+}
+.cmd code {
+  flex: 1; min-width: 0; padding: 12px 14px; font-size: .78rem;
+  color: var(--amber); white-space: pre-wrap; overflow-wrap: anywhere; line-height: 1.6;
+}
+.cmd code .pr { color: var(--amber-d); }
+.cmd button {
+  flex: none; align-self: stretch; border: 0; border-left: 1px solid var(--amber);
+  background: var(--amber); color: #140e02;
+  font-family: var(--mono); font-size: .72rem; font-weight: 700;
+  letter-spacing: .14em; text-transform: uppercase; padding: 0 18px; cursor: pointer;
+}
+.cmd button:hover { background: var(--bone); }
+/* Copying needs script. Without it the command is still there to select by hand. */
+.no-js .cmd button { display: none; }
+.cmd-note { font-size: .74rem; color: var(--dimmer); margin: 10px 0 0; max-width: 640px; }
+
+/* ---------- FIG.01, the strip chart ----------
+   Static SVG, so the figure is there with script off. The draw-in is a CSS clip. */
+.chart-bay { position: relative; margin-top: 56px; border-top: 1px solid var(--rule); }
+.chart-head {
+  display: flex; justify-content: space-between; align-items: baseline;
+  flex-wrap: wrap; gap: 12px; padding: 14px 0 12px;
+  font-size: .68rem; letter-spacing: .22em; text-transform: uppercase; color: var(--dimmer);
+}
+.chart-head b { color: var(--amber); font-weight: 700; }
+.scope {
+  position: relative; width: 100%; height: 340px;
+  background: #080b0a; border: 1px solid var(--rule); overflow: hidden;
+}
+@media (max-width: 620px) { .scope { height: 240px; } }
+.plot { position: absolute; left: 44px; right: 16px; top: 18px; bottom: 26px; }
+.plot svg { position: absolute; inset: 0; width: 100%; height: 100%; display: block; overflow: visible; }
+.plot .grid line { stroke: rgba(255,170,29,.10); stroke-width: 1; }
+.plot .grid line.v { stroke: rgba(255,170,29,.05); }
+.plot .busy { stroke: rgba(255,170,29,.5); stroke-width: 1; stroke-dasharray: 4 4; }
+.plot .tr polyline { fill: none; stroke-width: 1.6; stroke-linejoin: round; }
+.plot .tr.u polyline { stroke: var(--magenta); }
+.plot .tr.g polyline { stroke: var(--cyan); }
+.plot .tr.u { filter: drop-shadow(0 0 4px rgba(255,61,154,.8)); }
+.plot .tr.g { filter: drop-shadow(0 0 4px rgba(35,214,218,.8)); }
+.plot .traces { animation: sweep 1.9s linear both; }
+@keyframes sweep { from { clip-path: inset(0 82% 0 0); } to { clip-path: inset(0 0 0 0); } }
+@media (prefers-reduced-motion: reduce) { .plot .traces { animation: none; } }
+.ytick { position: absolute; left: -30px; font-size: 10px; color: rgba(255,170,29,.45); transform: translateY(-50%); }
+.busy-lab { position: absolute; left: 6px; font-size: 10px; color: rgba(255,170,29,.75); transform: translateY(-140%); }
+.scope-key {
+  position: absolute; top: 14px; right: 16px; font-size: .68rem;
+  letter-spacing: .1em; text-align: right; line-height: 1.9;
+}
+.scope-key .u { color: var(--magenta); }
+.scope-key .g { color: var(--cyan); }
+.cap { font-size: .72rem; color: var(--dimmer); margin: 14px 0 0; max-width: 78ch; line-height: 1.65; }
+
+/* ---------- generic section ---------- */
+section { position: relative; padding: 110px 0; border-top: 1px solid var(--rule); }
+.void-r { display: grid; grid-template-columns: minmax(0,4fr) minmax(0,6fr); gap: 0; }
+.void-l { display: grid; grid-template-columns: minmax(0,6fr) minmax(0,4fr); gap: 0; }
+@media (max-width: 900px) { .void-r, .void-l { grid-template-columns: 1fr; } }
+.push { padding-left: 8%; }
+@media (max-width: 900px) { .push { padding-left: 0; } }
+
+/* ---------- dither band (decoration; a plain gradient stands in without script) ---------- */
+.dither {
+  position: relative; height: 150px; border-top: 1px solid var(--rule); border-bottom: 1px solid var(--rule); overflow: hidden;
+  background: linear-gradient(to right, rgba(255,61,154,.35), rgba(35,214,218,.08) 60%, transparent);
+}
+.dither.b2 { background: linear-gradient(to right, rgba(255,170,29,.35), rgba(35,214,218,.08) 60%, transparent); }
+.dither canvas { display: block; width: 100%; height: 100%; }
+.dither-label {
+  position: absolute; left: 48px; bottom: 14px; font-size: .68rem;
+  letter-spacing: .24em; text-transform: uppercase; color: var(--void);
+  background: var(--amber); padding: 3px 10px; font-weight: 700;
+}
+@media (max-width: 760px) { .dither-label { left: 18px; } }
+
+/* ---------- register dump tiles ---------- */
+.regs { display: grid; grid-template-columns: repeat(auto-fit, minmax(176px,1fr)); gap: 1px; background: var(--rule); border: 1px solid var(--rule); margin-top: 40px; }
+.reg { background: var(--panel); padding: 18px 20px; }
+.reg .k { font-size: .62rem; letter-spacing: .2em; text-transform: uppercase; color: var(--dimmer); }
+.reg .v { font-family: var(--crt); font-size: 2.9rem; line-height: 1; margin-top: 10px; color: var(--cyan); }
+.reg .v.warn { color: var(--amber); }
+.reg .was { font-size: .68rem; color: var(--magenta); margin-top: 6px; letter-spacing: .04em; }
+.reg .d { font-size: .7rem; color: var(--dimmer); margin-top: 10px; line-height: 1.5; }
+
+/* ---------- bar readout ---------- */
+.bars { margin-top: 44px; border: 1px solid var(--rule); background: var(--panel); padding: 24px 26px 18px; }
+@media (max-width: 620px) { .bars { padding: 18px 16px 14px; } }
+.brow { margin-bottom: 24px; }
+.brow:last-of-type { margin-bottom: 10px; }
+.blab { display: flex; justify-content: space-between; gap: 12px; flex-wrap: wrap; font-size: .7rem; letter-spacing: .14em; margin-bottom: 7px; }
+.blab .nm { font-weight: 700; text-transform: uppercase; }
+.blab .st { color: var(--dimmer); letter-spacing: .06em; }
+.btrack { position: relative; height: 26px; background: var(--void-2); }
+.bfill { position: absolute; top: 0; bottom: 0; left: 0; }
+.bfill.ghost { opacity: .3; }
+.bnotch { position: absolute; top: -4px; bottom: -4px; width: 2px; background: var(--bone); }
+.baxis { position: relative; height: 44px; border-top: 1px solid var(--rule); margin-top: 4px; }
+.baxis .m { position: absolute; top: 7px; font-size: .64rem; color: var(--dimmer); transform: translateX(-50%); }
+.baxis .busy { position: absolute; top: 24px; font-size: .62rem; color: var(--amber); transform: translateX(-50%); white-space: nowrap; letter-spacing: .1em; }
+.baxis .busy::before { content: ""; position: absolute; left: 50%; top: -24px; height: 20px; border-left: 1px dashed var(--amber-d); }
+
+/* ---------- terminal panel ---------- */
+.term {
+  border: 1px solid var(--rule); background: #080b0a;
+  padding: 20px 22px; overflow-x: auto;
+  font-size: .78rem; line-height: 1.75; color: #9fb3a8;
+  box-shadow: inset 0 0 70px rgba(35,214,218,.05);
+}
+@media (max-width: 620px) { .term { padding: 14px 12px; font-size: .68rem; } }
+.term pre { margin: 0; font-family: var(--mono); }
+.term pre.wrap { white-space: pre-wrap; max-width: 64ch; }
+.term .d { color: #4e6459; }
+.term .g { color: var(--cyan); }
+.term .a { color: var(--amber); }
+.term .m { color: var(--magenta); }
+.term .w { color: var(--bone); }
+
+/* ---------- FIG.04, the memory map ----------
+   One cell is a quarter slot. The lit run is a width, --slots x 4 cells of 15px, so the
+   figure is drawn by CSS from the same number printed beside it. */
+.memmap { margin-top: 36px; border: 1px solid var(--rule); background: var(--panel); padding: 24px 26px; }
+@media (max-width: 620px) { .memmap { padding: 16px 14px; } }
+.mm-row { display: grid; grid-template-columns: 112px 1fr 92px; gap: 16px; align-items: center; margin-bottom: 14px; }
+@media (max-width: 620px) { .mm-row { grid-template-columns: 90px 1fr 70px; gap: 10px; } }
+.mm-name { font-size: .7rem; letter-spacing: .1em; text-transform: uppercase; color: var(--dim); }
+.mm-name.hi { color: var(--bone); font-weight: 700; }
+.mm-cells {
+  position: relative; height: 22px; width: 238px; max-width: 100%; overflow: hidden;
+  background: repeating-linear-gradient(to right, var(--rule) 0 13px, transparent 13px 15px);
+}
+.mm-cells::after {
+  content: ""; position: absolute; left: 0; top: 0; bottom: 0;
+  width: max(2px, calc(var(--slots) * 60px - 2px));
+  background: repeating-linear-gradient(to right, var(--c, var(--cyan)) 0 13px, transparent 13px 15px);
+}
+.mm-cells.unit { --c: var(--amber); }
+.mm-cells.big { --c: var(--magenta); }
+.mm-val { font-family: var(--crt); font-size: 1.5rem; color: var(--bone); text-align: right; line-height: 1; }
+.mm-scale { font-size: .64rem; color: var(--dimmer); letter-spacing: .14em; border-top: 1px solid var(--rule); padding-top: 12px; margin-top: 18px; }
+
+/* ---------- steps ---------- */
+.steps { margin-top: 44px; border-left: 2px solid var(--rule); }
+.step { padding: 0 0 36px 28px; position: relative; }
+.step::before {
+  content: ""; position: absolute; left: -7px; top: 7px;
+  width: 12px; height: 12px; background: var(--amber);
+}
+.step:nth-child(4)::before { background: var(--cyan); }
+.step:nth-child(5)::before { background: var(--magenta); }
+.step h4 { margin: 0 0 8px; font-family: var(--mono); font-size: .92rem; font-weight: 700; color: var(--bone); }
+.step p { margin: 0; font-size: .86rem; }
+
+/* ---------- promises ---------- */
+.prom { border: 1px solid var(--rule); background: var(--panel); padding: 24px 26px; }
+.prom + .prom { margin-top: 20px; }
+.prom.offset { margin-left: 10%; border-color: var(--cyan); }
+@media (max-width: 900px) { .prom.offset { margin-left: 0; } }
+.prom h4 { margin: 0 0 10px; font-family: var(--display); font-size: 1.15rem; text-transform: uppercase; color: var(--amber); font-weight: 400; letter-spacing: .02em; }
+.prom.offset h4 { color: var(--cyan); }
+.prom p { margin: 0; font-size: .85rem; }
+
+/* ---------- lists ---------- */
+ul.dash { list-style: none; padding: 0; margin: 22px 0 0; max-width: 62ch; }
+ul.dash li { position: relative; padding-left: 24px; margin-bottom: 14px; color: var(--dim); font-size: .88rem; }
+ul.dash li::before { content: "▸"; position: absolute; left: 0; color: var(--amber); }
+
+/* ---------- warn ---------- */
+.warn { border: 1px solid var(--magenta); background: #1d0d17; padding: 20px 22px; margin-top: 36px; max-width: 70ch; }
+.warn h4 { margin: 0 0 10px; font-size: .76rem; letter-spacing: .2em; text-transform: uppercase; color: var(--magenta); font-weight: 700; }
+.warn p { margin: 0; font-size: .86rem; color: var(--dim); }
+.warn p + p { margin-top: 10px; }
+
+/* ---------- routes ---------- */
+.route { margin-bottom: 30px; }
+.route h4 { margin: 0 0 10px; font-size: .68rem; letter-spacing: .22em; text-transform: uppercase; color: var(--dimmer); font-weight: 700; }
+
+/* ---------- masthead / footer ---------- */
+.mast {
+  position: relative; z-index: 50; border-bottom: 1px solid var(--rule);
+  background: var(--void-2);
+}
+.mast-in { display: flex; align-items: center; gap: 18px; flex-wrap: wrap; padding: 12px 48px 12px; }
+@media (max-width: 760px) { .mast-in { padding-left: 18px; padding-right: 18px; } }
+.mark { font-family: var(--display); font-size: 1rem; letter-spacing: .04em; text-transform: uppercase; color: var(--amber); margin-right: auto; }
+.mark b { color: var(--dimmer); font-weight: 400; }
+.mast a { color: var(--dim); text-decoration: none; font-size: .72rem; letter-spacing: .16em; text-transform: uppercase; }
+.mast a:hover { color: var(--amber); }
+.blip { display: inline-block; width: 7px; height: 7px; background: var(--cyan); margin-right: 8px; vertical-align: 1px; animation: blink 1.7s steps(1) infinite; }
+@keyframes blink { 0%,60% { opacity: 1; } 61%,100% { opacity: .18; } }
+@media (prefers-reduced-motion: reduce) { .blip { animation: none; } }
+
+.further { margin-top: 44px; font-size: .74rem; letter-spacing: .12em; text-transform: uppercase; color: var(--dimmer); }
+.further a { margin-right: 18px; }
+
+footer { border-top: 1px solid var(--rule); background: var(--void-2); padding: 40px 0; }
+footer .bay { display: flex; justify-content: space-between; gap: 20px; flex-wrap: wrap; font-size: .7rem; letter-spacing: .14em; text-transform: uppercase; color: var(--dimmer); }
+</style>
+</head>
+<body>
+
+<div class="rail" aria-hidden="true"></div>
+<div class="vig" aria-hidden="true"></div>
+<div class="scan" aria-hidden="true"></div>
+
+<div class="page">
+
+<header class="mast">
+  <div class="mast-in">
+    <span class="mark">Build&nbsp;Governor<b> / claude-governor</b></span>
+    <span style="font-size:.7rem;letter-spacing:.18em;color:var(--dimmer)"><span class="blip"></span><span data-fig="version">V0.1.4</span></span>
+    <a href="#how">How</a>
+    <a href="#proof">Proof</a>
+    <a href="#install">Install</a>
+  </div>
+</header>
+
+<div class="hero bay">
+  <div class="hero-grid">
+    <div>
+      <span class="tag">SYS.LOAD &nbsp;//&nbsp; <b>CONTENTION DETECTED</b></span>
+      <h1>
+        <span class="c1">Six sessions.</span>
+        <span class="c2">One laptop.</span>
+        <span class="c3">Everything crawls.</span>
+      </h1>
+      <p class="hero-sub">Each session fans out into subagents and builds with no idea the others exist. Twelve things compile at once on eight cores, the fans spin up, and every session gets slower — including the one you are watching.</p>
+      <p class="hero-def"><b>Build Governor is a jobserver for Claude Code.</b> One small daemon holds a single budget for the whole machine. Every session asks before it starts an expensive build, and gets told a number instead of guessing one.</p>
+      <div class="cmd">
+        <code data-cmd><span class="pr">$ </span>curl -fsSL https://raw.githubusercontent.com/peter3605/claude-governor/main/install.sh | sh</code>
+        <button type="button" data-copy="curl -fsSL https://raw.githubusercontent.com/peter3605/claude-governor/main/install.sh | sh">Copy</button>
+      </div>
+      <p class="cmd-note">macOS + Linux · <span data-nofig>arm64 + amd64</span> · one static binary · no sudo · no telemetry</p>
+    </div>
+    <div>
+      <div class="readout">
+        <h4>Host · uncontrolled</h4>
+        <div><span>cores</span><span data-fig="host-cores">8</span></div>
+        <div><span>builds admitted</span><span class="bad" data-fig="ung-admitted">10 of 10</span></div>
+        <div><span>run queue / core</span><span class="bad" data-fig="ung-rq-max">11.93</span></div>
+        <div><span>build cpu</span><span class="bad" data-fig="ung-cpu">468.1 s</span></div>
+      </div>
+      <div class="readout" style="margin-left:22%">
+        <h4>Host · governed</h4>
+        <div><span>cores</span><span data-fig="host-cores">8</span></div>
+        <div><span>builds admitted</span><span class="ok" data-fig="gov-admitted">1 of 10</span></div>
+        <div><span>run queue / core</span><span class="ok" data-fig="gov-rq-max">4.22</span></div>
+        <div><span>build cpu</span><span class="ok" data-fig="gov-cpu">96.8 s</span></div>
+      </div>
+    </div>
+  </div>
+
+  <div class="chart-bay">
+    <div class="chart-head">
+      <span><b>FIG.01</b> &nbsp; RUN QUEUE DEPTH PER CORE · TEN CONCURRENT BUILDS</span>
+      <span>M1 AIR · <span data-fig="host-cores">8</span> CORES · <span data-fig="proof-window">150 S</span> WINDOW · <span data-fig="proof-date">2026-09-14</span></span>
+    </div>
+    <div class="scope">
+      <div class="plot">
+        <svg viewBox="0 0 149 13" preserveAspectRatio="none" role="img" aria-labelledby="fig01-cap">
+          <defs>
+            <linearGradient id="fu" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#ff3d9a" stop-opacity=".30"/><stop offset="1" stop-color="#ff3d9a" stop-opacity=".02"/></linearGradient>
+            <linearGradient id="fg" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#23d6da" stop-opacity=".30"/><stop offset="1" stop-color="#23d6da" stop-opacity=".02"/></linearGradient>
+          </defs>
+          <g class="grid">
+            <line x1="0" x2="149" y1="13" y2="13" vector-effect="non-scaling-stroke"/>
+            <line x1="0" x2="149" y1="11" y2="11" vector-effect="non-scaling-stroke"/>
+            <line x1="0" x2="149" y1="9" y2="9" vector-effect="non-scaling-stroke"/>
+            <line x1="0" x2="149" y1="7" y2="7" vector-effect="non-scaling-stroke"/>
+            <line x1="0" x2="149" y1="5" y2="5" vector-effect="non-scaling-stroke"/>
+            <line x1="0" x2="149" y1="3" y2="3" vector-effect="non-scaling-stroke"/>
+            <line x1="0" x2="149" y1="1" y2="1" vector-effect="non-scaling-stroke"/>
+            <line class="v" x1="14.9" x2="14.9" y1="0" y2="13" vector-effect="non-scaling-stroke"/>
+            <line class="v" x1="29.8" x2="29.8" y1="0" y2="13" vector-effect="non-scaling-stroke"/>
+            <line class="v" x1="44.7" x2="44.7" y1="0" y2="13" vector-effect="non-scaling-stroke"/>
+            <line class="v" x1="59.6" x2="59.6" y1="0" y2="13" vector-effect="non-scaling-stroke"/>
+            <line class="v" x1="74.5" x2="74.5" y1="0" y2="13" vector-effect="non-scaling-stroke"/>
+            <line class="v" x1="89.4" x2="89.4" y1="0" y2="13" vector-effect="non-scaling-stroke"/>
+            <line class="v" x1="104.3" x2="104.3" y1="0" y2="13" vector-effect="non-scaling-stroke"/>
+            <line class="v" x1="119.2" x2="119.2" y1="0" y2="13" vector-effect="non-scaling-stroke"/>
+            <line class="v" x1="134.1" x2="134.1" y1="0" y2="13" vector-effect="non-scaling-stroke"/>
+          </g>
+          <line class="busy" x1="0" x2="149" y1="12" y2="12" vector-effect="non-scaling-stroke"/>
+          <g class="traces">
+            <polygon fill="url(#fu)" points="0,9.943 1,8.924 2,7.905 3,6.886 4,5.867 5,4.848 6,3.829 7,3.329 8,3.975 9,3.249 10,2.540 11,2.493 12,2.566 13,2.494 14,2.336 15,1.920 16,1.605 17,1.728 18,1.767 19,1.605 20,1.811 21,1.839 22,2.451 23,2.077 24,1.605 25,1.818 26,2.300 27,1.605 28,2.172 29,2.240 30,2.305 31,2.893 32,3.472 33,3.290 34,2.881 35,3.504 36,3.345 37,2.706 38,3.057 39,2.922 40,3.142 41,3.423 42,3.405 43,3.087 44,3.372 45,3.885 46,3.324 47,3.136 48,3.317 49,2.572 50,2.595 51,3.078 52,3.447 53,2.816 54,2.684 55,2.695 56,3.183 57,3.282 58,3.764 59,4.511 60,4.224 61,3.834 62,4.367 63,4.302 64,3.939 65,3.365 66,3.558 67,3.698 68,3.490 69,2.997 70,2.992 71,3.019 72,2.591 73,1.905 74,2.168 75,1.605 76,2.044 77,2.378 78,1.704 79,1.605 80,2.042 81,2.714 82,3.023 83,2.534 84,2.144 85,2.578 86,2.564 87,2.179 88,2.303 89,2.559 90,2.780 91,3.222 92,2.666 93,1.070 94,2.841 95,2.541 96,2.631 97,2.978 98,2.942 99,3.187 100,3.786 101,3.957 102,4.008 103,3.632 104,3.090 105,2.679 106,3.082 107,2.804 108,2.676 109,3.312 110,2.948 111,2.464 112,2.370 113,1.842 114,2.506 115,2.136 116,2.232 117,1.605 118,1.605 119,2.060 120,2.388 121,1.866 122,1.605 123,1.605 124,1.605 125,2.311 126,1.735 127,2.128 128,1.605 129,1.994 130,1.605 131,1.605 132,1.605 133,1.605 134,1.797 135,2.268 136,2.978 137,3.713 138,4.261 139,3.864 140,4.483 141,4.683 142,4.696 143,3.958 144,4.424 145,4.343 146,4.333 147,4.471 148,4.414 149,5.077 149,13 0,13"/>
+            <polygon fill="url(#fg)" points="0,12.133 1,11.844 2,11.555 3,11.266 4,10.977 5,10.688 6,10.399 7,9.359 8,9.578 9,9.276 10,9.476 11,9.485 12,9.799 13,9.591 14,9.773 15,9.971 16,10.174 17,10.053 18,10.239 19,10.584 20,10.644 21,10.654 22,10.417 23,10.120 24,9.960 25,10.015 26,9.814 27,9.998 28,10.313 29,10.439 30,10.170 31,10.103 32,10.083 33,10.215 34,10.492 35,10.230 36,10.372 37,10.689 38,10.583 39,10.257 40,10.577 41,10.542 42,10.568 43,10.480 44,10.126 45,10.393 46,10.598 47,10.601 48,10.867 49,10.745 50,10.699 51,10.373 52,10.702 53,10.757 54,10.928 55,11.097 56,11.009 57,11.034 58,11.097 59,11.097 60,11.097 61,10.948 62,11.097 63,11.097 64,10.771 65,10.834 66,10.461 67,10.779 68,11.097 69,11.051 70,11.097 71,10.930 72,10.988 73,10.911 74,10.861 75,10.529 76,10.416 77,10.071 78,10.388 79,10.041 80,10.115 81,10.253 82,10.397 83,10.105 84,9.733 85,9.906 86,9.773 87,9.741 88,10.022 89,10.289 90,10.267 91,9.959 92,10.304 93,8.780 94,9.945 95,9.688 96,9.676 97,9.561 98,9.879 99,9.577 100,9.857 101,9.735 102,10.082 103,10.095 104,9.923 105,9.832 106,9.910 107,9.829 108,10.085 109,10.296 110,10.382 111,10.725 112,10.708 113,10.456 114,10.133 115,10.049 116,9.950 117,9.778 118,10.152 119,9.888 120,9.941 121,9.971 122,9.742 123,9.808 124,9.834 125,9.765 126,10.084 127,9.839 128,9.642 129,9.305 130,9.046 131,9.012 132,8.894 133,8.830 134,8.830 135,8.830 136,8.830 137,8.830 138,8.830 139,8.830 140,8.830 141,8.830 142,8.830 143,8.830 144,8.830 145,8.830 146,8.830 147,8.887 148,9.203 149,9.082 149,13 0,13"/>
+            <g class="tr u"><polyline data-trace="ung" vector-effect="non-scaling-stroke" points="0,9.943 1,8.924 2,7.905 3,6.886 4,5.867 5,4.848 6,3.829 7,3.329 8,3.975 9,3.249 10,2.540 11,2.493 12,2.566 13,2.494 14,2.336 15,1.920 16,1.605 17,1.728 18,1.767 19,1.605 20,1.811 21,1.839 22,2.451 23,2.077 24,1.605 25,1.818 26,2.300 27,1.605 28,2.172 29,2.240 30,2.305 31,2.893 32,3.472 33,3.290 34,2.881 35,3.504 36,3.345 37,2.706 38,3.057 39,2.922 40,3.142 41,3.423 42,3.405 43,3.087 44,3.372 45,3.885 46,3.324 47,3.136 48,3.317 49,2.572 50,2.595 51,3.078 52,3.447 53,2.816 54,2.684 55,2.695 56,3.183 57,3.282 58,3.764 59,4.511 60,4.224 61,3.834 62,4.367 63,4.302 64,3.939 65,3.365 66,3.558 67,3.698 68,3.490 69,2.997 70,2.992 71,3.019 72,2.591 73,1.905 74,2.168 75,1.605 76,2.044 77,2.378 78,1.704 79,1.605 80,2.042 81,2.714 82,3.023 83,2.534 84,2.144 85,2.578 86,2.564 87,2.179 88,2.303 89,2.559 90,2.780 91,3.222 92,2.666 93,1.070 94,2.841 95,2.541 96,2.631 97,2.978 98,2.942 99,3.187 100,3.786 101,3.957 102,4.008 103,3.632 104,3.090 105,2.679 106,3.082 107,2.804 108,2.676 109,3.312 110,2.948 111,2.464 112,2.370 113,1.842 114,2.506 115,2.136 116,2.232 117,1.605 118,1.605 119,2.060 120,2.388 121,1.866 122,1.605 123,1.605 124,1.605 125,2.311 126,1.735 127,2.128 128,1.605 129,1.994 130,1.605 131,1.605 132,1.605 133,1.605 134,1.797 135,2.268 136,2.978 137,3.713 138,4.261 139,3.864 140,4.483 141,4.683 142,4.696 143,3.958 144,4.424 145,4.343 146,4.333 147,4.471 148,4.414 149,5.077"/></g>
+            <g class="tr g"><polyline data-trace="gov" vector-effect="non-scaling-stroke" points="0,12.133 1,11.844 2,11.555 3,11.266 4,10.977 5,10.688 6,10.399 7,9.359 8,9.578 9,9.276 10,9.476 11,9.485 12,9.799 13,9.591 14,9.773 15,9.971 16,10.174 17,10.053 18,10.239 19,10.584 20,10.644 21,10.654 22,10.417 23,10.120 24,9.960 25,10.015 26,9.814 27,9.998 28,10.313 29,10.439 30,10.170 31,10.103 32,10.083 33,10.215 34,10.492 35,10.230 36,10.372 37,10.689 38,10.583 39,10.257 40,10.577 41,10.542 42,10.568 43,10.480 44,10.126 45,10.393 46,10.598 47,10.601 48,10.867 49,10.745 50,10.699 51,10.373 52,10.702 53,10.757 54,10.928 55,11.097 56,11.009 57,11.034 58,11.097 59,11.097 60,11.097 61,10.948 62,11.097 63,11.097 64,10.771 65,10.834 66,10.461 67,10.779 68,11.097 69,11.051 70,11.097 71,10.930 72,10.988 73,10.911 74,10.861 75,10.529 76,10.416 77,10.071 78,10.388 79,10.041 80,10.115 81,10.253 82,10.397 83,10.105 84,9.733 85,9.906 86,9.773 87,9.741 88,10.022 89,10.289 90,10.267 91,9.959 92,10.304 93,8.780 94,9.945 95,9.688 96,9.676 97,9.561 98,9.879 99,9.577 100,9.857 101,9.735 102,10.082 103,10.095 104,9.923 105,9.832 106,9.910 107,9.829 108,10.085 109,10.296 110,10.382 111,10.725 112,10.708 113,10.456 114,10.133 115,10.049 116,9.950 117,9.778 118,10.152 119,9.888 120,9.941 121,9.971 122,9.742 123,9.808 124,9.834 125,9.765 126,10.084 127,9.839 128,9.642 129,9.305 130,9.046 131,9.012 132,8.894 133,8.830 134,8.830 135,8.830 136,8.830 137,8.830 138,8.830 139,8.830 140,8.830 141,8.830 142,8.830 143,8.830 144,8.830 145,8.830 146,8.830 147,8.887 148,9.203 149,9.082"/></g>
+          </g>
+        </svg>
+        <span class="ytick" style="top:100%" data-nofig>0</span>
+        <span class="ytick" style="top:84.6%" data-nofig>2</span>
+        <span class="ytick" style="top:69.2%" data-nofig>4</span>
+        <span class="ytick" style="top:53.8%" data-nofig>6</span>
+        <span class="ytick" style="top:38.5%" data-nofig>8</span>
+        <span class="ytick" style="top:23.1%" data-nofig>10</span>
+        <span class="ytick" style="top:7.7%" data-nofig>12</span>
+        <span class="busy-lab" style="top:92.3%" data-nofig>1.0 FULLY BUSY</span>
+      </div>
+      <div class="scope-key">
+        <div class="u">▰ UNGOVERNED</div>
+        <div class="g">▰ GOVERNED</div>
+      </div>
+    </div>
+    <p class="cap" id="fig01-cap">Each trace is drawn at its arm's measured median and maximum; the per-second shape between them is illustrative, the median and the peak are not. Both arms ran the same ten background <code>go build -a</code> jobs, measured by an independent watcher sampling once a second rather than by the governor's own accounting. The exact figures are plotted in FIG.02.</p>
+  </div>
+</div>
+
+<div class="dither" aria-hidden="true"><canvas id="dither"></canvas><span class="dither-label">Oversubscribed → governed</span></div>
+
+<section id="problem">
+  <span class="ord" style="left:-10px; top:40px;" aria-hidden="true" data-nofig>01</span>
+  <div class="bay void-r">
+    <div></div>
+    <div class="push">
+      <span class="tag">§1 &nbsp;//&nbsp; <b>The problem</b></span>
+      <h2>A session cannot see<br>the other sessions</h2>
+      <p class="lead">Claude Code is good at parallelism. It will launch a test suite, a build, and four subagents because all of those are reasonable things to do.</p>
+      <p>What it cannot know is that three other sessions on the same laptop just did the same. Nothing in the stack arbitrates this — each session is a separate process tree making locally sensible decisions, and the machine absorbs the sum of them.</p>
+      <p>On a desktop with headroom you never notice. On a laptop you notice immediately, and the symptom is the worst kind: <strong>everything</strong> gets slower, so there is nothing to blame.</p>
+      <p>The oversubscribed machine also delivers <em>less</em> work. Ten builds thrashing on eight cores spend their time on context switches and memory pressure, not compiling. You pay the heat and the fan noise and get fewer finished builds for it.</p>
+    </div>
+  </div>
+</section>
+
+<section id="proof">
+  <div class="bay">
+    <span class="tag">§2 &nbsp;//&nbsp; <b>What it actually does</b></span>
+    <h2>The same fan-out.<br>Run twice.<br>Measured from outside.</h2>
+    <p class="lead" style="max-width:64ch">Ten builds launched at once — once with no hooks at all, once against a live daemon. Every number below came from an independent watcher rather than the governor's own logs, because a control loop reporting on its own behaviour proves nothing.</p>
+    <p style="max-width:64ch">The first attempt was thrown away. The governed arm stopped early after its first few refusals, which left the two arms with unequal session lifetimes and made the comparison worthless. It was re-run with the refusals declared up front, and the discarded run is in the record.</p>
+
+    <div class="regs">
+      <div class="reg">
+        <div class="k">Builds admitted</div>
+        <div class="v" data-fig="gov-admitted">1 / 10</div>
+        <div class="was">was <span data-fig="ung-admitted">10 / 10</span></div>
+        <div class="d">Nine refused.</div>
+      </div>
+      <div class="reg">
+        <div class="k">Build CPU</div>
+        <div class="v" data-fig="gov-cpu">96.8</div>
+        <div class="was">was <span data-fig="ung-cpu">468.1</span> core-sec</div>
+        <div class="d"><span data-fig="cpu-ratio">4.8&times;</span> less CPU handed to builds.</div>
+      </div>
+      <div class="reg">
+        <div class="k">Run queue max</div>
+        <div class="v" data-fig="gov-rq-max">4.22</div>
+        <div class="was">was <span data-fig="ung-rq-max">11.93</span> per core</div>
+        <div class="d"><span data-fig="rq-ratio">2.8&times;</span> less contention.</div>
+      </div>
+      <div class="reg">
+        <div class="k">Peak child cores</div>
+        <div class="v warn" data-fig="gov-peak">6.67</div>
+        <div class="was">was <span data-fig="ung-peak">4.84</span> — higher</div>
+        <div class="d">Measures speed, not oversubscription.</div>
+      </div>
+    </div>
+
+    <div class="bars">
+      <div class="chart-head" style="padding-top:0">
+        <span><b>FIG.02</b> &nbsp; MEASURED PERCENTILES · RUN QUEUE PER CORE</span>
+      </div>
+      <div class="brow">
+        <div class="blab">
+          <span class="nm" style="color:var(--magenta)">UNGOVERNED</span>
+          <span class="st">p50 <span data-fig="ung-rq-p50">10.19</span> · p90 <span data-fig="ung-rq-p90">11.49</span> · max <span data-fig="ung-rq-max">11.93</span></span>
+        </div>
+        <div class="btrack">
+          <div class="bfill ghost" data-at="ung-rq-max" style="width:95.4%;background:var(--magenta)"></div>
+          <div class="bfill" data-at="ung-rq-p50" style="width:81.5%;background:var(--magenta)"></div>
+          <div class="bnotch" data-at="ung-rq-p90" style="left:91.9%"></div>
+        </div>
+      </div>
+      <div class="brow">
+        <div class="blab">
+          <span class="nm" style="color:var(--cyan)">GOVERNED</span>
+          <span class="st">p50 &nbsp;<span data-fig="gov-rq-p50">2.89</span> · p90 &nbsp;<span data-fig="gov-rq-p90">3.97</span> · max &nbsp;<span data-fig="gov-rq-max">4.22</span></span>
+        </div>
+        <div class="btrack">
+          <div class="bfill ghost" data-at="gov-rq-max" style="width:33.8%;background:var(--cyan)"></div>
+          <div class="bfill" data-at="gov-rq-p50" style="width:23.1%;background:var(--cyan)"></div>
+          <div class="bnotch" data-at="gov-rq-p90" style="left:31.8%"></div>
+        </div>
+      </div>
+      <div class="baxis">
+        <span class="m" style="left:0%" data-nofig>0</span>
+        <span class="m" style="left:16%" data-nofig>2</span>
+        <span class="m" style="left:32%" data-nofig>4</span>
+        <span class="m" style="left:48%" data-nofig>6</span>
+        <span class="m" style="left:64%" data-nofig>8</span>
+        <span class="m" style="left:80%" data-nofig>10</span>
+        <span class="m" style="left:96%" data-nofig>12</span>
+        <span class="busy" style="left:8%" data-nofig>1.0 — FULLY BUSY</span>
+      </div>
+    </div>
+    <p class="cap">Solid bar is the median, pale extension the maximum, notch the p90. A run queue of <span data-nofig>1.0</span> per core means the machine is exactly busy. <span data-fig="ung-rq-max">11.93</span> means about <span data-fig="rq-threads">95</span> runnable threads queued for <span data-fig="host-cores">8</span> cores.</p>
+    <p class="cap" style="margin-top:12px">Peak child cores went <em>up</em>, and it is reported rather than dropped. One build alone gets the whole machine and compiles at full width; ten builds thrash and each gets a fraction, so the oversubscribed arm shows a <em>lower</em> instantaneous peak while doing <span data-fig="cpu-ratio">4.8&times;</span> more work. It measures how fast the machine is going, not how overloaded it is — the same reason the control loop ignores CPU utilisation (§3). The whole experiment, including the run that was thrown away, is in <a href="https://github.com/peter3605/claude-governor/blob/main/docs/control-proof.md">docs/control-proof.md</a>.</p>
+  </div>
+
+</section>
+
+<section id="how">
+  <span class="ord" style="right:-14px; top:50px;" aria-hidden="true" data-nofig>03</span>
+  <div class="bay">
+    <span class="tag">§3 &nbsp;//&nbsp; <b>How it works</b></span>
+    <h2>A gate, a daemon,<br>and a budget that moves</h2>
+  </div>
+  <div class="bay void-l" style="margin-top:10px">
+    <div>
+      <div class="term">
+<pre><span class="d">        claude code session</span>
+               <span class="a">│</span>
+          PreToolUse hook
+               <span class="a">│</span>
+          <span class="a">┌────────▼────────┐</span>
+          <span class="a">│</span>  <span class="w">classify</span>       <span class="a">│</span>  <span class="d">~<span data-fig="classify-us">5 µs</span>, no I/O</span>
+          <span class="a">└───┬─────────┬───┘</span>
+     <span class="d">cheap</span> <span class="a">│</span>         <span class="a">│</span> <span class="m">build-shaped</span>
+          <span class="a">▼</span>         <span class="a">▼</span>
+     <span class="g">pass through</span>   unix socket
+     <span class="d">never dials</span>         <span class="a">│</span>
+                        <span class="a">▼</span>
+          <span class="a">┌──────────────────────┐</span>
+          <span class="a">│</span>  <span class="w">daemon</span>              <span class="a">│</span>
+          <span class="a">│</span>   lease table        <span class="a">│</span>
+          <span class="a">│</span>   AIMD loop          <span class="a">│</span>
+          <span class="a">│</span>   max-min fair queue <span class="a">│</span>
+          <span class="a">└───┬──────────────┬───┘</span>
+              <span class="a">│</span>              <span class="a">│</span>
+        <span class="g">GRANT</span>            <span class="m">WAIT ≤ <span data-fig="gate-wait">20s</span></span>
+        <span class="d">lease held</span>       <span class="d">then refuse</span>
+
+<span class="d">  any failure, anywhere ──▶ </span><span class="g">FAIL OPEN</span></pre>
+      </div>
+      <p class="cap">FIG.03 — the admission path. Only <span data-fig="gated-share">18.4%</span> of Bash calls reach the socket; they carry <span data-fig="cost-captured">78.6%</span> of the child CPU.</p>
+    </div>
+    <div style="padding-left:7%">
+      <div class="steps">
+        <div class="step">
+          <h4>The gate classifies before it does anything else</h4>
+          <p>A pure function reads the command text in about <span data-fig="classify-us">5 microseconds</span> and decides whether it is build-shaped. <code>git status</code> and <code>cat</code> never touch the socket at all.</p>
+        </div>
+        <div class="step">
+          <h4>One lease table for the whole machine</h4>
+          <p>Started lazily by the first gate that needs it. Leases are divided max-min fair across sessions, the rest queue FIFO, and a dead process has its lease reaped by TTL and PID liveness.</p>
+        </div>
+        <div class="step">
+          <h4>The budget is a control loop, not a constant</h4>
+          <p>Additive increase while the machine has room and something is waiting; multiplicative decrease the moment the queue goes deep. Climbs one slot per second, halves on the way down — the asymmetry TCP uses, for the same reason.</p>
+        </div>
+        <div class="step">
+          <h4>It controls on run-queue depth, not CPU</h4>
+          <p>A build machine at <span data-nofig>100%</span> CPU with a shallow queue is <em>working</em>, not in trouble, and utilisation saturates at <span data-nofig>1.0</span> exactly where the useful distinctions begin. Measured: the CPU climb condition held on <span data-fig="climb-ticks">0 of 471</span> saturated ticks.</p>
+        </div>
+        <div class="step">
+          <h4>Thermal is a backstop, honestly labelled</h4>
+          <p>A <code>serious</code> reading floors the budget. On a fanless Mac over <span data-fig="thermal-hours">101 hours</span> that never once fired, so it is documented as carried for hardware that throttles rather than claimed as load-bearing. No <code>sudo</code>.</p>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section id="slots">
+  <div class="bay">
+    <span class="tag">§4 &nbsp;//&nbsp; <b>The unit</b></span>
+    <div class="void-r">
+      <div></div>
+      <div class="push">
+        <h2>One slot<br>is <span data-fig="slot-cores">1.2</span> cores</h2>
+        <p class="lead">Not one agent. Not one session. A slot is the measured p90 peak child cores of an ordinary compile, so the common case weighs exactly <span data-fig="medium-weight">1</span> and <code data-fig="statusline-slots">3/6 slots</code> reads as "about three ordinary builds' worth of load."</p>
+      </div>
+    </div>
+
+    <div class="memmap">
+      <div class="chart-head" style="padding-top:0"><span><b>FIG.04</b> &nbsp; LEASE WEIGHTS · ONE CELL = <span data-nofig>0.25</span> SLOTS</span></div>
+      <div class="mm-row">
+        <span class="mm-name">Subagent</span>
+        <div class="mm-cells" data-at="agent-weight" style="--slots:0.08"></div>
+        <span class="mm-val" data-fig="agent-weight">0.08</span>
+      </div>
+      <div class="mm-row">
+        <span class="mm-name">Light cmd</span>
+        <div class="mm-cells" data-at="light-weight" style="--slots:0.08"></div>
+        <span class="mm-val" data-fig="light-weight">0.08</span>
+      </div>
+      <div class="mm-row">
+        <span class="mm-name hi">Medium build</span>
+        <div class="mm-cells unit" data-at="medium-weight" style="--slots:1.00"></div>
+        <span class="mm-val" data-fig="medium-weight">1.00</span>
+      </div>
+      <div class="mm-row">
+        <span class="mm-name">Heavy build</span>
+        <div class="mm-cells big" data-at="heavy-weight" style="--slots:3.75"></div>
+        <span class="mm-val" data-fig="heavy-weight">3.75</span>
+      </div>
+      <div class="mm-scale">MEDIUM BUILD IS THE UNIT · <span data-fig="agents-per-build">12</span> SUBAGENTS WEIGH ONE BUILD</div>
+    </div>
+    <p class="cap">The subagent figure is a population-level marginal, not a per-agent cost: the sampler is host-wide and the measured machine never ran fewer than three concurrent sessions. The distinction is kept everywhere it appears.</p>
+
+    <div class="void-l" style="margin-top:80px">
+      <div>
+        <h3>Which is how the project changed its own mind</h3>
+        <p>It began as a subagent limiter. A week of tracing said agents cost about <code data-fig="agent-cores">0.098</code> cores each, near-constant, with a <em>negative</em> maximum marginal — the busiest seconds on the machine had no agent live at all.</p>
+        <p>The CPU was going to the builds the agents launched. So the controlled variable moved to build concurrency, and agents kept a weighted lease rather than a count. A budget that counted a subagent and a heavy build alike would govern neither.</p>
+      </div>
+      <div></div>
+    </div>
+  </div>
+</section>
+
+<section id="see">
+  <span class="ord" style="left:-10px; top:36px;" aria-hidden="true" data-nofig>05</span>
+  <div class="bay void-r">
+    <div></div>
+    <div class="push">
+      <span class="tag">§5 &nbsp;//&nbsp; <b>What you see</b></span>
+      <h2>A refusal that<br>tells you why</h2>
+      <p>A governor that silently changes behaviour is untrustworthy. The number is in your status line, and every refusal names the figures behind it.</p>
+    </div>
+  </div>
+  <div class="bay" style="margin-top:36px">
+    <div class="term">
+<pre><span class="d">$</span> <span class="w">governor status</span></pre>
+<pre data-fig="status-example">budget <span class="a">6</span>
+in use <span class="a">3</span>
+waiting <span class="a">0</span>
+cpu <span class="a">0.78</span>
+thermal <span class="g">nominal</span>
+session 16c20e52-7a3f-4b1e-9d02-5e8c41a7b3f9 weight 1 tentative 0 confirmed 1
+session 9b04a7e1-c6d5-4f80-a1b3-2e7f90d4c815 weight 1 tentative 0 confirmed 2</pre>
+<pre>
+<span class="d">──── status line ────────────────────────────────────</span></pre>
+<pre data-fig="statusline-example"><span class="g">3/6 slots</span> <span class="d">(1 yours)</span> - cpu <span class="a">78%</span> - thermal <span class="g">ok</span></pre>
+<pre>
+<span class="d">──── a refusal, in session ───────────────────────────</span></pre>
+<pre class="wrap" data-fig="refusal-example"><span class="m">Not enough free build slots</span> <span class="w">(3/6 build slots held, this one needs 3.8, CPU 78%, thermal: nominal).</span> This command was not run. <span class="w">This is a large build and the slots left free are not enough for it.</span> Wait a few seconds and run exactly the same command again; do not look for a different way to build, <span class="w">and do not treat this as a build failure.</span></pre>
+    </div>
+    <p class="cap">Verbatim: each line is what the shipped binary prints for that state. A refusal names the number, the cause, and one concrete instruction — a vague one produces a retry loop that burns tokens. A refused build is told to wait and run the same command again, never to "do it inline": nothing else on the machine can compile that package, so inline advice it cannot act on would send it looking for a worse way to build. The gate prefers to <em>wait</em> rather than refuse wherever the wait fits inside the hook timeout, because a stall costs nothing and the model never has to reason about it.</p>
+    <ul class="dash">
+      <li><strong>Overrides, when you disagree.</strong> <code>limit</code> pins the budget, <code>pause</code> stops gating without stopping the daemon, <code>boost</code> doubles one session's share, <code>resume</code> releases either.</li>
+      <li><strong>An MCP tool, so a session can ask first.</strong> <code>governor__request_build</code> checks for room before committing to something expensive, instead of discovering the answer by being refused.</li>
+      <li><strong>A doctor that diagnoses rather than describes.</strong> <code>governor doctor</code> checks the install, daemon, socket, hooks, and whether any running session predates the install — and names the fix for each thing it finds.</li>
+    </ul>
+  </div>
+</section>
+
+<section id="guarantees">
+  <div class="bay">
+    <span class="tag">§6 &nbsp;//&nbsp; <b>The two guarantees</b></span>
+    <div class="void-l">
+      <div>
+        <h2>What this asks of you<br>is a hook on<br>every build</h2>
+        <p class="lead">That is an intrusive thing to install, so these come before any feature.</p>
+        <ul class="dash">
+          <li>No <code>sudo</code>, ever. Nothing runs as root and nothing asks.</li>
+          <li>No telemetry. Nothing collected, nothing sent.</li>
+          <li>One static binary. No runtime, no background updater.</li>
+          <li>It never kills anything already running. Admission control only.</li>
+        </ul>
+      </div>
+      <div style="padding-left:4%">
+        <div class="prom">
+          <h4>It fails open</h4>
+          <p>Daemon down, socket unreachable, reply slow, wrong protocol version, garbled payload — the build goes ahead ungoverned. A broken governor can never stall a session. Every hook has a hard deadline inside Claude Code's own, and the fail-open test drives the gate through each failure shape it knows and requires every one to let the work through.</p>
+        </div>
+        <div class="prom offset">
+          <h4>It comes out clean</h4>
+          <p><code>governor uninstall</code> removes the plugin, stops the daemon, and restores <code>settings.json</code> byte for byte. A test installs into a scratch home, uninstalls, and fails on any difference in a digest of the whole directory — on every push against clean Debian and Alpine, and on every release against a clean macOS machine using the published download.</p>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<div class="dither b2" aria-hidden="true"><canvas id="dither2"></canvas><span class="dither-label">Install → calibrate → governed</span></div>
+
+<section id="install">
+  <div class="bay">
+    <span class="tag">§7 &nbsp;//&nbsp; <b>Install</b></span>
+    <h2>Three routes,<br>one destination</h2>
+    <p class="lead" style="max-width:62ch">They all end in the same place: one plugin at <code>~/.claude/skills/build-governor/</code> and one <code>governor</code> binary. The marketplace entry carries no second copy — it points Claude Code at the tree the binary already wrote, so both registrations load the same files and cannot double up.</p>
+
+    <div class="void-l" style="margin-top:44px">
+      <div>
+        <div class="route">
+          <h4><span data-nofig>01</span> — The one-liner</h4>
+          <div class="cmd" style="margin-top:0">
+            <code data-cmd><span class="pr">$ </span>curl -fsSL https://raw.githubusercontent.com/peter3605/claude-governor/main/install.sh | sh</code>
+            <button type="button" data-copy="curl -fsSL https://raw.githubusercontent.com/peter3605/claude-governor/main/install.sh | sh">Copy</button>
+          </div>
+        </div>
+        <div class="route">
+          <h4><span data-nofig>02</span> — Homebrew</h4>
+          <div class="cmd" style="margin-top:0">
+            <code data-cmd><span class="pr">$ </span>brew install peter3605/claude-governor/governor &amp;&amp; governor install</code>
+            <button type="button" data-copy="brew install peter3605/claude-governor/governor && governor install">Copy</button>
+          </div>
+        </div>
+        <div class="route">
+          <h4><span data-nofig>03</span> — Claude Code marketplace</h4>
+          <div class="cmd" style="margin-top:0">
+            <code data-cmd><span class="pr">$ </span>claude plugin marketplace add peter3605/claude-governor
+<span class="pr">$ </span>claude plugin install build-governor@claude-governor</code>
+            <button type="button" data-copy="claude plugin marketplace add peter3605/claude-governor
+claude plugin install build-governor@claude-governor">Copy</button>
+          </div>
+          <p class="cmd-note">Once the binary is installed by either route above.</p>
+        </div>
+      </div>
+      <div style="padding-left:6%">
+        <h3 style="margin-top:0">It measures your machine first</h3>
+        <p>Install ends by running <code>governor calibrate</code>: your core count, your performance-core split, your RAM, and what your run queue already sits at while you work — then a short, announced load probe of <span data-fig="probe-seconds">3.75 seconds</span> to find how many cores your hardware really delivers in parallel.</p>
+        <p>That is not the number it advertises: a laptop with four performance and four efficiency cores measures about <span data-fig="probe-cores">5.6 of 8</span>.</p>
+      </div>
+    </div>
+
+    <div class="warn">
+      <h4>⚠ Sessions you already have open stay ungoverned</h4>
+      <p>Claude Code binds hooks when a session starts, so an install cannot reach into a session that is already running. Those stay ungoverned for the rest of their lives.</p>
+      <p>Install counts them and names them, <code>governor doctor</code> <strong>fails</strong> while any of them is still running, and the status line reads <code data-fig="ungoverned-line">governor: ungoverned - restart to enable</code> rather than a misleading slot count. Restart them and it takes effect.</p>
+    </div>
+  </div>
+</section>
+
+<section id="limits">
+  <div class="bay void-r">
+    <div></div>
+    <div class="push">
+      <span class="tag">§8 &nbsp;//&nbsp; <b>What this is, and is not</b></span>
+      <h2>Honest about<br>the edges</h2>
+      <ul class="dash">
+        <li><strong data-fig="version">v0.1.4.</strong> Early, and versioned like it. The wire protocol and the config file are both versioned with forward migration, so an upgrade is a non-event.</li>
+        <li><strong>One machine.</strong> The budget covers the host it runs on. A shared broker across machines is designed and seamed for, and deliberately not built — CPU does not aggregate across hosts.</li>
+        <li><strong>Measured on one laptop.</strong> An M1 MacBook Air, mostly against Go and Python workloads. <code>calibrate</code> re-derives the constants on yours, but the shape of the model carries that machine's fingerprints and the documents say where.</li>
+        <li><strong>The classifier is imperfect and knows it.</strong> It catches <span data-fig="catch-rate">53%</span> of expensive commands by name and gates <span data-fig="false-positives">36%</span> of cheap ones unnecessarily. It captures <span data-fig="cost-captured">78.6%</span> of the child CPU that matters, which is the figure it is tuned against.</li>
+      </ul>
+    </div>
+  </div>
+</section>
+
+<section id="close">
+  <div class="bay">
+    <h2 style="font-size:clamp(2rem,6.5vw,5rem)">One budget,<br><span style="color:var(--amber)">behind all of them</span></h2>
+    <p class="lead" style="max-width:56ch">If you run more than one Claude Code session on a laptop, the contention is already happening. You are absorbing it instead of scheduling it.</p>
+    <div class="cmd">
+      <code data-cmd><span class="pr">$ </span>curl -fsSL https://raw.githubusercontent.com/peter3605/claude-governor/main/install.sh | sh</code>
+      <button type="button" data-copy="curl -fsSL https://raw.githubusercontent.com/peter3605/claude-governor/main/install.sh | sh">Copy</button>
+    </div>
+    <p class="cmd-note">Then <code>governor doctor</code> to see what it did, and <code>governor uninstall</code> if you disagree.</p>
+    <p class="further">Read further:
+      <a href="https://github.com/peter3605/claude-governor/blob/main/docs/guide.md">The guide</a>
+      <a href="https://github.com/peter3605/claude-governor/blob/main/docs/how-it-works.md">How it works</a>
+      <a href="https://github.com/peter3605/claude-governor/blob/main/docs/design.md">The design</a>
+      <a href="https://github.com/peter3605/claude-governor/blob/main/CONTRIBUTING.md">Contributing</a>
+    </p>
+  </div>
+</section>
+
+<footer>
+  <div class="bay">
+    <span>build-governor · MIT · macOS + Linux</span>
+    <span><a href="https://github.com/peter3605/claude-governor" data-nofig>github.com/peter3605/claude-governor</a></span>
+  </div>
+</footer>
+
+</div><!-- /page -->
+
+<script>
+(function () {
+  document.documentElement.className = document.documentElement.className.replace("no-js", "js");
+
+  /* ---- ordered-dither gradient band, like a thermal printout. Decoration only. ---- */
+  var BAYER = [
+    [0, 8, 2, 10], [12, 4, 14, 6], [3, 11, 1, 9], [15, 7, 13, 5]
+  ];
+  function drawDither(cv, from, to) {
+    if (!cv) return;
+    var w = cv.clientWidth, h = cv.clientHeight;
+    if (!w || !h) return;
+    cv.width = w; cv.height = h;
+    var c = cv.getContext("2d");
+    c.fillStyle = "#0a0910"; c.fillRect(0, 0, w, h);
+    var px = 4, cols = Math.ceil(w / px), rows = Math.ceil(h / px);
+    for (var cx = 0; cx < cols; cx++) {
+      for (var cy = 0; cy < rows; cy++) {
+        var t = cx / cols;
+        /* density falls from left to right: oversubscribed -> governed */
+        var d = Math.pow(1 - t, 1.6) * 0.95 + 0.03 * Math.sin(cy * 0.6 + cx * 0.08);
+        var thr = (BAYER[cy % 4][cx % 4] + 0.5) / 16;
+        if (d > thr) {
+          c.fillStyle = t < 0.42 ? from : to;
+          c.fillRect(cx * px, cy * px, px - 1, px - 1);
+        }
+      }
+    }
+  }
+  function dithers() {
+    drawDither(document.getElementById("dither"), "#ff3d9a", "#23d6da");
+    drawDither(document.getElementById("dither2"), "#ffaa1d", "#23d6da");
+  }
+  dithers();
+  var dt;
+  window.addEventListener("resize", function () {
+    clearTimeout(dt);
+    dt = setTimeout(dithers, 160);
+  });
+
+  /* ---- copy ---- */
+  document.addEventListener("click", function (e) {
+    var btn = e.target.closest("button[data-copy]");
+    if (!btn) return;
+    var txt = btn.getAttribute("data-copy"), was = btn.textContent;
+    var done = function () { btn.textContent = "OK"; setTimeout(function () { btn.textContent = was; }, 1400); };
+    var fail = function () { btn.textContent = "Select"; setTimeout(function () { btn.textContent = was; }, 1600); };
+    try {
+      if (navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(txt).then(done, fail);
+      else fail();
+    } catch (err) { fail(); }
+  });
+})();
+</script>
+
+</body>
+</html>

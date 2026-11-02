@@ -14,7 +14,7 @@
         "command": "governor plugin-path",
         "mode": "link"
       },
-      "homepage": "https://github.com/peter3605/claude-governor",
+      "homepage": "https://peter3605.github.io/claude-governor/",
       "license": "MIT"
     }
   ]
