@@ -264,8 +264,8 @@ contributor does not need it.
 
 A release is a tag. Pushing `vX.Y.Z` runs `.github/workflows/release.yml`, which takes the
 release notes from [CHANGELOG.md](CHANGELOG.md), builds the four binaries, publishes the
-GitHub release, and then tests the published release on a clean macOS machine. The Homebrew
-tap is then updated by hand. The whole procedure:
+GitHub release, and then tests the published release and its Homebrew formula on clean macOS
+machines. The Homebrew tap is then updated by hand. The whole procedure:
 
 ### 1. Write the CHANGELOG entry, and merge it before you tag
 
@@ -301,7 +301,7 @@ are annotated; v0.1.2 was pushed as a lightweight tag by mistake. Do not repeat 
 Tag only a commit whose CI is green. The release workflow does not run the test suite; it
 trusts that `main` already did.
 
-### 3. Watch `release.yml`, all four jobs
+### 3. Watch `release.yml`, all five jobs
 
 ```sh
 gh run list --workflow release --limit 1
@@ -318,25 +318,24 @@ gh run watch <run-id>
   body is the `notes` job's output. `install.sh` downloads from `releases/latest`, so from this moment the
   release is live for anyone running the one-liner.
 - **`clean-macos`** runs **after** `publish`, against the release as published. On a fresh
-  macOS runner with a fresh `HOME` it checks:
-  1. **`install.sh`, unmodified, fetched from the tag**, installs from `releases/latest` and
-     passes everything in `scripts/clean-install-in-container.sh`: the exact §13.3 file set,
-     `governor doctor` exiting 0 or 3 with exactly `sessions` and `spawn` unverified, a
-     reinstall over a running install, **thermal is not `unknown`** (the release's darwin
-     binary really was built with cgo), and a byte-identical uninstall;
-  2. **the release's own `governor.rb`**, placed in a throwaway local tap, passes
-     `brew style` and `brew audit --strict`, installs, passes `brew test`, and the installed
-     binary prints `governor X.Y.Z`.
+  macOS runner with a fresh `HOME`, **`install.sh`, unmodified, fetched from the tag**,
+  installs from `releases/latest` and passes everything in
+  `scripts/clean-install-in-container.sh`: the exact §13.3 file set, `governor doctor`
+  exiting 0 or 3 with exactly `sessions` and `spawn` unverified, a reinstall over a running
+  install, **thermal is not `unknown`** (the release's darwin binary really was built with
+  cgo), and a byte-identical uninstall.
+- **`homebrew-macos`** also runs **after** `publish`, on its own fresh macOS runner. **The
+  release's own `governor.rb`**, downloaded from this tag's release and placed in a throwaway
+  local tap that the job trusts (`brew trust`, which current Homebrew requires before it will
+  load a formula from a tap), passes `brew style` and `brew audit --strict`, installs, passes
+  `brew test`, and the installed binary prints `governor X.Y.Z`.
 
 It needs the repository to be public, because it downloads from
 `raw.githubusercontent.com` and `releases/latest` exactly as a stranger would.
 
-**Known issue:** on current Homebrew, the formula step in `clean-macos` fails with
-`Refusing to load formula local/governor/governor from untrusted tap local/governor`, because
-the job does not yet trust the throwaway tap it creates. That happened on v0.1.2. If that is
-the **only** failure, the release itself is sound. Do the Homebrew check by hand in step 5
-before you announce anything. Any other failure in `clean-macos` means the release is bad:
-go to step 6.
+A failure in either `clean-macos` or `homebrew-macos` means the release is bad: go to step 6.
+(v0.1.2's `clean-macos` failed only because the job did not yet trust its throwaway tap. That
+is fixed, so a red Homebrew check is real now.)
 
 ### 4. Copy that release's `governor.rb` into the tap
 
@@ -355,8 +354,7 @@ git commit -m "governor X.Y.Z"
 git push
 ```
 
-Copy a formula only after `clean-macos` has passed (or failed only on the known issue
-above). The tap's history starts at 0.1.1 because v0.1.0's formula failed its own audit and
+Copy a formula only after `clean-macos` and `homebrew-macos` have both passed. The tap's history starts at 0.1.1 because v0.1.0's formula failed its own audit and
 was never copied.
 
 This step is manual on purpose. Automating it would mean storing a token with write access to
@@ -382,9 +380,9 @@ The marketplace needs no step of its own. Its entry is a command source that run
 ([design.md §13.2a](docs/design.md#132a-the-marketplace-route-and-why-the-plugin-is-build-governor)),
 so it always serves whatever version is installed.
 
-### 6. When `clean-macos` fails: a new patch tag, never a re-tag
+### 6. When `clean-macos` or `homebrew-macos` fails: a new patch tag, never a re-tag
 
-By the time `clean-macos` runs, the release is already published. `releases/latest` points at
+By the time those two jobs run, the release is already published. `releases/latest` points at
 it, and someone may already have installed it. **Never move or re-push a tag**, and never
 replace a release's assets. A tag that changes meaning under people who already fetched it is
 worse than a bad release. Instead:
@@ -407,7 +405,8 @@ the tap. v0.1.0 was left as it was.
 real release. Test it with a throwaway **pre-release** tag instead: any tag with a semver
 suffix, such as `v0.1.3-rc.1`. The release it publishes is marked as a pre-release, which
 `releases/latest` skips, so `install.sh` and Homebrew users never see it. `clean-macos` is
-skipped for it, because it would only test the previous release.
+skipped for it, because it would only test the previous release; `homebrew-macos` still runs,
+because it installs the formula attached to the pre-release itself.
 
 ```sh
 git switch -c release-test origin/main      # plus the release.yml change under test
