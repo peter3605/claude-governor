@@ -6,6 +6,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/peter3605/claude-governor/internal/trace"
 )
 
 // Tests for `governor doctor --report` (GOV-40). See report.go for why the report is built in
@@ -102,6 +104,37 @@ func TestTheReportIsSafeToPasteInPublic(t *testing.T) {
 
 	if code != plainCode {
 		t.Errorf("--report exited %d and plain doctor %d: a script must see the same verdict either way", code, plainCode)
+	}
+}
+
+// The trace log rotates (GOV-B26), and the report's decisions must survive it.
+//
+// Right after a rotation the live samples.jsonl holds a few records or none, and the year of
+// decisions before it is in samples.jsonl.1. A report that read only the live file would say
+// "(no gate decisions recorded)" on exactly the machines with the most history — which is
+// the silent failure GOV-40's trap on GOV-B26 named.
+func TestTheReportReadsDecisionsAcrossARotation(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv(trace.StateDirEnv, dir)
+	build := func(ts, outcome string) string {
+		return `{"ts":"` + ts + `","kind":"build","v":3,"build":{"session_id":"1f2e3d4c-5b6a-4789-8abc-def012345678",` +
+			`"shapes":["go test"],"class":"heavy","weight":2,"outcome":"` + outcome + `"}}`
+	}
+	writeFile(t, filepath.Join(dir, "samples.jsonl"+trace.RotatedSuffix),
+		build("2026-11-01T10:00:00Z", "granted")+"\n"+build("2026-11-01T10:00:01Z", "parked")+"\n")
+
+	// No live file at all: the record that filled the log was the last one written.
+	got := recentDecisions()
+	if !strings.Contains(got, "granted") || !strings.Contains(got, "parked") {
+		t.Fatalf("with no live file the report lost the rotated decisions:\n%s", got)
+	}
+
+	// A live file with one newer decision: both generations, oldest first.
+	writeFile(t, filepath.Join(dir, "samples.jsonl"), build("2026-11-01T10:00:02Z", "denied")+"\n")
+	got = recentDecisions()
+	g, p, d := strings.Index(got, "granted"), strings.Index(got, "parked"), strings.Index(got, "denied")
+	if g < 0 || p < 0 || d < 0 || !(g < p && p < d) {
+		t.Fatalf("want granted, parked, denied in that order across .1 and the live file:\n%s", got)
 	}
 }
 

@@ -17,6 +17,8 @@ import (
 	"syscall"
 	"testing"
 	"time"
+
+	"github.com/peter3605/claude-governor/internal/trace"
 )
 
 // Tests for `governor install` / `governor uninstall` (GOV-21).
@@ -895,25 +897,34 @@ func TestInstallLeavesSomebodyElsesBinaryOnThePath(t *testing.T) {
 
 // Plain uninstall keeps the state; --purge removes it.
 //
-// And samples.jsonl survives a plain uninstall either way: design.md section 13.3 says it
-// goes by hand because it is the Phase 0 measurement, and an uninstall that deleted it
-// would throw away the phase the setpoint is derived from.
+// And the trace log survives a plain uninstall, all three of its files: design.md section 13.3
+// says a plain uninstall keeps the record of every gated build (and, where Phase 0 ran, the
+// measurement the setpoint came from), names it on the way out, and leaves deleting it to
+// --purge. GOV-B26 re-decided that rule after Phase 0 closed; the decision is that it holds.
 func TestPurgeRemovesStateAndPlainUninstallDoesNot(t *testing.T) {
 	p := stagedHome(t)
 	installOK(t)
 
 	mkdirAll(t, p.state)
-	writeFileT(t, filepath.Join(p.state, "samples.jsonl"), "{\"sample\":1}\n")
+	traceLog := []string{"samples.jsonl", "samples.jsonl.1", "samples.pre-bound-20261102T000000Z.jsonl"}
+	for _, name := range traceLog {
+		writeFileT(t, filepath.Join(p.state, name), "{\"sample\":1}\n")
+	}
 	writeFileT(t, filepath.Join(p.state, "statusline.json"), "{}\n")
 	writeFileT(t, filepath.Join(p.state, onboardMarker), "2026-09-09T00:00:00Z\n")
 	mkdirAll(t, p.data)
 	writeFileT(t, filepath.Join(p.data, "config.json"), "{\"schema\":1}\n")
 	writeFileT(t, filepath.Join(p.data, onboardMarker), "2026-09-09T00:00:00Z\n")
 
-	uninstallOK(t)
+	out := uninstallOK(t)
 
-	if _, err := os.Stat(filepath.Join(p.state, "samples.jsonl")); err != nil {
-		t.Errorf("plain uninstall removed the Phase 0 measurement: %v", err)
+	for _, name := range traceLog {
+		if _, err := os.Stat(filepath.Join(p.state, name)); err != nil {
+			t.Errorf("plain uninstall removed the trace log's %s: %v", name, err)
+		}
+		if !strings.Contains(out, name+" (") {
+			t.Errorf("plain uninstall kept %s without saying so:\n%s", name, out)
+		}
 	}
 	if _, err := os.Stat(filepath.Join(p.state, "statusline.json")); err == nil {
 		t.Error("plain uninstall left the status line cache behind")
@@ -1620,5 +1631,26 @@ func TestSectionThirteenThreeNamesTheSlashCommand(t *testing.T) {
 		t.Error("design.md does not name commands/governor.md; §13.3 is the normative list " +
 			"of what touches the user's machine, and uninstall is only verifiable while it " +
 			"is exhaustive")
+	}
+}
+
+// design.md §13.3 names every file of the trace log, in the main table and not only Phase 0's.
+//
+// The gate writes samples.jsonl on every install (GOV-17), so a row that lived only in the
+// Phase 0 table described a stock install as touching nothing it does not, and GOV-B26's
+// rotation adds two more names. Uninstall is only verifiable against an exhaustive list.
+func TestSectionThirteenThreeNamesTheTraceLog(t *testing.T) {
+	b, err := os.ReadFile(filepath.Join("..", "..", "docs", "design.md"))
+	if err != nil {
+		t.Fatalf("read design.md: %v", err)
+	}
+	for _, row := range []string{
+		"| `~/.claude/governor/samples.jsonl` | the gate",
+		"| `~/.claude/governor/samples.jsonl" + trace.RotatedSuffix + "` |",
+		"| `~/.claude/governor/samples.pre-bound-<ts>.jsonl` |",
+	} {
+		if !strings.Contains(string(b), row) {
+			t.Errorf("design.md §13.3 has no row starting %q", row)
+		}
 	}
 }

@@ -1,16 +1,23 @@
-// Package trace writes the Phase 0 instrumentation log.
+// Package trace writes the governor's record log: every gated build, and — while the Phase 0
+// instrumentation is installed — every subagent and a 1 Hz reading of the host.
 //
-// Phase 0 (design.md section 5.2, "tune setpoint against the Phase 0 traces") measures what
-// a real machine actually does under real fan-out, so that the control loop's constants come
-// from evidence rather than from feel. Nothing in this package gates, blocks, denies or
-// decides anything — it only records.
+// It began as the Phase 0 instrumentation log (design.md section 5.2, "tune setpoint against
+// the Phase 0 traces"), and Phase 0's `governor trace` family still writes to it. It is no
+// longer only that. Since GOV-17 the shipped gate appends a KindBuild record for every gated
+// Bash command (cmd/governor/buildlog.go), so EVERY install writes here during ordinary
+// operation, whether or not anyone ever ran `governor trace install`. `governor doctor
+// --report` reads those records back as the bug report's recent gate decisions.
+//
+// What it is not: nothing in this package gates, blocks, denies or decides anything — it only
+// records, and every write happens after the decision it records has been made.
 //
 // The log is newline-delimited JSON at ${GOVERNOR_STATE_DIR}/samples.jsonl, defaulting to
-// ~/.claude/governor/samples.jsonl. Two kinds of process append to it concurrently: the 1 Hz
-// sampler, and a hook process per subagent start and stop. Each record is therefore
-// marshalled whole and handed to a single Write on a file opened O_APPEND, which is the
-// standard multiple-appender arrangement — the kernel makes one such write atomic, so
-// records interleave but never tear.
+// ~/.claude/governor/samples.jsonl, and it is BOUNDED (GOV-B26, rotate.go): at MaxBytes it is
+// renamed to samples.jsonl.1 and a fresh file begins. Several processes append to it
+// concurrently — the gate on every gated command, and with Phase 0 installed the sampler and a
+// hook process per subagent event. Each record is therefore marshalled whole and handed to a
+// single Write on a file opened O_APPEND, which is the standard multiple-appender arrangement —
+// the kernel makes one such write atomic, so records interleave but never tear.
 package trace
 
 import (
@@ -235,7 +242,8 @@ func LogPath() (string, error) {
 	return filepath.Join(dir, "samples.jsonl"), nil
 }
 
-// Append writes one record to the log, creating the directory and file if needed.
+// Append writes one record to the log, creating the directory and file if needed, and rotates
+// the log if this record filled it (rotate.go).
 //
 // TS is stamped here rather than by the caller so that every record in the file comes from
 // one clock and one format.
@@ -252,12 +260,28 @@ func Append(r Record) error {
 		return err
 	}
 	defer f.Close()
-	return write(f, r)
+	if err := write(f, r); err != nil {
+		return err
+	}
+	rotateIfFull(f, path)
+	return nil
 }
 
 // Writer holds the log open for a long-lived appender, so the 1 Hz sampler does not pay an
 // open and a close every second.
-type Writer struct{ f *os.File }
+//
+// IT FOLLOWS THE PATH, NOT THE FILE IT FIRST OPENED. A descriptor held for days outlives the
+// file it names: rotation renames the file aside, and a person compressing or deleting the
+// log by hand unlinks it. A writer that kept appending to its original descriptor would then
+// write to .1 forever, or to a file with no name that nothing can read and nothing can delete
+// until the process exits. The second is not hypothetical — on 2026-11-02 a sampler was found
+// still appending to a 724 MB unlinked inode a day after its log had been gzipped. So after
+// every record the writer checks that the path still names its file, and reopens if not.
+// That is two stats a second on a path that is not the gate's, which is nothing.
+type Writer struct {
+	f    *os.File
+	path string
+}
 
 // Open returns a Writer appending to the log.
 func Open() (*Writer, error) {
@@ -265,18 +289,50 @@ func Open() (*Writer, error) {
 	if err != nil {
 		return nil, err
 	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return nil, err
-	}
-	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	f, err := openLog(path)
 	if err != nil {
 		return nil, err
 	}
-	return &Writer{f: f}, nil
+	return &Writer{f: f, path: path}, nil
 }
 
-// Write appends one record.
-func (w *Writer) Write(r Record) error { return write(w.f, r) }
+func openLog(path string) (*os.File, error) {
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return nil, err
+	}
+	return os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+}
+
+// Write appends one record, rotates the log if this record filled it, and moves the writer
+// onto the live file if the one it holds is no longer at the log's path.
+func (w *Writer) Write(r Record) error {
+	if err := write(w.f, r); err != nil {
+		return err
+	}
+	rotateIfFull(w.f, w.path)
+	if !w.current() {
+		// A failed reopen keeps the old descriptor and is retried on the next record. The
+		// record just written is not lost either way: it is in the file the path used to name.
+		if f, err := openLog(w.path); err == nil {
+			w.f.Close()
+			w.f = f
+		}
+	}
+	return nil
+}
+
+// current reports whether the path still names the file the writer holds.
+func (w *Writer) current() bool {
+	held, err := w.f.Stat()
+	if err != nil {
+		return false
+	}
+	at, err := os.Stat(w.path)
+	if err != nil {
+		return false
+	}
+	return os.SameFile(held, at)
+}
 
 // Close releases the file.
 func (w *Writer) Close() error { return w.f.Close() }

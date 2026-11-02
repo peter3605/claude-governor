@@ -233,6 +233,7 @@ func (d *diagnosis) run() {
 	d.checkBudget()
 	d.checkSessions()
 	d.checkLeases()
+	d.checkTraceLog()
 	d.checkStrayDaemons()
 }
 

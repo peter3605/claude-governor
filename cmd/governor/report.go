@@ -67,8 +67,9 @@ const (
 	// one leak could carry.
 	reportLineMax = 240
 	// reportTailBytes is how far back from the end of a file the report reads. samples.jsonl
-	// grows without bound (GOV-B26) and has been seen at hundreds of megabytes; the report
-	// needs its last few records, not all of it.
+	// is bounded at trace.MaxBytes since GOV-B26, but daemon.log is not, a log from before the
+	// bound can still be hundreds of megabytes, and the report needs the last few records of
+	// each, not all of it.
 	reportTailBytes = 512 << 10
 )
 
@@ -302,11 +303,20 @@ func recentDecisions() string {
 		return "(cannot resolve the trace log)"
 	}
 	lines, err := tail(path)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return "(no gate decisions recorded)"
-		}
+	if err != nil && !os.IsNotExist(err) {
 		return fmt.Sprintf("(cannot read the trace log: %v)", err)
+	}
+	// THE LOG ROTATES (GOV-B26), so the newest decisions can be in .1: just after a rotation
+	// the live file holds a handful of records or does not exist yet, and reading it alone
+	// would print "(no gate decisions recorded)" on a machine with a year of them. When the
+	// live file has fewer build records than the report shows, the rotated generation's tail
+	// is read too and put in front, which keeps the order oldest-to-newest.
+	if countBuilds(lines) < reportDecisions {
+		older, err := tail(path + trace.RotatedSuffix)
+		if err != nil && !os.IsNotExist(err) {
+			return fmt.Sprintf("(cannot read the trace log: %v)", err)
+		}
+		lines = append(older, lines...)
 	}
 	type safeBuild struct {
 		SessionID string   `json:"session_id"`
@@ -354,6 +364,18 @@ func recentDecisions() string {
 		return "(no gate decisions recorded)"
 	}
 	return strings.Join(out, "\n")
+}
+
+// countBuilds counts the build records among log lines, cheaply: it is only deciding whether to
+// read further back, so a substring test stands in for decoding every line.
+func countBuilds(lines []string) int {
+	n := 0
+	for _, l := range lines {
+		if strings.Contains(l, `"kind":"build"`) {
+			n++
+		}
+	}
+	return n
 }
 
 // ---------------------------------------------------------------------------

@@ -129,10 +129,13 @@ func resolvePaths() (paths, error) {
 // stateFiles are the files inside the state directory that uninstall removes.
 //
 // Named individually rather than removing the directory wholesale, because design.md
-// section 13.3 says samples.jsonl is removed BY HAND and not by uninstall: it is the Phase 0
-// measurement, and throwing it away on uninstall would throw away the phase. The directory
-// itself is removed only once it is empty, so a machine that still has its samples keeps
-// them and everything else goes.
+// section 13.3 says a plain uninstall KEEPS the trace log (samples.jsonl, its rotated .1, and
+// any samples.pre-bound-*.jsonl): it is the user's record of every gated build and, on a
+// machine that ran Phase 0, the measurement the setpoint came from — neither is
+// reconstructable, and since GOV-B26 it is bounded, so keeping it costs at most about
+// 2 x trace.MaxBytes. --purge removes it with the rest of the state. The directory itself is
+// removed only once it is empty, so a machine that still has its log keeps it and everything
+// else goes.
 // stateFiles is every file the governor writes into the state directory, and it is the list
 // uninstall removes. design.md section 13.3 is the normative version; this must agree with it.
 //
@@ -1212,6 +1215,11 @@ func runUninstall(args []string, stdout, stderr io.Writer) int {
 	if !*purge {
 		fmt.Fprintf(stdout, "\nState kept: %s and %s. Remove them too with: governor uninstall --purge\n",
 			short(p.state), short(p.data))
+		// The trace log by name and size, because "state" undersells it: it is the one file
+		// here that can be large, and an uninstall is the moment people look (GOV-B26).
+		if kept := keptTraceLog(); kept != "" {
+			fmt.Fprintf(stdout, "Trace log kept: %s.\n", kept)
+		}
 	}
 	return 0
 }
@@ -1365,11 +1373,12 @@ func (un *installer) removeTree(path string) {
 	un.record(path, "removed", "")
 }
 
-// removeStateFiles removes the governor's runtime files but keeps the Phase 0 measurement.
+// removeStateFiles removes the governor's runtime files but keeps the trace log.
 //
-// design.md section 13.3 is explicit that samples.jsonl goes by hand and not on uninstall —
-// it is the trace the setpoint is derived from, and an uninstall that deleted it would
-// throw away the phase. So the files are named and the directory goes only if it empties.
+// design.md section 13.3 is explicit that a plain uninstall leaves samples.jsonl and its
+// rotated and set-aside siblings, and --purge removes them: they are the record of every gated
+// build, and deleting a user's history is the louder of the two commands' jobs. So the files
+// are named and the directory goes only if it empties.
 //
 // Named, or matched: stateGlobs covers the residue whose name is not fixed. Both lists are
 // normative in design.md section 13.3, and a path in neither is a path uninstall leaves.

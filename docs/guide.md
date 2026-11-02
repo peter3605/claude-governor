@@ -418,6 +418,18 @@ Another governor daemon has been running on its own socket for a while. This is 
 leftover from development or testing. `doctor` names the pids, and the fix is to `kill` them
 if you did not start them on purpose.
 
+### `governor doctor` warns about `tracelog`
+
+The governor keeps a log of every gated build at `~/.claude/governor/samples.jsonl`. It is what
+`doctor --report` reads, and what the Phase 0 sampler writes to if you installed it with
+`governor trace install`. The log rotates at 16 MiB and keeps one older file,
+`samples.jsonl.1`, so it never takes more than about 32 MiB, and `doctor`'s **`tracelog`**
+check shows both files with their sizes on every run. It warns only about a file over 32 MiB.
+No current build writes one: it is a log from before the bound existed, set aside as
+`samples.pre-bound-<date>.jsonl` the first time a bounded binary wrote to it. Nothing depends
+on it. Keep it, compress it or delete it, as you like. `governor uninstall --purge` removes it
+too.
+
 ### The marketplace install says the command `is ignored inside a Claude Code session`
 
 The marketplace entry runs `governor plugin-path`, and Claude Code accepts a command like that
@@ -451,7 +463,9 @@ recorded on disk.
 Whichever route you installed by, `governor uninstall` removes what `governor install` wrote:
 the plugin tree, the `statusLine` it merged into `~/.claude/settings.json` (your previous value
 is restored, byte for byte), the daemon and its socket. `--purge` also removes the calibrated
-config, the first-run marker and the sample log, which are otherwise kept. The full list of
+config, the first-run marker and the trace log (`samples.jsonl` and its rotated siblings, at
+most about 32 MiB), which are otherwise kept. A plain uninstall names the trace log files it
+kept and their sizes. The full list of
 paths is normative in [§13.3](design.md#133-what-touches-the-users-machine).
 
 Restart open sessions afterwards. They loaded the hooks when they started and keep trying to
