@@ -1,13 +1,14 @@
 # claude-governor — design
 
-**Status:** design agreed, nothing built. **Owner:** Peter. **Last revised:** 2026-09-07.
-**Scope:** tier one (one machine) is what gets built. Tier two is designed, seamed for, and
-not built — see section 12.
-**Published version:** https://claude.ai/code/artifact/58fa604b-6978-49a3-b7ba-af2e49037ddd
+**Status:** shipped, and public since v0.1.1 (Homebrew tap and plugin marketplace); current
+release v0.1.2. **Owner:** Peter. **Last revised:** 2026-11-01.
+**Scope:** tier one (one machine) is built, and is what this document specifies. Tier two is
+designed, seamed for, and not built — see section 12.
 
-A machine-wide admission controller for Claude Code subagents. One daemon holds the CPU
-budget for the whole laptop; every session asks it before fanning out, and gets told a
-number instead of guessing one.
+A machine-wide admission controller for the expensive work Claude Code sessions launch: builds
+and test runs first, subagent spawns second. One daemon holds the CPU budget for the whole
+laptop, counted in build slots; every gated tool call asks it before it runs, and a session that
+wants to plan ahead is told a number instead of guessing one.
 
 This document is the spec a session implements from. Where it says MUST, treat it as an
 invariant and write a test for it. The hook surface it builds on is **confirmed** against
@@ -22,17 +23,36 @@ a session that needs one of those MUST measure it first rather than assuming.
 Several Claude Code sessions running at once on a fanless MacBook Air saturate the machine,
 and every session degrades together — including the one being watched.
 
-The obvious fix is a fixed cap, `slots = cores - 2`. Claude Code's own Workflow tool already
-does exactly this internally (`min(16, cores - 2)`). It is wrong here in both directions:
+**The load is builds and test runs, not the sessions or their subagents.** This was measured,
+not assumed (GOV-03, [phase-0-findings.md](phase-0-findings.md)). Over four days of traces,
+47.5% of all Claude-attributable CPU came from child processes — compilers, test binaries,
+package managers — and it arrived in 9.1% of the seconds, peaking at 7.8 of 8 cores. Session
+and subagent processes are small and steady by comparison: a live subagent adds about a tenth
+of a core at the median and a fifth at p99. Many of those builds are *launched* by subagents,
+which is why limiting subagents feels like it should help, and why this project first set out
+to count them. GOV-03 is what showed that to be the wrong control variable: a budget of four
+agents caps under one core, while the quantity that reaches 7.8 cores arrives through `Bash`
+and is not capped at all.
 
-- **Load is bimodal.** A subagent blocked on the API costs almost nothing. A subagent that
-  has just started `npm test` costs a whole core plus disk. A constant is simultaneously too
-  stingy when six agents are thinking and far too generous when three are compiling.
+**So the rationed quantity is build and test concurrency, counted in slots.** One slot is one
+ordinary (Medium) build; a heavier build weighs more than one slot. A `Bash` call takes a lease
+only when it is build-shaped (§5.5). Subagent spawns still take a lease, weighted at their
+measured cost of about 0.08 slots, so a wide fan-out is still governed without being mistaken
+for the thing that saturates the machine (§4, §5.2, `internal/budget/weight.go`).
+
+The obvious fix is a fixed cap, `slots = cores - 2`. Claude Code's own Workflow tool already
+does exactly this internally for agents (`min(16, cores - 2)`). It is wrong here in both
+directions:
+
+- **Load is bimodal.** In most seconds no build is running at all and a constant is too
+  stingy; when three builds start together, each can take several cores and the same
+  constant is far too generous.
 - **The chassis is fanless.** Sustained multicore load thermally throttles within roughly
   two to four minutes. A cap tuned on a cool machine is the wrong cap on a warm one.
 
-**Therefore:** the allowed count is the output of a feedback controller with a setpoint, not
-a configured constant. The enforcement layer reads whatever the controller currently says.
+**Therefore:** the budget — how many slots may be held at once, across every session on the
+machine — is the output of a feedback controller that reads run-queue depth, not a configured
+constant (§5.2). The enforcement layer reads whatever the controller currently says.
 
 ### Non-goals
 
@@ -41,7 +61,8 @@ a configured constant. The enforcement layer reads whatever the controller curre
 - Not cross-machine *in v1*. CPU does not aggregate across hosts, so multi-host CPU
   governance is N copies of this design. What a second tier governs is a different resource
   — tokens, spend, rate limit — and section 12 specifies it.
-- Never kills a running subagent. See §5.
+- Never kills running work, build or subagent. A smaller budget only starves new grants. See
+  §3, invariant 5.
 
 ---
 
@@ -58,7 +79,7 @@ a configured constant. The enforcement layer reads whatever the controller curre
                                               ┌─────────────┴─────────────┐
                                               │ sampler, 1 Hz             │
                                               │ cpu · runqueue · thermal  │
-                                              │ memory · per-agent cost   │
+                                              │ memory · process-tree cost│
                                               └───────────────────────────┘
 ```
 
@@ -67,12 +88,12 @@ Four components, one binary.
 | Component | Runs as | Lifetime |
 |---|---|---|
 | `governord` | `governor daemon` | long-lived, one per machine, lazily started by the gate |
-| gate | `governor gate` | one process per subagent spawn, milliseconds |
-| release | `governor release` | one process per subagent stop |
+| gate | `governor gate` | one process per gated tool call — every `Bash` call and every subagent spawn (§4.1) — milliseconds |
+| lifecycle hooks | `governor confirm` · `release` · `finish` · `session` | one process per subagent start or stop, `Bash` completion, or session start or end |
 | MCP server | `governor mcp` | stdio child of each Claude Code session |
 
-**Language: Go.** The gate runs on *every* subagent spawn inside a hook Claude Code is
-blocked on. A Node or Python entry point pays 30–50 ms of interpreter startup per call; a
+**Language: Go.** The gate runs on *every* gated tool call — every `Bash` call, not only the
+build-shaped ones, plus every subagent spawn — inside a hook Claude Code is blocked on. A Node or Python entry point pays 30–50 ms of interpreter startup per call; a
 static Go binary pays about two. Go also cross-compiles to one file with no runtime to
 install, which is the whole distribution story. `gopsutil` covers process and CPU
 introspection. The single native piece is a small cgo/Swift shim for
@@ -86,7 +107,7 @@ These are the properties that make the thing usable rather than a liability. Eac
 a test.
 
 1. **The gate fails open.** If the daemon is unreachable, wedged, or slower than the connect
-   deadline, the gate exits 0 and the spawn proceeds ungoverned. A broken governor MUST
+   deadline, the gate exits 0 and the tool call proceeds ungoverned. A broken governor MUST
    never brick a session. Build and test this before anything else.
 2. **Leases expire on their own.** Every lease carries a TTL and an owning PID, and a reaper
    drops both. Assume the stop hooks never fire; leaks are the default outcome, not the edge
@@ -95,9 +116,9 @@ a test.
    emit `permissionDecision: "allow"` — that suppresses the user's own permission prompts as
    a side effect, trading a security regression for nothing.
 4. **The budget never reaches zero.** `B_min = 1`. A machine under thermal duress still makes
-   progress, one agent at a time.
-5. **Shrinking the budget never kills a running agent.** Cutting an agent mid-task discards
-   everything it has already spent. Starve new grants; let running ones finish.
+   progress, one build at a time.
+5. **Shrinking the budget never kills running work.** Cutting a build or a subagent mid-task
+   discards everything it has already spent. Starve new grants; let running ones finish.
 6. **Every live session is guaranteed one slot** before any session gets a second.
 7. **Install is reversible and idempotent.** Running install twice changes nothing the
    second time; uninstall leaves no file, hook, setting or process behind. Anything the
@@ -490,7 +511,7 @@ Three consequences, none of them a defect in the gate:
 - It is **outside** the 100 ms budget, which is enforced inside `main` and so does not start
   until the process is already running. The gate's own accounting is untouched.
 - It means the 120 ms end-to-end ceiling above is exceeded exactly once per installed
-  binary, on the first subagent spawn after an install or upgrade. That is well inside the
+  binary, on the first gated call that reaches the daemon after an install or upgrade. That is well inside the
   30 s hook timeout in §4.1, so it is a one-off stall rather than a failure.
 - §13.4 requires an upgrade to install via `rename(2)` rather than overwriting in place
   (GOV-02). A renamed-in binary is a new file, so it *will* pay this cost on its first gate
@@ -644,18 +665,9 @@ figure — the same answer a non-cgroup machine gives.
 
 ### 5.2 AIMD
 
-> **`B` is a count of build slots, and the loop controls on the run queue.** Two things moved
-> since this section was first written, and both are measured rather than preferred.
-> **What `B` counts** changed in GOV-15: Phase 0 found agent cost small and near-constant while
-> build cost is zero almost always and occasionally enormous, so the rationed quantity became
-> build and test concurrency (docs/phase-0-findings.md §7, §5.5 for what takes a lease).
-> **What the loop reads** changed in GOV-32: host utilisation was the primary input and is now
-> not an input at all, because it saturates at 1.0 under exactly the load this governor exists
-> for and cannot distinguish two builds from eight ([climb-condition.md](climb-condition.md)).
-> Additive increase, multiplicative decrease, the thermal floor and the `demand_waiting` guard
-> all survive both changes. GOV-46 later narrowed the guard to the in-use case, for the reason
-> given below. The constants below are derived against build slots and
-> the reasoning lives at each constant in `internal/budget/aimd.go`.
+`B` is the budget in build slots, the unit §1 sets out. The constants below are derived
+against build slots, and the reasoning for each lives at the constant in
+`internal/budget/aimd.go`.
 
 Borrowed from TCP congestion control, and the right shape for the same reason: reclaim
 headroom cautiously, give it back immediately.
@@ -2090,7 +2102,7 @@ relabels `SubagentStop` when the execution context that finished is not the main
 have no start, no tools, no transcript, and **no `PreToolUse` under any tool name**, confirmed
 with a catch-all matcher watching every tool in every live session.
 
-**So the budget stays driven by agent count**, and GOV-14 and GOV-15 need no correction: over
+**So the gate already sees every spawn**, and GOV-14 and GOV-15 need no correction: over
 a 25 h window the number of agents the gate leased and the number of subagents that actually
 ran were the same nine. What changed instead is one genuine omission — the `SendMessage`
 resume path of §4.1, now gated.
@@ -2342,7 +2354,7 @@ in daily use and the token and spend problem is actually felt.
 
 Packagability is a v1 requirement, not a release chore. A stranger must be able to install
 this in one command and — more importantly — remove it in one command, because what is
-being asked of them is to run a hook on every subagent spawn.
+being asked of them is to run a hook on every `Bash` call and every subagent spawn.
 
 ### 13.1 Principles
 
@@ -2621,7 +2633,8 @@ it added" and "removes things it did not":
   six days, and `~/.claude/governor/` could not empty for as long as they sat there. GOV-33
   fixed the cause by moving the write off the abandonable path (§9), and added `stateGlobs`
   so uninstall sweeps by pattern as well as by name. **Both halves ship, deliberately.**
-  Uninstall is the promise that makes running a hook on every subagent spawn a reasonable ask,
+  Uninstall is the promise that makes running a hook on every `Bash` call and every subagent
+  spawn a reasonable ask,
   and it must not rest on every writer having been correct for the life of the install — a
   machine that accrued residue under the old binary still has to come clean under the new one.
   A new random-suffixed path therefore goes in `stateGlobs` and in this table, not in
