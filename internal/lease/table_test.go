@@ -474,3 +474,35 @@ func TestFitsTakesNothing(t *testing.T) {
 		t.Error("a table that has only been asked questions refused a lease")
 	}
 }
+
+// GOV-48: AdoptSession registers only a session the table has never heard of. It is called
+// from a confirm, which carries no weight and no boost, so it must never overwrite a session
+// that SessionStart registered and somebody has since boosted.
+func TestAdoptSessionNeverOverwritesARegisteredSession(t *testing.T) {
+	tbl := NewTable(Options{})
+	until := time.Now().Add(time.Hour)
+	tbl.StartSession(Session{ID: "s", PID: 10, Weight: 1})
+	if !tbl.Boost("s", 3, until) {
+		t.Fatal("boost refused")
+	}
+	if tbl.AdoptSession(Session{ID: "s", PID: 10}) {
+		t.Error("adopted a session that is already registered")
+	}
+	for _, s := range tbl.Snapshot().Sessions {
+		if s.ID == "s" && s.Weight != 3 {
+			t.Errorf("weight = %d after adopt, want the boosted 3 left alone", s.Weight)
+		}
+	}
+
+	if !tbl.AdoptSession(Session{ID: "new", PID: 11}) {
+		t.Fatal("refused to adopt a session the table has never seen")
+	}
+	if tbl.AdoptSession(Session{ID: "nopid"}) {
+		t.Error("adopted a session with no PID, which the reaper would never collect")
+	}
+	for _, s := range tbl.Snapshot().Sessions {
+		if s.ID == "new" && (s.Weight != 1 || s.StartedAt.IsZero()) {
+			t.Errorf("adopted session = %+v, want weight 1 and a start time", s)
+		}
+	}
+}

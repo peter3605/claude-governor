@@ -168,7 +168,7 @@ func printStatus(stdout io.Writer, c cachedStatus) {
 	// it, so a session sitting at 2 is a fact the others need to be able to see.
 	for _, s := range c.Reply.Sessions {
 		fmt.Fprintf(stdout, "session %s weight %d tentative %d confirmed %d%s\n",
-			s.Session, sessionWeight(s.Weight), s.Tentative, s.Confirmed, liveSuffix(s))
+			s.Session, sessionWeight(s.Weight), s.Tentative, s.Confirmed, liveSuffix(c.Reply, s))
 	}
 }
 
@@ -182,17 +182,36 @@ func sessionWeight(w int) int {
 	return w
 }
 
-// liveSuffix marks a session that is running but has never registered with this daemon.
+// liveSuffix gives a session's governance on its status line, or "" when there is nothing to say.
 //
-// It is the one thing on these lines that is not a number, and it is here because a session in
-// that state is holding no leases and looks identical to an idle governed one — which is the
-// exact misreading GOV-29 was filed about, in the place a person goes to check after the status
-// line has sent them.
-func liveSuffix(s sessionStat) string {
-	if s.Live && !s.Registered {
-		return " ungoverned"
+// It is the one thing on these lines that is not a number. It exists because a session whose
+// hooks never loaded holds no leases and looks identical to an idle governed one, which is
+// the exact misreading GOV-29 was filed about, in the place a person goes to check after the
+// status line has sent them.
+//
+// THE VERDICT IS classifyGovernance's, NOT A TEST OF ITS OWN (GOV-48). This used to print
+// "ungoverned" for any live session the daemon had not registered. That fired for a session
+// holding a confirmed lease, which it can only have got by loading the hooks and running the
+// gate, and for every session immediately after a daemon restart. Those need opposite
+// actions: a session that never loaded the hooks has to be restarted, and one that
+// registered with the previous daemon needs nothing. doctor and the status line already told
+// them apart through the shared classifier. A third surface with its own rule is a surface
+// that tells a person to restart sessions that are fine, until they stop believing the word
+// on the day it is true.
+//
+// The benign case uses doctor's wording, so the two commands use one vocabulary.
+func liveSuffix(reply statusResponse, s sessionStat) string {
+	if !s.Live {
+		return ""
 	}
-	return ""
+	switch g := classifyGovernance(reply, s); {
+	case g.ungoverned():
+		return " ungoverned (" + g.why() + ")"
+	case g == govPreviousDaemon:
+		return " registered with a daemon that has since been replaced"
+	default:
+		return ""
+	}
 }
 
 // statusBudget is the allowance for `governor status`.

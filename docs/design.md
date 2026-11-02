@@ -1615,6 +1615,32 @@ the session verb with a disjoint vocabulary and `slots` is already the gate's le
 anything reports. Three times now, so it is a rule rather than an anecdote: **a key is free only
 after checking every other message on this connection, and a new field is guilty until then.**
 
+**A `confirm` from a session the daemon has never seen registers it (GOV-48).** The session
+table lives in memory, so a daemon that replaced another one starts out knowing nobody. That
+happens on every upgrade. `session start` fires once per session and never again, so before
+this change a replaced daemon could never learn about a session that predated it. Fair share
+(§6.1) was then split across a list missing exactly the long-running sessions, and `status`
+called a session holding a lease "ungoverned". A confirm carries the session's `pid` and
+`pid_started_at`, and it can only come from a session whose hooks are loaded, so it is
+sufficient evidence to register on. The rules:
+
+- **Only an unknown session is registered.** A confirm carries no weight, so it never updates
+  a session that `session start` registered. Updating one would silently reset a
+  `governor boost`.
+- **A confirm with no `pid` registers nothing.** The reaper skips sessions with no PID, so
+  such an entry would stay for the rest of the daemon's life.
+- **It is done on confirm, not acquire.** The gate sends no PID, and finding one means walking
+  the process table on the path every spawn waits on. The confirm hook already does that walk.
+- **The cost is accepted:** a boost set before the restart does not survive it, and the
+  re-registered session starts again at weight 1. A boost is temporary by design (§9.1).
+- **No protocol change.** It uses fields the confirm already sends.
+
+`status` reports each live session through the same classifier as `doctor` and the status
+line. A session that never loaded the hooks is `ungoverned (<reason>)` and must be restarted.
+A session not in the table that started before this daemon is `registered with a daemon that
+has since been replaced` and needs nothing. A session holding a lease is never called
+ungoverned, because the lease itself proves its gate ran.
+
 
 The daemon MUST tolerate a malformed line by closing that connection only. One bad client
 never takes down the broker.

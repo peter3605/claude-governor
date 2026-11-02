@@ -806,6 +806,41 @@ func (t *Table) StartSession(s Session) {
 	t.sessions[s.ID] = s
 }
 
+// AdoptSession registers a session this table has no record of, and reports whether it did.
+// A session it already knows is left exactly as it is.
+//
+// GOV-48. The session table lives in memory, so a daemon that replaced another one starts
+// knowing about nobody, and SessionStart, the only thing that registered a session, fires
+// once per session and never again. Without this a replaced daemon could never learn about
+// a session that started before it, and fair share (section 6.1) was split across a list
+// missing exactly the long-running sessions. A lifecycle hook from such a session proves its
+// hooks are loaded and names its process, which is all registration needs.
+//
+// Only an UNKNOWN session is adopted, never an update, because the caller holds less than
+// SessionStart did: no weight and no boost. Overwriting a registered session would quietly
+// reset a boost somebody set. A session without a PID is refused, because the reaper skips
+// sessions with no PID (deadSessionsLocked), so adopting one would keep it in the table
+// for the rest of this daemon's life.
+func (t *Table) AdoptSession(s Session) bool {
+	if s.ID == "" || s.PID <= 0 {
+		return false
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	if _, ok := t.sessions[s.ID]; ok {
+		return false
+	}
+	if s.Weight <= 0 {
+		s.Weight = 1
+	}
+	if s.StartedAt.IsZero() {
+		s.StartedAt = t.opt.Now()
+	}
+	t.sessions[s.ID] = s
+	return true
+}
+
 // Reap drops leases that have outlived their TTL, leases whose registered session is gone,
 // and confirmed leases whose own owner is gone. It returns how many it dropped.
 //
