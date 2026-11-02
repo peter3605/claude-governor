@@ -1786,7 +1786,8 @@ func sourceName(quotas []budget.Quota) string {
 
 // loadCalibration reads what `governor calibrate` measured for this host.
 //
-// IT IS READ ONCE, IN THE DAEMON, AND NEVER ON THE HOT PATH. The gate's whole cost is process
+// IT IS READ IN THE DAEMON — at startup, and again by reloadConfig when the file changes — AND
+// NEVER ON THE HOT PATH. The gate's whole cost is process
 // start (~6 ms against ~0.6 ms of round trip, measured in GOV-15), so adding a file read to
 // every Bash call to look up a constant would be spending the one budget that matters on
 // information the daemon already has. The daemon holds it and the gate asks the daemon, which
@@ -1804,21 +1805,37 @@ func sourceName(quotas []budget.Quota) string {
 // names the path it resolved and says what it found there, so the log of any daemon answers
 // "which config is this running" without reproducing anything.
 func loadCalibration(diag io.Writer) (config.Config, loadedConfig) {
+	c, loaded, err := readCalibration(diag)
+	if err != nil {
+		fmt.Fprintf(diag, "governor daemon: %v, using built-in defaults\n", err)
+		return config.Config{}, loaded
+	}
+	return c, loaded
+}
+
+// readCalibration is loadCalibration without the fallback: a config that is present but cannot
+// be used — unreadable, malformed, or written by a newer schema — comes back as an error, so
+// that each caller chooses what to fall back TO. At startup that is the compiled-in defaults,
+// because there is nothing else. On a reload it is the calibration the daemon already had
+// (GOV-B22): a running daemon that drops to defaults because a file it read fine a second ago
+// went bad would turn a broken config into a governor that suddenly allows more.
+//
+// A missing file is not an error here either. It is a state — never calibrated — and both
+// callers treat it as one.
+func readCalibration(diag io.Writer) (config.Config, loadedConfig, error) {
 	path, err := config.Path()
 	if err != nil {
-		fmt.Fprintf(diag, "governor daemon: cannot locate config, using built-in defaults: %v\n", err)
-		return config.Config{}, loadedConfig{}
+		return config.Config{}, loadedConfig{}, fmt.Errorf("cannot locate config: %w", err)
 	}
 	loaded := loadedConfig{Path: path}
 	if _, err := os.Stat(path); os.IsNotExist(err) {
 		fmt.Fprintf(diag, "governor daemon: config %s: not found, using built-in defaults\n", path)
-		return config.Config{}, loaded
+		return config.Config{}, loaded, nil
 	}
 	store := &config.FileStore{Path: path, Warn: func(s string) { fmt.Fprintln(diag, s) }}
 	c, err := store.Load(context.Background())
 	if err != nil {
-		fmt.Fprintf(diag, "governor daemon: config %s: cannot read it, using built-in defaults: %v\n", path, err)
-		return config.Config{}, loaded
+		return config.Config{}, loaded, fmt.Errorf("config %s: cannot read it: %w", path, err)
 	}
 	loaded.Found = true
 	loaded.BMax, loaded.RunQueueMax, loaded.CalibratedAt = c.BMax, c.RunQueueMax, c.CalibratedAt
@@ -1828,7 +1845,7 @@ func loadCalibration(diag io.Writer) (config.Config, loadedConfig) {
 		fmt.Fprintf(diag, "governor daemon: config %s: found, calibrated %s (b_max %d, run-queue cut %g)\n",
 			path, c.CalibratedAt, c.BMax, c.RunQueueMax)
 	}
-	return c, loaded
+	return c, loaded, nil
 }
 
 // resolveRunQueueMax picks the threshold this daemon cuts at, from three possible sources.

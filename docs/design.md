@@ -1006,6 +1006,18 @@ than leaving it alone, because `loadavg1` is already a one-minute average and th
 already the slower of the two on a rising edge. Writing either would be the exact failure GOV-32
 named when it struck the setpoint from GOV-25's own acceptance criteria.
 
+**A calibration takes effect on the running daemon's next tick, with nothing restarted.** The
+daemon stats `config.json` once per sampling tick and reloads it when the file's identity
+(existence, mtime, size) changes; a `calibrate` written under it, by hand or by `install`, is
+being served within a second (GOV-44, GOV-B22). That is why `install` can start the daemon
+before it calibrates — so the measurement sees the machine as the governor will find it — and
+still finish on the new numbers. The stat costs about 2 µs a second, against §5.1's
+1%-of-a-core bar (`BenchmarkConfigStamp`). The reload keeps both rules above: b_max still only
+lowers `MaxSlots(capacity)`, and `GOVERNOR_RUNQUEUE_MAX` still beats the file. A file that has
+gone bad — unreadable, malformed, a newer schema — is logged and the daemon **keeps the
+calibration it had**, rather than falling to the compiled-in defaults, which are the looser
+limit. §13.4 has the rest.
+
 [calibration.md](calibration.md) carries the re-sweep of the threshold against this loop.
 
 ### 5.3 Thermal
@@ -2820,7 +2832,7 @@ every calibration differs at least in `calibrated_at`.
 
 ### 13.4 Config and upgrade
 
-Config is `<state dir>/config.json` — `~/.claude/governor/config.json` by default — carrying `"schema": 1`. A daemon reads it at startup, logs the path it resolved and what it found there, re-reads it when it changes (once per sampling tick, never on the hot path), and reports what it loaded in `status`, where `doctor`'s `loaded` check compares it with the file (GOV-44). Unknown keys warn and
+Config is `<state dir>/config.json` — `~/.claude/governor/config.json` by default — carrying `"schema": 1`. A daemon reads it at startup, logs the path it resolved and what it found there, re-reads it when it changes (once per sampling tick, never on the hot path), and reports what it loaded in `status`, where `doctor`'s `loaded` check compares it with the file (GOV-44). So a calibration needs no restart, and `install` leaving a healthy daemon alone does not leave it on stale numbers. A config that cannot be used is handled differently at the two points it is read: at startup the daemon falls back to the built-in defaults, because it has nothing else; on a reload it keeps the values it was already serving and logs why (GOV-B22), so a corrupt or newer-schema file written mid-run never loosens a running governor. The gate reads none of this — it asks the daemon. Unknown keys warn and
 are preserved, never crash — a config written by a newer version must not brick an older
 binary. Migration happens on read; the write is atomic (temp file, rename).
 

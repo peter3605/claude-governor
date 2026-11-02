@@ -283,3 +283,134 @@ func loadsItsConfig(d *daemon) {
 	_, loaded := loadCalibration(io.Discard)
 	d.loaded = &loaded
 }
+
+// TestAFailedReloadKeepsTheCalibrationItHad is GOV-B22 clause 4: a config that goes bad under a
+// running daemon — unreadable, or written by a newer schema — leaves the daemon governing on
+// what it had, not on the compiled-in defaults. The defaults are the looser limit (a calibrated
+// b_max only ever lowers the ceiling), so falling back to them would answer a corrupt file by
+// allowing more.
+func TestAFailedReloadKeepsTheCalibrationItHad(t *testing.T) {
+	cases := []struct {
+		name  string
+		spoil func(t *testing.T, path string)
+	}{
+		{"newer schema", func(t *testing.T, path string) {
+			writeConfig(t, path, map[string]any{"schema": config.Schema + 1, "b_max": 9, "run_queue_max": 9.5})
+		}},
+		{"malformed", func(t *testing.T, path string) {
+			if err := os.WriteFile(path, []byte("{ not json"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{"unreadable", func(t *testing.T, path string) {
+			if os.Geteuid() == 0 {
+				t.Skip("root reads a mode-000 file")
+			}
+			// New content first: a chmod alone changes neither mtime nor size, and a file
+			// that went unreadable without changing is not a reload at all.
+			writeConfig(t, path, map[string]any{"schema": config.Schema, "b_max": 9, "run_queue_max": 9.5,
+				"calibrated_at": "2026-11-01T00:00:00Z"})
+			if err := os.Chmod(path, 0); err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { os.Chmod(path, 0o600) })
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			state := t.TempDir()
+			t.Setenv(transport.StateDirEnv, state)
+			t.Setenv(runQueueMaxEnv, "")
+			path := filepath.Join(state, config.File)
+
+			var diag bytes.Buffer
+			d := &daemon{diag: &diag, loop: &budget.Controller{Max: 6}}
+			_, loaded := loadCalibration(&diag)
+			d.loaded, d.configStamp = &loaded, stampOf(path)
+			writeConfig(t, path, map[string]any{"schema": config.Schema, "b_max": 4, "run_queue_max": 4.72,
+				"calibrated_at": "2026-10-31T19:14:30Z"})
+			d.reloadConfig()
+			if d.calibratedBMax != 4 || d.loop.RunQueueMax != 4.72 {
+				t.Fatalf("setup: the good calibration did not load: b_max %d, cut %g", d.calibratedBMax, d.loop.RunQueueMax)
+			}
+
+			tc.spoil(t, path)
+			diag.Reset()
+			d.reloadConfig()
+
+			if d.calibratedBMax != 4 || d.ceiling(8) != 4 || d.loop.RunQueueMax != 4.72 {
+				t.Fatalf("a failed reload moved the daemon off its calibration: b_max %d, ceiling(8) %d, cut %g\n%s",
+					d.calibratedBMax, d.ceiling(8), d.loop.RunQueueMax, diag.String())
+			}
+			if got := d.statusConfig(); !got.Found || got.CalibratedAt != "2026-10-31T19:14:30Z" || got.RunQueueCut != 4.72 {
+				t.Fatalf("status no longer reports the calibration being served: %+v", got)
+			}
+			if !strings.Contains(diag.String(), "keeping the calibration it had") {
+				t.Fatalf("a failed reload was not logged as one: %s", diag.String())
+			}
+
+			// Logged once per change, not once a tick.
+			diag.Reset()
+			d.reloadConfig()
+			if diag.Len() != 0 {
+				t.Fatalf("an unchanged bad file was re-read on the next tick: %s", diag.String())
+			}
+
+			// And the next good write is picked up as normal.
+			os.Chmod(path, 0o600)
+			writeConfig(t, path, map[string]any{"schema": config.Schema, "b_max": 3, "run_queue_max": 5.1,
+				"calibrated_at": "2026-11-01T09:00:00Z"})
+			d.reloadConfig()
+			if d.calibratedBMax != 3 || d.loop.RunQueueMax != 5.1 {
+				t.Fatalf("the daemon stopped reloading after a bad file: b_max %d, cut %g", d.calibratedBMax, d.loop.RunQueueMax)
+			}
+		})
+	}
+}
+
+// TestAReloadDoesNotOverrideTheRunQueueEnv: GOVERNOR_RUNQUEUE_MAX beats config.json at startup
+// (resolveRunQueueMax), and a reload must not quietly reverse that. tools/sweep sets the
+// variable to measure one threshold; a calibration landing mid-sweep that swapped it out would
+// produce a confident wrong number.
+func TestAReloadDoesNotOverrideTheRunQueueEnv(t *testing.T) {
+	state := t.TempDir()
+	t.Setenv(transport.StateDirEnv, state)
+	t.Setenv(runQueueMaxEnv, "3.3")
+	path := filepath.Join(state, config.File)
+
+	d := &daemon{diag: io.Discard, loop: &budget.Controller{Max: 6, RunQueueMax: 3.3}}
+	_, loaded := loadCalibration(io.Discard)
+	loaded.RunQueueOverride = runQueueMaxOverride(io.Discard)
+	d.loaded, d.configStamp = &loaded, stampOf(path)
+
+	writeConfig(t, path, map[string]any{"schema": config.Schema, "b_max": 4, "run_queue_max": 4.72,
+		"calibrated_at": "2026-10-31T19:14:30Z"})
+	d.reloadConfig()
+
+	if d.loop.RunQueueMax != 3.3 {
+		t.Fatalf("a reload let config.json's cut %g override the environment's 3.3: now cutting at %g", 4.72, d.loop.RunQueueMax)
+	}
+	if d.calibratedBMax != 4 {
+		t.Fatalf("the env var covers the run-queue cut only, but b_max did not reload: %d", d.calibratedBMax)
+	}
+	got := d.statusConfig()
+	if got.RunQueueOverride != 3.3 {
+		t.Fatalf("the reload dropped the override from status: %+v", got)
+	}
+	if why := calibrationDrift(got, 4, path, config.Config{BMax: 4, RunQueueMax: 4.72, CalibratedAt: "2026-10-31T19:14:30Z"}, true); why != "" {
+		t.Fatalf("a sweep's daemon is called stale for obeying its override: %s", why)
+	}
+}
+
+// BenchmarkConfigStamp is the per-tick cost of noticing a new calibration (design.md 5.1's
+// 1%-of-a-core bar). reloadConfig does one stat a second and nothing else when the file has
+// not changed.
+func BenchmarkConfigStamp(b *testing.B) {
+	path := filepath.Join(b.TempDir(), config.File)
+	if err := os.WriteFile(path, []byte(`{"schema":1}`), 0o600); err != nil {
+		b.Fatal(err)
+	}
+	for i := 0; i < b.N; i++ {
+		stampOf(path)
+	}
+}
