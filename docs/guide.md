@@ -277,17 +277,13 @@ and which numbers were kept rather than re-measured.
   never produced an answer it trusted, so the ceiling comes from the raw core count. Run
   calibrate again.
 
-**Calibration takes effect when the daemon next starts.** The daemon reads its config once, at
-start-up ([§13.4](design.md#134-config-and-upgrade)), and `governor install` leaves a healthy
-daemon alone. So after re-running calibrate, restart the daemon yourself, the same way
-`governor doctor` names it:
-
-```sh
-kill $(cat ~/.claude/governor/daemon.pid) && governor install
-```
-
-`governor install` runs calibrate after it has started the daemon, so this applies to a fresh
-install too. Until the daemon restarts, it runs on the shipped defaults.
+**Calibration takes effect straight away.** The running daemon checks its config once a second
+and picks up a new calibration on its own, so there is nothing to restart, after `governor
+calibrate` or after `governor install`. `calibrate` waits for the daemon to catch up and only
+says something if it has not, which means the daemon is older than this version: run `governor
+install` to replace it. If the config file is damaged or was written by a newer governor, a
+running daemon keeps the limits it already had and `governor doctor` reports the file
+([§13.4](design.md#134-config-and-upgrade)).
 
 ---
 

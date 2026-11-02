@@ -171,7 +171,21 @@ func (d *daemon) reloadConfig() {
 		return
 	}
 	fmt.Fprintf(d.diag, "governor daemon: config %s changed, reloading\n", path)
-	cal, loaded := loadCalibration(d.diag)
+	cal, loaded, err := readCalibration(d.diag)
+	if err != nil {
+		// A FAILED RELOAD KEEPS WHAT THE DAEMON HAD (GOV-B22). Startup falls back to the
+		// compiled-in defaults because it has nothing else; a running daemon does, and the
+		// defaults are usually the LOOSER limit — b_max only ever lowers the ceiling — so
+		// falling back to them would answer a corrupt or newer-schema file by allowing more.
+		// The stamp still advances, so this is logged once per change to the file rather
+		// than once a second until someone fixes it; the next write is reloaded as normal.
+		// doctor reads the same file itself and reports it unreadable, so nothing is hidden.
+		fmt.Fprintf(d.diag, "governor daemon: %v; keeping the calibration it had\n", err)
+		d.signalsMu.Lock()
+		d.configStamp = now
+		d.signalsMu.Unlock()
+		return
+	}
 	loaded.RunQueueOverride = override
 	threshold := resolveRunQueueMax(cal, d.diag)
 
