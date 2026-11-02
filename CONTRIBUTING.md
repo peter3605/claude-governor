@@ -94,13 +94,17 @@ and that widening hid the bug the test exists to catch.
   `timed` helper: the gate, the status line, onboarding). These subtract the runner's own
   measured lateness from the elapsed time instead of allowing more time. If one starts failing
   intermittently, the fix is not a bigger number; the comment at the top of that file explains
-  why.
+  why. The status line's ceiling also logs, rather than fails, a run where the runner's
+  lateness alone exceeded the whole ceiling, because nothing under it can be measured on that
+  run. Its content is still checked.
 - **The wait queue** (`cmd/governor/wait_test.go`). These assert the order of two events, not
   how long they took.
 - **Lazy daemon start** (`TestGateStartsADaemonOnlyWhenNothingIsListening` in
-  `cmd/governor/lazystart_test.go`). Its "accepts and never answers" case currently asserts
-  which of two racing deadlines prints its message first. Under load either one can win, so it
-  fails occasionally with the gate behaving correctly. This is a known open issue.
+  `cmd/governor/lazystart_test.go`). Its "accepts and never answers" case does not assert
+  which of two racing deadlines prints its message, because under load either can win. It
+  asserts that no daemon was started, and that the wedged listener received the gate's request,
+  which proves the gate reached it. If the gate's budget ran out before it even dialled, the
+  run tested nothing and is reported as a skip.
 - **Doctor's exec budget** (`TestDoctorCatchesHooksRunningADifferentBuild`). Doctor gives each
   child process 2 seconds, and on a saturated machine this test can take exactly that long.
   `TestTheEffectiveBudgetIsTheMinimumOfLocalAndRemote` is load-sensitive in the same way.

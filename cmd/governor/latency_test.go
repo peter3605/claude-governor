@@ -90,6 +90,25 @@ func (l latency) own() time.Duration { return l.elapsed - l.noise }
 // exceeds reports whether the code — not the runner — went over the ceiling.
 func (l latency) exceeds(ceiling time.Duration) bool { return l.own() > ceiling }
 
+// inconclusive reports whether this run cannot say anything about the ceiling at all: the
+// runner was late by more than the whole ceiling, so no regression smaller than the load is
+// measurable on it (see "what the discount costs" above).
+//
+// WHY THIS EXISTS, AND WHY IT IS NOT A WIDER CEILING (GOV-B19). The discount subtracts the
+// single worst late wakeup, which is sound for one stall and undercounts an operation that
+// was descheduled more than once. A darwin/arm64 runner did exactly that on PR #72:
+// "took 218ms (124ms of it scheduler lateness), want under 70ms" for a statusline that reads
+// a corrupt cache and makes one local round trip. Summing every late wakeup instead was
+// measured and REJECTED: under GOMAXPROCS=1 with four spinners it discounted a genuine 200 ms
+// stall to 0–18 ms, because a starved pacer is late on every tick even while the operation is
+// asleep and losing nothing. The worst-of estimator still charged that stall 96–198 ms. So
+// the estimator stays, the ceiling stays, and a run whose noise alone exceeds the ceiling is
+// reported as unmeasurable rather than as a failure of code that did nothing wrong.
+//
+// What it costs: a real regression is missed on the runs that are this starved, and caught
+// on every other. Measured idle, the 200 ms stall carried no noise at all.
+func (l latency) inconclusive(ceiling time.Duration) bool { return l.noise >= ceiling }
+
 // String is written for the failure message, so it shows the split rather than hiding it.
 // A reader who sees a large lateness figure is looking at a runner problem; a reader who
 // sees a small one is looking at a real regression.
@@ -153,6 +172,30 @@ func timed(op func()) latency {
 // Only the direction is asserted, never a figure: how late a goroutine runs is the property
 // of the machine this suite happens to be on, and a test that pinned a number for it would
 // be the same mistake in a new place.
+// TestALatencyTooNoisyToJudgeIsNotAFailure pins the three verdicts on the figures that
+// produced them (GOV-B19): the darwin/arm64 run that flaked, the 200 ms stall the ceilings
+// exist to catch (GOV-B08's "206ms (1ms of it scheduler lateness)"), and an ordinary pass.
+func TestALatencyTooNoisyToJudgeIsNotAFailure(t *testing.T) {
+	const ceiling = 70 * time.Millisecond
+	for _, tc := range []struct {
+		name         string
+		l            latency
+		inconclusive bool
+		exceeds      bool
+	}{
+		{"the PR #72 flake: starved past the whole ceiling", latency{218 * time.Millisecond, 124 * time.Millisecond}, true, true},
+		{"a real 200 ms stall on a runner that was on time", latency{206 * time.Millisecond, time.Millisecond}, false, true},
+		{"an ordinary pass", latency{3 * time.Millisecond, 0}, false, false},
+	} {
+		if got := tc.l.inconclusive(ceiling); got != tc.inconclusive {
+			t.Errorf("%s: inconclusive = %v, want %v", tc.name, got, tc.inconclusive)
+		}
+		if got := tc.l.exceeds(ceiling); got != tc.exceeds {
+			t.Errorf("%s: exceeds = %v, want %v", tc.name, got, tc.exceeds)
+		}
+	}
+}
+
 func TestTimedChargesTheRunnerForItsOwnLateness(t *testing.T) {
 	t.Run("the split is well formed", func(t *testing.T) {
 		took := timed(func() { time.Sleep(5 * time.Millisecond) })

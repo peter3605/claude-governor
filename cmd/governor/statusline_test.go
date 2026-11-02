@@ -203,7 +203,12 @@ func runStatuslineWithin(t *testing.T, endpoint, payload string, width int, budg
 	})
 	line := strings.TrimSuffix(stdout.String(), "\n")
 
-	if took.exceeds(statuslineCeiling) {
+	switch {
+	case took.inconclusive(statuslineCeiling):
+		// Logged, not failed, and the content checks below still run (GOV-B19).
+		t.Logf("latency not judged: took %v, and a runner late by more than the whole %v "+
+			"ceiling cannot measure anything under it", took, statuslineCeiling)
+	case took.exceeds(statuslineCeiling):
 		t.Errorf("took %v, want under %v (stderr: %s)", took, statuslineCeiling, stderr.String())
 	}
 	if line == "" {
