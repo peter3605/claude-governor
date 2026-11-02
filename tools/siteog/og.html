@@ -1,0 +1,34 @@
+<!DOCTYPE html>
+<!--
+  The source of site/og.png, the page's social preview (GOV-42 clause 5). It carries no measured
+  figure on purpose: a number baked into a PNG is one site_test.go cannot read, and so one that
+  could drift. Regenerate from the repository root with:
+
+    "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" --headless=new --hide-scrollbars \
+      --window-size=1200,630 --allow-file-access-from-files \
+      --screenshot="$PWD/site/og.png" "file://$PWD/tools/siteog/og.html"
+-->
+<html><head><meta charset="utf-8"><style>
+@font-face{font-family:DG;src:url(../../site/fonts/dotgothic16-400.woff2)}
+@font-face{font-family:PM;font-weight:400;src:url(../../site/fonts/ibmplexmono-400.woff2)}
+@font-face{font-family:PM;font-weight:700;src:url(../../site/fonts/ibmplexmono-700.woff2)}
+@font-face{font-family:VT;src:url(../../site/fonts/vt323-400.woff2)}
+html,body{margin:0;width:1200px;height:630px;overflow:hidden;background:#0a0910;color:#ece7de;font-family:PM}
+.rail{position:absolute;left:0;top:0;bottom:0;width:34px;background:#110f18;border-right:1px solid #2d2740;background-image:radial-gradient(circle at 17px 14px,#0a0910 4.5px,transparent 5px);background-size:34px 34px}
+.scan{position:absolute;inset:0;background:repeating-linear-gradient(to bottom,rgba(255,255,255,.03) 0 1px,transparent 1px 3px)}
+.in{position:absolute;left:84px;top:58px;right:60px}
+.tag{font-size:15px;font-weight:700;letter-spacing:.3em;color:#5d5572}.tag b{color:#ff3d9a}
+h1{font-family:DG;font-weight:400;font-size:92px;line-height:.95;margin:26px 0 0;text-transform:uppercase;letter-spacing:-.02em}
+h1 span{display:block}.c2{color:#ffaa1d;margin-left:.9em}.c3{color:#ff3d9a}
+.def{margin-top:34px;font-size:22px;max-width:46ch;border-left:3px solid #ff3d9a;padding-left:18px;color:#8b82a0}.def b{color:#ffaa1d}
+.mark{position:absolute;left:84px;bottom:40px;font-family:DG;font-size:26px;color:#ffaa1d;text-transform:uppercase}.mark b{color:#5d5572;font-weight:400}
+.rd{position:absolute;right:60px;top:64px;border:1px solid #2d2740;background:#171423;padding:16px 20px;font-size:15px;color:#8b82a0;width:270px}
+.rd h4{margin:0 0 10px;font-size:12px;letter-spacing:.24em;color:#ffaa1d;text-transform:uppercase;border-bottom:1px solid #2d2740;padding-bottom:8px}
+.rd div{display:flex;justify-content:space-between}.bad{color:#ff3d9a}.ok{color:#23d6da}
+</style></head><body><div class="rail"></div>
+<div class="in"><div class="tag">SYS.LOAD // <b>CONTENTION DETECTED</b></div>
+<h1><span>Six sessions.</span><span class="c2">One laptop.</span><span class="c3">Everything crawls.</span></h1>
+<p class="def"><b>A jobserver for Claude Code.</b> One budget for the whole machine. Every session asks before it builds.</p></div>
+<div class="rd"><h4>One budget · every session</h4><div><span>macOS + Linux</span><span class="ok">static binary</span></div><div><span>no sudo</span><span class="ok">no telemetry</span></div></div>
+<div class="mark">Build Governor<b> / claude-governor</b></div>
+<div class="scan"></div></body></html>

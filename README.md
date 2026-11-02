@@ -1,5 +1,8 @@
 # claude-governor
 
+**[peter3605.github.io/claude-governor](https://peter3605.github.io/claude-governor/)** — what it does,
+the measurement that shows it working, and how to install it, on one page.
+
 Two promises come first, because what this asks of you is to run a hook on every subagent spawn
 and every build:
 

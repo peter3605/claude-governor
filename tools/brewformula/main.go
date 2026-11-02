@@ -30,6 +30,11 @@ import (
 // be public for anyone but its owner to install from it.
 const repo = "peter3605/claude-governor"
 
+// homepage is the project's landing page (GOV-42), served by GitHub Pages from site/. It is the
+// formula's homepage rather than the repository because it is the page written for someone
+// deciding whether to install; cmd/governor/site_test.go holds every route in to this URL.
+const homepage = "https://peter3605.github.io/claude-governor/"
+
 // targets are the four release artefacts, in the order the formula lists them. Each must appear
 // in checksums.txt or the formula is refused: a platform block with no digest would install
 // whatever the URL returns.
@@ -98,10 +103,10 @@ func write(w io.Writer, version string, checksums io.Reader) error {
 		plats = append(plats, platform{t.brewOS, t.brewArch, asset, sum})
 	}
 	return formula.Execute(w, struct {
-		Repo, Version string
-		Prerelease    bool
-		Mac, Linux    []platform
-	}{repo, version, strings.Contains(version, "-"), plats[:2], plats[2:]})
+		Repo, Homepage, Version string
+		Prerelease              bool
+		Mac, Linux              []platform
+	}{repo, homepage, version, strings.Contains(version, "-"), plats[:2], plats[2:]})
 }
 
 // THERE IS NO version LINE, and that is brew's rule rather than an omission. Every URL carries
@@ -128,7 +133,7 @@ func write(w io.Writer, version string, checksums io.Reader) error {
 // upgrading from an older release still has the link until this very command retires it.
 var formula = template.Must(template.New("formula").Parse(`class Governor < Formula
   desc "Machine-wide build and subagent budget for Claude Code sessions"
-  homepage "https://github.com/{{.Repo}}"
+  homepage "{{.Homepage}}"
 {{- if .Prerelease}}
   version "{{.Version}}"
 {{- end}}

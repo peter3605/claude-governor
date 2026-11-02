@@ -284,6 +284,12 @@ release that bumps the protocol or the config schema says so (`governor version`
 There is no `Unreleased` section to promote, so the entry is written fresh from
 `git log vPREVIOUS..origin/main`.
 
+**Bump the landing page's version in the same pull request.** [site/index.html](site/index.html)
+shows the version twice, and `TestEveryFigureOnThePageMatchesItsSource` holds both to the newest
+CHANGELOG heading, so the entry's PR fails CI until they agree. That is deliberate: the page is
+what a stranger reads before installing, and it should never advertise a release other than the
+one `install.sh` fetches. Merging the PR republishes the page (`.github/workflows/pages.yml`).
+
 ### 2. Tag a green `main` with an annotated tag
 
 ```sh

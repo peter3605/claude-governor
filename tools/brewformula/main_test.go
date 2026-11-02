@@ -45,7 +45,7 @@ func TestEveryPlatformGetsItsOwnURLAndDigest(t *testing.T) {
 	if strings.Contains(f, "\n  version ") {
 		t.Errorf("formula states a version; brew scans it from the URL and audit rejects it as redundant:\n%s", f)
 	}
-	for _, want := range []string{`license "MIT"`, "governor install", "governor uninstall"} {
+	for _, want := range []string{`license "MIT"`, `homepage "` + homepage + `"`, "governor install", "governor uninstall"} {
 		if !strings.Contains(f, want) {
 			t.Errorf("formula does not contain %q", want)
 		}
