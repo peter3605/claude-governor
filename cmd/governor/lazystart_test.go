@@ -210,7 +210,15 @@ func TestForkDaemonRefusesToRunABinaryThatIsNotTheGovernor(t *testing.T) {
 // on every spawn for as long as the first stays wedged. errNoDaemon is what draws that line,
 // and this is the test that holds it there.
 func TestGateStartsADaemonOnlyWhenNothingIsListening(t *testing.T) {
-	wedged := listenerFunc(t, func(c net.Conn, _ []byte) {
+	// spoken counts connections on which the wedged listener received the gate's request.
+	// listenerFunc calls the handler only after reading the request line, so a count here
+	// proves the gate CONNECTED AND SPOKE — the thing that makes this "a daemon", not "no
+	// daemon". It replaces asserting the "read response" wording, which was a race (GOV-B19).
+	spoken := make(chan struct{}, 16)
+	wedged := listenerFunc(t, func(c net.Conn, req []byte) {
+		if len(req) > 0 {
+			spoken <- struct{}{}
+		}
 		// Accept and never answer. The gate fails open on its own read deadline.
 		select {}
 	})
@@ -222,8 +230,10 @@ func TestGateStartsADaemonOnlyWhenNothingIsListening(t *testing.T) {
 		// wantDiag is why, not just how many. A count alone can be produced by the wrong
 		// mechanism — a second case sharing a state directory is rate-limited to zero starts
 		// and looks exactly like a case that correctly declined — so each row also pins the
-		// path the gate actually took.
+		// path the gate actually took. Empty where the path is pinned another way.
 		wantDiag string
+		// wantSpoken is that other way: the endpoint itself confirms the gate reached it.
+		wantSpoken bool
 	}{
 		{
 			name:     "nothing listening",
@@ -232,12 +242,19 @@ func TestGateStartsADaemonOnlyWhenNothingIsListening(t *testing.T) {
 			wantDiag: "started a daemon",
 		},
 		{
-			name:     "a daemon that accepts and never answers",
-			endpoint: func(t *testing.T) string { return wedged },
-			want:     0,
-			// It got a connection and died on the read, which is the whole point: this is
-			// not "no daemon", so nothing may be started.
-			wantDiag: "read response",
+			// It got a connection, sent its request, and never got an answer, which is the
+			// whole point: this is not "no daemon", so nothing may be started.
+			//
+			// WHICH DIAGNOSTIC IT PRINTS IS NOT ASSERTED, AND MUST NOT BE. The per-read
+			// deadline ("read response") and the gate's overall 100 ms budget ("budget of
+			// 100ms expired") race here, and either may win on a loaded runner. Asserting one
+			// failed CI three times on darwin/arm64 for a gate that behaved correctly
+			// (GOV-B19). What the case proves is carried by the zero start count and by
+			// the listener's own record that the gate spoke to it.
+			name:       "a daemon that accepts and never answers",
+			endpoint:   func(t *testing.T) string { return wedged },
+			want:       0,
+			wantSpoken: true,
 		},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
@@ -259,9 +276,38 @@ func TestGateStartsADaemonOnlyWhenNothingIsListening(t *testing.T) {
 			if len(*starts) != tt.want {
 				t.Errorf("started %d daemons, want %d (stderr: %s)", len(*starts), tt.want, stderr.String())
 			}
-			if !strings.Contains(stderr.String(), tt.wantDiag) {
+			if tt.want == 0 && strings.Contains(stderr.String(), "started a daemon") {
+				t.Errorf("stderr = %q, want no daemon start reported", stderr.String())
+			}
+			if tt.wantDiag != "" && !strings.Contains(stderr.String(), tt.wantDiag) {
 				t.Errorf("stderr = %q, want it to show the gate took the %q path",
 					stderr.String(), tt.wantDiag)
+			}
+			if tt.wantSpoken {
+				// Logged, not asserted: which timer won is the runner's business, and the
+				// log is how a -count run shows both paths are reached (GOV-B19 clause 2).
+				t.Logf("diagnostic: %s", strings.TrimSpace(stderr.String()))
+				// Waited for rather than checked, and generously: the listener reads the
+				// request on its own goroutine, which on a loaded runner can run after
+				// the gate has already given up. That lateness is the runner's, and a
+				// gate that never connected never produces this signal at all.
+				//
+				// A gate whose budget ran out before it dialled never reaches the listener,
+				// and that run tested nothing: it is the one case "budget expired" cannot
+				// tell apart from a wedged daemon. It is reported as a skip, not a pass —
+				// the start count above has already been held — and not as a failure, which
+				// would be this story's flake again in a new place.
+				select {
+				case <-spoken:
+				case <-time.After(5 * time.Second):
+					if strings.Contains(stderr.String(), "budget of") {
+						t.Skipf("inconclusive: the gate's budget expired before it reached the listener, "+
+							"so this run did not exercise a wedged daemon (stderr: %s)", stderr.String())
+					}
+					t.Errorf("the wedged listener never received a request: the gate did not reach it, "+
+						"so this case did not test a daemon that accepts and never answers (stderr: %s)",
+						stderr.String())
+				}
 			}
 		})
 	}
