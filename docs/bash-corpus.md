@@ -533,7 +533,8 @@ That cannot be collected by correcting a constant. `B` is global and the mix is 
 size `B` for pytest and one `go test` burst at ~4 cores a build saturates the machine. Collecting
 it requires **per-build cost accounting at admission** — a lease that costs what its shape costs,
 rather than one slot — which is a change to the control law and therefore outside the scope
-GOV-B14 set for itself. Filed separately rather than smuggled in here.
+GOV-B14 set for itself. Filed separately rather than smuggled in here, as GOV-B15, which
+was itself dropped (§10).
 
 ### What this section does NOT say
 
@@ -545,3 +546,73 @@ GOV-B14 set for itself. Filed separately rather than smuggled in here.
 - **It is one 8-core laptop over a fortnight**, and the second half is this project's own
   development, which runs `go test -race ./...` heavily. That remains a plausible and unmeasured
   cause of the `go` family's drift, exactly as §8 recorded.
+
+## 10. Can a lease cost what its shape costs? (GOV-B15, answered 2026-11-02)
+
+**Not from anything the shipped product records, and the story was dropped on that.** §9 left one
+durable finding, `pytest`'s stable p90 of ~0.87 cores, and observed that collecting it needs
+per-build accounting at admission rather than a corrected constant. GOV-B15 was that accounting.
+Its own traps instructed that the case for dropping it be made first; this is that case, and it
+was decided on the data source, not on the admission rule.
+
+### The admission rule was not the obstacle
+
+The story's traps expected the hard part to be fair share, on the premise that
+`lease.Table.shareLocked` and the first-slot escape in `fitsLocked` (GOV-34, invariant 6) reason
+about lease COUNTS. They do not, and have not since GOV-15: every lease already carries a
+fractional weight, `budget.SlotsFor(class peak cores)`, set by the gate. Capacity is
+`t.weight + weight > limit`, the max-min share is computed over summed weights, and the
+first-slot escape keys on a session holding *nothing*, which is indifferent to how much its
+first lease weighs. A shape-derived weight would have been a different number in the same
+field, with neither invariant restated. Clause 3's bound also holds by construction: `B_max` is
+`floor(capacity / SlotCores)`, total weight never exceeds the limit plus one escaped lease, and
+expected peak demand is total weight times `SlotCores`.
+
+So the cost of the story was never in `internal/lease`. It was in feeding the table.
+
+### No shipped data source can feed the table
+
+Clause 2 requires each shape's p90, bootstrapped across the corpus's chronological halves, at
+n >= 20 per half. Every number in §8 and §9 was computed from `tools/bashcorpus`, which joins
+two things a stranger's install does not have:
+
+- **1 Hz host samples.** These come from Phase 0's `governor trace sample`, started only by
+  `governor trace install`. The shipped install does not run it. On this host on 2026-11-02 the
+  live `samples.jsonl` held 156 build records, 13 of them `pytest`, and **zero** sample
+  records; the 1 Hz samples behind §8 and §9 are in the Phase 0 archive.
+- **Each call's end, and every other `Bash` call in flight.** `bashcorpus` reads both from
+  Claude Code transcripts in `~/.claude/projects`, and attributes cost only over seconds a call
+  was the sole `Bash` command running. The shipped build record has no end time, and the
+  governor sees only *gated* commands, so it cannot reproduce that attribution even in
+  principle.
+
+Reading transcripts from a shipped `governor calibrate` was rejected outright: it would put
+every user's conversation files on the read path of a command whose only job is sizing a
+budget. The alternative was the daemon measuring builds itself, and it is the expensive one:
+
+- **The daemon walks the process tree every fifth second, not every second** (design.md §5.1,
+  GOV-12). Walking every tick measured 0.84-1.77% of a core on this laptop, over GOV-12's 1%
+  bar. A short `pytest` run would get zero or one tree reading at that cadence, so a p90 built
+  from it is biased toward the long runs, which is exactly the tail the p90 is meant to
+  capture faithfully.
+- Fixing that means walking at 1 Hz whenever a build lease is held, breaking GOV-12's bar during
+  precisely the periods builds run. On top of that sit an end-time record from the finish
+  hook, a re-implementation of bashcorpus's attribution inside `calibrate`, shapes on the
+  acquire wire, a per-shape table behind `internal/config`, and a staleness window.
+
+### What that machinery would have bought
+
+A budget of **9 rather than 6, and only on a pool made of `pytest`.** `go test`, the commonest
+*expensive* shape, stays at its class weight because §9 found its p90 non-stationary. And a
+stranger's host collects at most a handful of `pytest` runs per day, so most installs would
+never reach n >= 20 per half before clause 4's staleness window retired the entry, and would
+behave exactly as today. That is the outcome the story's traps named: a third dropped story is
+cheaper than this much machinery for a gain confined to one shape on hosts like this one.
+
+### What this section does NOT say
+
+- **It does not say the pytest finding is wrong.** §9's measurement stands. What is missing is
+  a shipped instrument that could re-measure it on someone else's machine.
+- **It does not rule out per-shape weights in principle.** If the daemon ever has a reason to
+  walk the tree at 1 Hz during builds for its own purposes, the per-build peak becomes nearly
+  free, and the admission side needs no change (see above). That would be the moment to refile.
