@@ -49,6 +49,70 @@ config schema 1      the "schema" key in ~/.claude/governor/config.json
 Releases are fixed by a new patch version and never by moving a tag. [0.1.1](#011---2026-10-29)
 is the first example.
 
+## [0.1.3] - 2026-11-02
+
+Protocol and config schema are unchanged (`protocol 1`, `config schema 1`).
+
+**Upgrading from 0.1.2 or earlier with Homebrew:** after `brew upgrade governor`, run
+`$(brew --prefix)/opt/governor/bin/governor install`, using the full path. On those versions
+a bare `governor` can still resolve to install's own `~/.local/bin` link to the old binary,
+which reinstalls the old version over itself. That full-path install removes the link, and
+a bare `governor install` works from then on.
+
+### Added
+
+- **`governor doctor --report`** prints one block you can paste into a public issue: the
+  version, install route, thermal source, Claude Code version, budget, doctor's findings,
+  the daemon log tail and the last few gated builds. Paths, IDs and anything shaped like a
+  credential are scrubbed out, and command text and working directories are never included.
+  The new issue templates ask for it first.
+  ([#78](https://github.com/peter3605/claude-governor/pull/78))
+- **`governor doctor` has a `loaded` check.** It fails when the running daemon is serving a
+  different calibration from the one in `config.json`.
+  ([#68](https://github.com/peter3605/claude-governor/pull/68))
+- [CHANGELOG.md](https://github.com/peter3605/claude-governor/blob/main/CHANGELOG.md) (this
+  file) and
+  [CONTRIBUTING.md](https://github.com/peter3605/claude-governor/blob/main/CONTRIBUTING.md).
+  From this release on, the GitHub release notes are this file's entry, word for word.
+  ([#77](https://github.com/peter3605/claude-governor/pull/77),
+  [#70](https://github.com/peter3605/claude-governor/pull/70))
+
+### Changed
+
+- **A calibration takes effect without a restart.** The daemon re-reads `config.json` on
+  the tick after it changes. That covers both `governor calibrate` and the calibration
+  `governor install` writes. If the file goes bad while the daemon is running (unreadable,
+  malformed, or from a newer schema), the daemon keeps the values it was serving and logs
+  the problem once. It no longer falls back to the looser built-in defaults.
+  ([#68](https://github.com/peter3605/claude-governor/pull/68),
+  [#76](https://github.com/peter3605/claude-governor/pull/76))
+- **The budget recovers by itself.** A budget that has been cut climbs back to the ceiling
+  once the machine has been idle for about a minute: no slot held, nothing waiting, and the
+  run queue low. Before this release it waited for demand, which a low budget suppresses, so
+  a budget could stay at 1 on an idle machine. A raised ceiling now takes effect on the same
+  tick. ([#71](https://github.com/peter3605/claude-governor/pull/71))
+- **`governor calibrate` gives steadier answers.** It now uses a probe result only when its
+  repetitions agree. It prints every repetition. When it cannot get a trustworthy answer, it
+  keeps the ceiling it already had and says so, instead of writing a new one.
+  ([#72](https://github.com/peter3605/claude-governor/pull/72))
+
+### Fixed
+
+- **A brew upgrade really upgrades.** On the Homebrew route, `governor install` no longer
+  creates a `~/.local/bin/governor` link that shadows the brew binary, and it removes the
+  link an earlier version left there. Wherever doctor's fix lines and the brew caveat name a
+  command, they now name the binary that will actually do the upgrade.
+  ([#67](https://github.com/peter3605/claude-governor/pull/67),
+  [#69](https://github.com/peter3605/claude-governor/pull/69),
+  [#71](https://github.com/peter3605/claude-governor/pull/71))
+- **A daemon started by a hook read a different `config.json`** from the one `calibrate`
+  wrote, and silently ran on the built-in ceiling. Every part of the tool now reads the
+  same file. ([#68](https://github.com/peter3605/claude-governor/pull/68))
+- **`governor status` called a session ungoverned while it held a slot** after a daemon
+  restart. It now uses the same wording as doctor and the status line. A replaced daemon
+  also learns about sessions that were already running, so fair share counts them again.
+  ([#74](https://github.com/peter3605/claude-governor/pull/74))
+
 ## [0.1.2] - 2026-10-31
 
 ### Added
