@@ -130,7 +130,8 @@ jobs:
   # price of testing the real download path; the fix is a new patch tag, not a re-run.
   #
   # Skipped for a pre-release tag: install.sh fetches releases/latest, which a pre-release is
-  # not, so this job would test the previous release and pass on it.
+  # not, so this job would test the previous release and pass on it. The Homebrew check is the
+  # separate homebrew-macos job below, which is not skipped.
   clean-macos:
     name: clean macOS install from the published release
     needs: publish
@@ -147,7 +148,21 @@ jobs:
             "https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/${GITHUB_REF_NAME}/install.sh" \
             -o "$RUNNER_TEMP/install.sh"
           INSTALL_SH="$RUNNER_TEMP/install.sh" sh scripts/clean-install-in-container.sh
-      - name: the Homebrew formula installs the same version
+
+  # The release's own governor.rb, on a fresh macOS runner. A job of its own rather than a step of
+  # clean-macos because, unlike install.sh, it downloads from THIS tag's release, not from
+  # releases/latest — so it is valid on a pre-release tag too, and a throwaway pre-release is how
+  # a change to it gets tested (CONTRIBUTING.md, "Testing a change to release.yml").
+  #
+  # Like clean-macos it runs after publish: a failure means a bad release is already out, and the
+  # fix is a new patch tag. Do NOT drop this job to make a run green — it is the check that caught
+  # v0.1.0's formula failing its own audit.
+  homebrew-macos:
+    name: the Homebrew formula installs the same version
+    needs: publish
+    runs-on: macos-latest
+    steps:
+      - name: style, audit --strict, install, test, version
         # brew style and audit refuse a formula outside a tap, so a throwaway local tap holds it.
         # The marketplace route needs no job of its own: its entry is a command source with no
         # version, which loads the tree `governor install` writes from THIS binary (design.md
@@ -159,6 +174,17 @@ jobs:
             -o "$RUNNER_TEMP/governor.rb"
           brew tap-new --no-git local/governor
           cp "$RUNNER_TEMP/governor.rb" "$(brew --repository local/governor)/Formula/governor.rb"
+          # Current Homebrew refuses to load a formula from an untrusted tap ("Refusing to load
+          # formula local/governor/governor from untrusted tap", v0.1.2), and tap-new does not
+          # trust the tap it creates. Trust exactly this one formula, not the whole tap.
+          # GUARD: a runner image with an older Homebrew has no `brew trust` subcommand, and also
+          # no trust check, so there it is skipped rather than failing the job. The guard is on the
+          # subcommand existing, not on a version number, so it cannot drift from what brew does.
+          if brew trust --help >/dev/null 2>&1; then
+            brew trust --formula local/governor/governor
+          else
+            echo "brew trust not available on $(brew --version | head -1); this Homebrew has no tap trust check"
+          fi
           brew style local/governor/governor
           brew audit --strict --formula local/governor/governor
           brew install local/governor/governor

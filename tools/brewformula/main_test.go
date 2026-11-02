@@ -52,6 +52,27 @@ func TestEveryPlatformGetsItsOwnURLAndDigest(t *testing.T) {
 	}
 }
 
+// brew scans "64" out of a pre-release URL (from the arch, not the tag), so the formula's
+// `brew test` would compare "governor 0.1.3-rc.1" against "governor 64" and fail, as it did on the
+// v0.1.3-rc.1 release run. A pre-release formula therefore states its version, exactly once,
+// and a stable one still does not (the assertion above).
+func TestAPrereleaseFormulaStatesItsVersion(t *testing.T) {
+	var out strings.Builder
+	if err := write(&out, "0.1.3-rc.1", strings.NewReader(checksumsFor(allAssets...))); err != nil {
+		t.Fatal(err)
+	}
+	f := out.String()
+	if n := strings.Count(f, "\n  version "); n != 1 {
+		t.Fatalf("want exactly one version line, got %d:\n%s", n, f)
+	}
+	if !strings.Contains(f, "\n  version \"0.1.3-rc.1\"\n") {
+		t.Errorf("version line is not version \"0.1.3-rc.1\":\n%s", f)
+	}
+	if !strings.Contains(f, "/releases/download/v0.1.3-rc.1/governor-darwin-arm64") {
+		t.Errorf("URLs do not carry the pre-release tag:\n%s", f)
+	}
+}
+
 func TestAMissingArtefactRefusesTheFormula(t *testing.T) {
 	err := write(&strings.Builder{}, "0.1.0", strings.NewReader(checksumsFor(allAssets[:3]...)))
 	if err == nil || !strings.Contains(err.Error(), "governor-linux-amd64") {

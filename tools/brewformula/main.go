@@ -99,14 +99,21 @@ func write(w io.Writer, version string, checksums io.Reader) error {
 	}
 	return formula.Execute(w, struct {
 		Repo, Version string
+		Prerelease    bool
 		Mac, Linux    []platform
-	}{repo, version, plats[:2], plats[2:]})
+	}{repo, version, strings.Contains(version, "-"), plats[:2], plats[2:]})
 }
 
 // THERE IS NO version LINE, and that is brew's rule rather than an omission. Every URL carries
 // the tag (.../download/v0.1.0/...), brew scans the version out of it, and `brew audit --strict`
 // rejects an explicit one as redundant — which is how v0.1.0's attached formula failed its own
 // release check. The test block's #{version} is that scanned value.
+//
+// EXCEPT for a pre-release. brew's scanner cannot read a semver suffix out of these URLs: for
+// .../download/v0.1.3-rc.1/governor-darwin-arm64 it scans "64", from the arch (measured with
+// Version.parse on Homebrew 7.0, and on the v0.1.3-rc.1 release run, GOV-B25). So a pre-release
+// formula states its version. That line is not redundant — it disagrees with the scan — so
+// audit --strict accepts it, and a stable formula is byte-for-byte what it was.
 //
 // The caveat carries the step brew cannot do for the user. Installing the formula puts a binary
 // on PATH and governs nothing: the hooks, the status line and the daemon are `governor install`,
@@ -122,6 +129,9 @@ func write(w io.Writer, version string, checksums io.Reader) error {
 var formula = template.Must(template.New("formula").Parse(`class Governor < Formula
   desc "Machine-wide build and subagent budget for Claude Code sessions"
   homepage "https://github.com/{{.Repo}}"
+{{- if .Prerelease}}
+  version "{{.Version}}"
+{{- end}}
   license "MIT"
 
   on_macos do
