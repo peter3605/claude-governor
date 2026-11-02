@@ -12,8 +12,29 @@ permissions:
   contents: write
 
 jobs:
+  # The release notes ARE the CHANGELOG.md entry for this tag (GOV-39), and this job runs
+  # first. A tag with no entry, or an empty one, fails here, before a binary is built or
+  # anything is published, so the entry has to be merged before the tag is pushed. Nothing
+  # else writes the release body: there is no generate_release_notes below.
+  notes:
+    name: release notes from CHANGELOG.md
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26'
+      - name: extract this tag's entry
+        run: go run ./tools/changelog -version "${GITHUB_REF_NAME#v}" -file CHANGELOG.md > notes.md
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-notes
+          path: notes.md
+          if-no-files-found: error
+
   build:
     name: build ${{ matrix.goos }}/${{ matrix.goarch }}
+    needs: notes
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: true
@@ -61,10 +82,17 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      # The binaries only. The notes go to their own directory: everything in dist/ is attached
+      # to the release as an asset.
       - uses: actions/download-artifact@v4
         with:
+          pattern: governor-*
           path: dist
           merge-multiple: true
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-notes
+          path: notes
       - name: checksums
         # One file listing every artefact's digest, so a download can be verified without
         # trusting the transport twice.
@@ -81,10 +109,14 @@ jobs:
         # and digests cannot drift from the artefacts beside them. The tap repository carries a
         # copy of this file; clean-macos below installs it before anyone else does.
         run: go run ./tools/brewformula -version "${GITHUB_REF_NAME#v}" -checksums dist/checksums.txt > dist/governor.rb
+      # A tag with a semver pre-release suffix (v0.1.3-rc.1) publishes a GitHub PRE-release.
+      # releases/latest skips pre-releases, so install.sh and every stranger keep the last real
+      # release. That is what makes a throwaway tag a safe way to test this workflow.
       - uses: softprops/action-gh-release@v2
         with:
           files: dist/*
-          generate_release_notes: true
+          body_path: notes/notes.md
+          prerelease: ${{ contains(github.ref_name, '-') }}
 
   # The clean-macOS half of GOV-19's Done-when, against the release as PUBLISHED — the only way
   # to test install.sh unmodified, because it fetches releases/latest. Tag-only, because macOS
@@ -96,9 +128,13 @@ jobs:
   #
   # It runs AFTER publish, so a failure here means a bad release is already out. That is the
   # price of testing the real download path; the fix is a new patch tag, not a re-run.
+  #
+  # Skipped for a pre-release tag: install.sh fetches releases/latest, which a pre-release is
+  # not, so this job would test the previous release and pass on it.
   clean-macos:
     name: clean macOS install from the published release
     needs: publish
+    if: ${{ !contains(github.ref_name, '-') }}
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4

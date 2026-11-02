@@ -36,7 +36,7 @@ func readRepoFile(t *testing.T, rel string) string {
 // absent: the guide names them, and they are not in this tree.
 var repoRoots = []string{
 	".github", ".claude-plugin", "cmd", "commands", "docs", "internal", "scripts", "skills", "tools",
-	"CONTRIBUTING.md", "LICENSE", "Makefile", "README.md", "go.mod", "install.sh",
+	"CHANGELOG.md", "CONTRIBUTING.md", "LICENSE", "Makefile", "README.md", "go.mod", "install.sh",
 }
 
 // guidePathRefs returns every repository path the guide names, as written, with any #anchor
