@@ -49,6 +49,38 @@ config schema 1      the "schema" key in ~/.claude/governor/config.json
 Releases are fixed by a new patch version and never by moving a tag. [0.1.1](#011---2026-10-29)
 is the first example.
 
+## [0.1.5] - 2026-11-02
+
+Protocol and config schema are unchanged (`protocol 1`, `config schema 1`). From 0.1.3 or
+0.1.4, upgrading takes no extra step: rerun the install one-liner, or `brew upgrade governor`.
+From 0.1.2 or earlier with Homebrew, follow
+[0.1.3's upgrade step](https://github.com/peter3605/claude-governor/releases/tag/v0.1.3).
+
+### Added
+
+- **`governor doctor` has a `tracelog` check.** It lists each trace log file with its size.
+  It warns only about a file over 32 MiB, which means a log set aside from before this
+  release. ([#84](https://github.com/peter3605/claude-governor/pull/84))
+
+### Changed
+
+- **`governor uninstall` names the trace log it keeps.** A plain uninstall still leaves the
+  log, because it is your record of every gated build, but it now prints each file it kept
+  and its size. `governor uninstall --purge` removes them, including any set-aside file.
+  ([#84](https://github.com/peter3605/claude-governor/pull/84))
+
+### Fixed
+
+- **The trace log no longer grows without limit.** `~/.claude/governor/samples.jsonl` records
+  every gated build, and before this release nothing ever trimmed it. On one machine it
+  reached 699 MB in six weeks. It now rotates at 16 MiB to `samples.jsonl.1` and keeps that
+  one older file, so it never takes more than about 32 MiB.
+  ([#84](https://github.com/peter3605/claude-governor/pull/84))
+
+  If your log is already over 32 MiB, the first write after you upgrade does not delete it.
+  It renames it to `samples.pre-bound-<date>.jsonl` and leaves it alone. Nothing reads that
+  file, so you can keep it, compress it or delete it.
+
 ## [0.1.4] - 2026-11-02
 
 Protocol and config schema are unchanged (`protocol 1`, `config schema 1`).
