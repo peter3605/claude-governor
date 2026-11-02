@@ -125,10 +125,19 @@ esac
 # enough that nothing FAILED: the checks that MUST be ok are named, and the set that may be
 # unverified is named EXACTLY. A count would let a new unknown in unnoticed, which is the
 # same hole GOV-30 closed.
-for check in daemon socket hooks matcher protocol binary config calibration budget leases strays; do
+for check in daemon socket hooks matcher protocol binary config budget leases strays; do
 	grep -Eq "^ok +${check}( |$)" /tmp/doctor.out \
 		|| fail "doctor did not report 'ok $check' on a fresh install."
 done
+
+# calibration is ok, or it is exactly ONE warn: GOV-47's "b_max was not measured". install's
+# calibrate skips the b_max probe when the machine is already loaded, and right after install.sh
+# on a CI runner it often is, so whether the probe runs depends on the runner, not the install.
+# v0.1.3's clean-macos failed on exactly this, on a 3-core runner, with everything else sound.
+# Any other calibration line (a failure, an unknown, a different warn) is still a finding.
+grep -Eq "^ok +calibration( |$)" /tmp/doctor.out \
+	|| grep -Eq "^warn +calibration .*b_max was not measured" /tmp/doctor.out \
+	|| fail "doctor reported neither 'ok calibration' nor the one accepted warn (b_max was not measured) on a fresh install."
 
 # EXACTLY TWO checks cannot verify on a machine with no Claude Code, and each is a fact about
 # the container rather than about the install:
