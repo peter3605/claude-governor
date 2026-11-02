@@ -1534,6 +1534,14 @@ func (d *daemon) confirm(req request) any {
 	if req.PIDStartedAt > 0 {
 		started = time.Unix(req.PIDStartedAt, 0)
 	}
+	// Re-register a session this daemon has never seen (GOV-48). This runs before the
+	// pending-lease check on purpose: a confirm with nothing to bind, from a resumed
+	// subagent, still proves this session's hooks are loaded. It is done here and not in
+	// the gate because the gate sends no PID, and finding one would mean walking the process
+	// table on the path every spawn waits on. The confirm hook already does that walk.
+	if d.table.AdoptSession(lease.Session{ID: req.Session, PID: req.PID, PIDStarted: started}) {
+		fmt.Fprintf(d.diag, "governor daemon: session %s re-registered from a confirm; it registered with a daemon that has since been replaced\n", req.Session)
+	}
 	l, ok := d.table.Confirm(req.Session, req.Lease, req.AgentID, req.PID, started)
 	if !ok {
 		// Not an error. A resumed subagent reaches the CPU with no PreToolUse at all

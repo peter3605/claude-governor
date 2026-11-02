@@ -456,17 +456,34 @@ func TestAnUnknownWeightPrintsAsTheDefaultShare(t *testing.T) {
 	}
 }
 
-// A live session that never registered is marked on its own line.
+// A live session whose hooks never loaded is marked on its own line, and only that session.
 //
 // Same misreading GOV-29 was filed about — it holds no leases and so looks identical to an idle
 // governed session — arriving in the place a person goes to check after the status line has
-// already sent them there.
+// already sent them there. GOV-48: the mark comes from classifyGovernance, so a session that
+// holds a lease or registered with a replaced daemon is not marked ungoverned.
 func TestStatusMarksALiveSessionThatNeverRegistered(t *testing.T) {
-	if got := liveSuffix(sessionStat{Live: true, Registered: false}); got == "" {
-		t.Error("a running, unregistered session is indistinguishable from an idle governed one")
+	hooks := time.Date(2026, 11, 1, 10, 0, 0, 0, time.UTC)
+	daemonAt := hooks.Add(2 * time.Hour)
+	reply := statusResponse{
+		SessionsKnown:  true,
+		HooksInstalled: hooks.Format(time.RFC3339),
+		DaemonStarted:  daemonAt.Format(time.RFC3339),
 	}
-	if got := liveSuffix(sessionStat{Live: true, Registered: true}); got != "" {
-		t.Errorf("marked a properly registered session as ungoverned: %q", got)
+	at := func(d time.Duration) string { return hooks.Add(d).Format(time.RFC3339) }
+
+	if got := liveSuffix(reply, sessionStat{Live: true, Started: at(-time.Hour)}); !strings.Contains(got, "ungoverned") {
+		t.Errorf("a session that predates the hooks reads %q, want it called ungoverned", got)
+	}
+	if got := liveSuffix(reply, sessionStat{Live: true, Registered: true, Started: at(-time.Hour)}); got != "" {
+		t.Errorf("marked a properly registered session: %q", got)
+	}
+	if got := liveSuffix(reply, sessionStat{Live: true, Confirmed: 1, Started: at(time.Hour)}); got != "" {
+		t.Errorf("marked a session holding a lease: %q", got)
+	}
+	got := liveSuffix(reply, sessionStat{Live: true, Started: at(time.Hour)})
+	if strings.Contains(got, "ungoverned") || !strings.Contains(got, "since been replaced") {
+		t.Errorf("a session that registered with a replaced daemon reads %q", got)
 	}
 }
 
