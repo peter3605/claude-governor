@@ -49,6 +49,27 @@ config schema 1      the "schema" key in ~/.claude/governor/config.json
 Releases are fixed by a new patch version and never by moving a tag. [0.1.1](#011---2026-10-29)
 is the first example.
 
+## [0.1.4] - 2026-11-02
+
+Protocol and config schema are unchanged (`protocol 1`, `config schema 1`).
+
+**This is v0.1.3 for Homebrew users.** The governor itself is the same code as v0.1.3, so
+everything in [0.1.3's release notes](https://github.com/peter3605/claude-governor/releases/tag/v0.1.3) applies, including its upgrade step: after
+`brew upgrade governor`, run `$(brew --prefix)/opt/governor/bin/governor install`, using the
+full path.
+
+### Fixed
+
+- **v0.1.3 never reached the Homebrew tap.** Its formula was sound and passed its own
+  Homebrew check. The release's clean-macOS install check failed, so the formula was held
+  back. That check required doctor to report `ok calibration`, but on a busy machine install
+  skips the calibration probe and doctor correctly warns `b_max was not measured`. The check
+  now accepts that one warning and still fails on anything else.
+  ([#81](https://github.com/peter3605/claude-governor/pull/81))
+
+  v0.1.3 was left published rather than re-tagged. The install one-liner served it, and it
+  works.
+
 ## [0.1.3] - 2026-11-02
 
 Protocol and config schema are unchanged (`protocol 1`, `config schema 1`).
