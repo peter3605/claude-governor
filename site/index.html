@@ -399,7 +399,7 @@ footer .bay { display: flex; justify-content: space-between; gap: 20px; flex-wra
 <header class="mast">
   <div class="mast-in">
     <span class="mark">Build&nbsp;Governor<b> / claude-governor</b></span>
-    <span style="font-size:.7rem;letter-spacing:.18em;color:var(--dimmer)"><span class="blip"></span><span data-fig="version">V0.1.4</span></span>
+    <span style="font-size:.7rem;letter-spacing:.18em;color:var(--dimmer)"><span class="blip"></span><span data-fig="version">V0.1.5</span></span>
     <a href="#how">How</a>
     <a href="#proof">Proof</a>
     <a href="#install">Install</a>
@@ -822,7 +822,7 @@ claude plugin install build-governor@claude-governor">Copy</button>
       <span class="tag">§8 &nbsp;//&nbsp; <b>What this is, and is not</b></span>
       <h2>Honest about<br>the edges</h2>
       <ul class="dash">
-        <li><strong data-fig="version">v0.1.4.</strong> Early, and versioned like it. The wire protocol and the config file are both versioned with forward migration, so an upgrade is a non-event.</li>
+        <li><strong data-fig="version">v0.1.5.</strong> Early, and versioned like it. The wire protocol and the config file are both versioned with forward migration, so an upgrade is a non-event.</li>
         <li><strong>One machine.</strong> The budget covers the host it runs on. A shared broker across machines is designed and seamed for, and deliberately not built — CPU does not aggregate across hosts.</li>
         <li><strong>Measured on one laptop.</strong> An M1 MacBook Air, mostly against Go and Python workloads. <code>calibrate</code> re-derives the constants on yours, but the shape of the model carries that machine's fingerprints and the documents say where.</li>
         <li><strong>The classifier is imperfect and knows it.</strong> It catches <span data-fig="catch-rate">53%</span> of expensive commands by name and gates <span data-fig="false-positives">36%</span> of cheap ones unnecessarily. It captures <span data-fig="cost-captured">78.6%</span> of the child CPU that matters, which is the figure it is tuned against.</li>
