@@ -1,0 +1,33 @@
+name: Something is broken
+description: The governor crashed, hung, stopped governing, or doctor reports a failure.
+labels: [bug]
+body:
+  - type: textarea
+    id: report
+    attributes:
+      label: Output of `governor doctor --report`
+      description: |
+        Run this in a terminal and paste everything it prints:
+
+            governor doctor --report
+
+        It is built to be safe to post in public. Paths into your files become `<path>`,
+        credentials become `<redacted>`, and no command text is included. Read it before you
+        paste it anyway.
+      render: text
+    validations:
+      required: true
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened, and what you expected
+      description: One or two sentences is enough. Quote any message the session showed you.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: How to make it happen again
+      description: Optional, but it is the fastest route to a fix.
+    validations:
+      required: false

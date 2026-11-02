@@ -205,11 +205,15 @@ type doctorStatus struct {
 func runDoctor(args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("governor doctor", flag.ContinueOnError)
 	fs.SetOutput(stderr)
+	report := fs.Bool("report", false, "print one block, safe to paste into a public issue, for reporting a problem (see report.go)")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
 	d := &diagnosis{}
 	d.run()
+	if *report {
+		return d.writeReport(stdout)
+	}
 	return d.report(stdout)
 }
 

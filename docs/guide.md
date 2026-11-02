@@ -428,6 +428,22 @@ Open a terminal outside Claude Code and run
 `claude plugin install build-governor@claude-governor` there. It shows the exact command and
 asks `[y/N]`.
 
+### None of the above, or it refused something it should have allowed
+
+Run `governor doctor --report` and open an issue at
+<https://github.com/peter3605/claude-governor/issues/new/choose>, pasting the whole output. The
+report is everything a maintainer needs without asking you a follow-up question: the version,
+how it was installed, the host, the Claude Code version, the budget, every doctor check, the
+end of the daemon log and the last gated builds with their outcome and reason. It is built to
+be safe to post in public. Paths into your own files become `<path>`, ids are shortened,
+anything shaped like a credential becomes `<redacted>`, and no command text is ever included,
+only the shape the classifier saw. Nothing is sent anywhere unless you paste it yourself.
+
+A refusal you think was wrong is worth reporting even though the governor did what it was
+built to do. Those reports are how the classifier and the budget get tuned. For a refused
+spawn, also quote the refusal text the session showed you, because spawn decisions are not
+recorded on disk.
+
 ---
 
 ## Uninstalling

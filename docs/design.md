@@ -2391,10 +2391,27 @@ being asked of them is to run a hook on every `Bash` call and every subagent spa
 | `governor install` | write the plugin (manifest, hooks, binary), merge the statusline into settings (after backup), start the daemon, print exactly what it touched, then run `doctor` and exit non-zero if it fails |
 | `governor uninstall` | reverse all of it, restore the settings backup, stop the daemon, remove state on `--purge` |
 | `governor plugin-path` | print the installed plugin tree and exit 0, or exit non-zero with nothing on stdout when there is none. It is what the marketplace entry runs (below); it stats two files and does nothing else, because Claude Code runs it on every session start |
-| `governor doctor` | daemon reachable? hooks registered? matcher matches the real tool name? **are the sessions running right now actually governed?** binary and plugin versions agree? config schema current? each failure names its fix |
+| `governor doctor` | daemon reachable? hooks registered? matcher matches the real tool name? **are the sessions running right now actually governed?** binary and plugin versions agree? config schema current? each failure names its fix. `--report` prints the same checks inside one block that is safe to paste into a public issue (GOV-40, below) |
 | `governor calibrate` | measure cores, performance cores, RAM, this host's ambient run queue and a short load probe; write the run-queue cut threshold and B_max for *this* machine, with a provenance note |
 | `governor version` | binary version, protocol version, config schema version |
 | `governor limit N` / `pause` / `resume` / `boost` | the manual overrides of §9.1, each expiring on its own |
+
+**`doctor --report` is the bug report (GOV-40).** It prints one block holding everything a
+maintainer needs to diagnose a refusal without a follow-up question: version and install route,
+OS, architecture and core count, thermal source, the Claude Code versions of live sessions, the
+budget, doctor's findings exactly as the plain command prints them, the last 30 daemon log lines
+and the last 20 gated builds from `samples.jsonl` with their outcome, class, shapes and reason.
+It exits with doctor's own code. The block is safe to post in public, and two layers keep it
+that way (`cmd/governor/report.go`). The first is structure: a build record contributes only
+named fields, never its `cwd` or any field added later. The second is a scrubber that every line
+passes through. The state directory becomes `<state>`, the §13.3 install paths are kept
+home-relative, every other path becomes `<path>`, uuids are cut to their first segment and
+anything shaped like a credential becomes `<redacted>`. `TestTheReportIsSafeToPasteInPublic`
+plants secrets, home paths and command text in every source and requires that none of them
+come out and that the safe fields do. The report reads files that already exist and writes
+nothing, so it adds no §13.3 row. Spawn decisions are not recorded on disk, so the report says
+so and the issue template asks for the refusal text instead. Nothing is uploaded: the report
+reaches a maintainer only when the user pastes it.
 
 GOV-20 shipped `doctor`, and it reports eleven findings rather than the six checks this table
 lists — `binary`, `protocol` and `config` are the three halves of "versions agree", split

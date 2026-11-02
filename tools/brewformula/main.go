@@ -155,6 +155,8 @@ var formula = template.Must(template.New("formula").Parse(`class Governor < Form
       It writes a plugin to ~/.claude/skills/build-governor/, merges a statusLine key into
       ~/.claude/settings.json (after backing it up), and starts the daemon.
       Undo all of it with: governor uninstall
+      Something wrong? Run governor doctor --report and paste it into an issue:
+        https://github.com/{{.Repo}}/issues
     EOS
   end
 
