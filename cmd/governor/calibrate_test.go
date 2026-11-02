@@ -306,8 +306,10 @@ func TestCalibrationIsReadableByTheStoreItWasWrittenBy(t *testing.T) {
 	if c.RunQueueMax <= 0 {
 		t.Errorf("run_queue_max came back as %v", c.RunQueueMax)
 	}
-	if c.BMax <= 0 {
-		t.Errorf("b_max came back as %v", c.BMax)
+	// --no-probe on a fresh host measures no ceiling, so none is written: zero, uncalibrated
+	// (GOV-47). TestACalibrationWithoutAProbeKeepsTheStoredCeiling covers a stored one.
+	if c.BMax != 0 {
+		t.Errorf("b_max came back as %v from a run that took no probe, want 0", c.BMax)
 	}
 	if c.CalibratedAt == "" || c.CalibratedFrom == "" {
 		t.Error("the provenance did not survive the round trip, so the numbers cannot be traced to a measurement")
@@ -322,5 +324,45 @@ func writeConfig(t *testing.T, path string, doc map[string]any) {
 	}
 	if err := os.WriteFile(path, body, 0o600); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// TestACalibrationWithoutAProbeKeepsTheStoredCeiling is GOV-47 clause 2 at the command: the
+// config already holds a measured b_max, this run takes no probe, and the measured value must
+// survive — with the output saying it was kept rather than re-measured.
+func TestACalibrationWithoutAProbeKeepsTheStoredCeiling(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv(transport.StateDirEnv, dir)
+	path := filepath.Join(dir, config.File)
+	writeConfig(t, path, map[string]any{
+		"schema":        config.Schema,
+		"b_max":         4,
+		"run_queue_max": 4.72,
+		"calibrated_at": "2026-11-01T19:34:07Z",
+	})
+
+	var stdout, stderr bytes.Buffer
+	if code := runCalibrate([]string{"--no-probe"}, &stdout, &stderr); code != 0 {
+		t.Fatalf("calibrate exit %d: %s", code, stderr.String())
+	}
+	var doc struct {
+		BMax           int    `json:"b_max"`
+		CalibratedFrom string `json:"calibrated_from"`
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(raw, &doc); err != nil {
+		t.Fatal(err)
+	}
+	if doc.BMax != 4 {
+		t.Errorf("b_max %d after a run with no probe, want the stored 4", doc.BMax)
+	}
+	if !strings.Contains(doc.CalibratedFrom, "b_max 4 kept from the calibration of 2026-11-01T19:34:07Z") {
+		t.Errorf("provenance does not record that b_max was kept: %s", doc.CalibratedFrom)
+	}
+	if !strings.Contains(stdout.String(), "kept from 2026-11-01T19:34:07Z") {
+		t.Errorf("the report does not tell the person the ceiling was kept:\n%s", stdout.String())
 	}
 }

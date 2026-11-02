@@ -182,16 +182,66 @@ func (m Measurement) EffectiveCapacity() float64 {
 // machines produce materially different values, and the only way to test that claim without
 // two machines is to be able to hand this function two readings. It also means the derivation
 // can be argued about against a recorded Measurement long after the host has changed.
+//
+// EACH OUTPUT IS DERIVED ONLY FROM ITS OWN MEASUREMENT, OR NOT AT ALL. A zero field means
+// "this run did not measure it", and Resolve decides what that means against what is already
+// stored. B_max in particular is NOT derived from CPUCapacity when the probe did not produce a
+// trusted figure: on 2026-10-31 that fallback wrote b_max 6 against a measured ceiling of 4 on
+// this host — the raw core count with no efficiency-core discount, which is the most permissive
+// answer available, written as though it had been measured (GOV-47).
 func Derive(m Measurement) Derived {
-	d := Derived{BMax: budget.MaxSlots(m.EffectiveCapacity())}
+	var d Derived
+	if m.Probe.OK {
+		d.BMax = budget.MaxSlots(m.EffectiveCapacity())
+	}
 	if m.AmbientOK {
 		d.RunQueueMax = deriveRunQueueMax(m.AmbientRunQueue)
 	}
-	// A zero RunQueueMax means "not calibrated", and the daemon then keeps the compiled-in
-	// budget.RunQueueMax. That is the honest answer for a host whose load could not be read:
-	// the threshold is placed relative to a baseline, and without the baseline there is
-	// nothing to place it relative to.
 	return d
+}
+
+// Prior is what an earlier calibration left in the config.
+type Prior struct {
+	RunQueueMax float64
+	BMax        int
+	// At is when that calibration ran, RFC3339, for saying where a kept value came from.
+	At string
+}
+
+// Outcome is what a calibration writes, and which of it was carried forward rather than
+// measured this time.
+type Outcome struct {
+	Derived
+	// BMaxKept and RunQueueMaxKept say the value is the prior one, because this run could not
+	// measure it. KeptFrom is when the prior calibration ran.
+	BMaxKept        bool
+	RunQueueMaxKept bool
+	KeptFrom        string
+}
+
+// Resolve decides what to write: this run's figure where it produced one, and otherwise the
+// figure already stored.
+//
+// A RUN THAT COULD NOT MEASURE SOMETHING HAS NO STANDING TO ERASE IT. A declined probe and an
+// unreadable load average both leave their field zero, and before GOV-47 that zero — or worse,
+// a core-count fallback — was written over a value an earlier run had actually measured. The
+// two outputs come from different measurements taken under different conditions, so a failure
+// in one is no evidence against the other, and each is resolved on its own.
+//
+// Where nothing is stored either, zero is written and means what it always has: uncalibrated,
+// and the daemon runs on its compiled-in derivation (design.md §13.4).
+func Resolve(d Derived, prev Prior) Outcome {
+	o := Outcome{Derived: d}
+	if d.BMax == 0 && prev.BMax > 0 {
+		o.BMax, o.BMaxKept = prev.BMax, true
+	}
+	if d.RunQueueMax == 0 && prev.RunQueueMax > 0 {
+		o.RunQueueMax, o.RunQueueMaxKept = prev.RunQueueMax, true
+	}
+	if o.BMaxKept || o.RunQueueMaxKept {
+		o.KeptFrom = prev.At
+	}
+	return o
 }
 
 // deriveRunQueueMax places the cut a fixed headroom above what this host idles at.

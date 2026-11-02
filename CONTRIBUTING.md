@@ -83,6 +83,8 @@ test. When you are working on one area, run just that area:
 go test ./cmd/governor -run 'TestGate' -v
 ```
 
+A laptop sleeping on battery looks exactly like a hung test run: Go's timeout clock pauses with the machine, so no timeout fires and no goroutine dump appears.
+
 ### The tests that depend on timing
 
 The gate's job is to answer within a 100 ms budget and to fail open past it, so some tests

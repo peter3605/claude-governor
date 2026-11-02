@@ -2,8 +2,10 @@ package calibrate
 
 import (
 	"context"
+	"fmt"
 	"math"
 	"runtime"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -20,13 +22,12 @@ import (
 // the probe-length trap is about. Those are different instruments and only one of them has a
 // window.
 //
-// THE REPETITIONS ARE NOT REDUNDANCY, THEY ARE THE ESTIMATOR — see Probe's "why the maximum".
+// THE REPETITIONS ARE NOT REDUNDANCY, THEY ARE THE ESTIMATOR — see Probe's "which repetition".
 // A single three-phase reading was measured on this host and is not usable: twelve of them,
 // taken as the machine settled from loadavg1 16.7 to 8.8, reported effective cores ranging
 // 1.89 to 6.05, a 3.2x spread on a quantity that is a fixed property of the hardware, with
-// four of the twelve failing the drift check outright. The maximum over five is stable: six
-// trials of it, over background load from 7.9 to 12.1, gave 5.70, 5.71, 6.31, 5.69, 6.53 and
-// 6.81. That is what makes five the count rather than one.
+// four of the twelve failing the drift check outright. Five gives the estimator three usable
+// repetitions to stand on with room for two to be lost to the drift check.
 const (
 	DefaultProbeDuration    = 250 * time.Millisecond
 	DefaultProbeRepetitions = 5
@@ -35,12 +36,47 @@ const (
 // ProbeMinUsableReps is how many repetitions must survive the drift check for the probe to
 // report a result.
 //
-// Two rather than one, because the estimator is a maximum and a maximum over a single sample
-// is that sample — which is the reading measured above to be unusable. Two is not much
-// evidence, but it is the point at which "the largest of these" starts meaning anything, and
-// requiring more would fail the probe on a busy machine rather than degrade it, when degrading
-// to the uncalibrated core count is exactly what an unmeasurable host should do.
-const ProbeMinUsableReps = 2
+// Three, because that is the fewest the estimator and its check can be computed from: the
+// highest is discarded, the second-highest is the answer, and the third is what the answer is
+// checked against (ProbeMaxDisagreement). In 30 recorded trials on this host the median trial
+// kept all five and none kept fewer than four, so three costs nothing on the hardware it is for.
+const ProbeMinUsableReps = 3
+
+// ProbeMaxDisagreement is how far apart the two repetitions an answer rests on — the second-
+// and third-highest usable — may be, as a fraction of the second, before the answer is not
+// trusted. ProbeAttempts says what happens then.
+//
+// IT IS A DIFFERENT QUANTITY FROM THE DRIFT CHECK, AND HAS TO BE. ProbeMaxDrift compares the two
+// single-worker phases INSIDE one repetition: it catches a machine that changed speed mid-
+// repetition. It cannot catch a repetition whose two baselines were slow TOGETHER, and every
+// repetition of every one of the seven GOV-47 runs passed it, including the one that cut this
+// host's b_max by a quarter. This compares repetitions WITH EACH OTHER: whether the probe, asked
+// the same question twice, gave the same answer.
+//
+// NOT THE SPREAD, WHICH WAS THE OBVIOUS CANDIDATE AND IS NOT PREDICTIVE. Over 30 recorded
+// trials (docs/calibration.md §8) the full range of the usable repetitions correlated +0.12
+// with how far the estimate landed from the host's centre; this gap correlated +0.61. The range
+// is dominated by the LOWEST repetition, which the estimator already ignores, so a wide range
+// is mostly harmless contention and rejecting on it would reject good answers.
+//
+// 6%, FROM THE SAME 30 TRIALS: 29 of them came in at or under 5.2%, and the one at 11.6% is
+// the trial whose answer was furthest from the centre (4.99 against 5.64, the only one more
+// than half a slot off). 6% sits just above the body of the distribution, and the one answer
+// the bound exists to stop is stopped. Validated on 23 probes it was not set from (§8.4): 21
+// passed at the first attempt, 2 on the retry, none declined, and every accepted answer gave
+// the same b_max. One host's distribution is the evidence, and the calibration doc says so.
+const ProbeMaxDisagreement = 0.06
+
+// ProbeAttempts is how many times the whole probe may run before it declines.
+//
+// Two: a disagreement on the first attempt is answered by measuring again rather than by
+// reporting a figure the probe itself has said it does not trust, and a second disagreement
+// declines. At the 2-in-23 first-attempt rate measured in validation, two consecutive
+// disagreements on a host like this one should be about one calibration in 130; a host that
+// produces them routinely is one
+// whose parallel throughput is not measurable in seconds, and the honest answer there is
+// "not measured" (Resolve keeps whatever an earlier run did measure). Each attempt is announced.
+const ProbeAttempts = 2
 
 // ProbeSkipAbove is the ambient run queue per core above which the probe does not run.
 //
@@ -50,8 +86,8 @@ const ProbeMinUsableReps = 2
 // scribed, because the single-worker phase is then competing too and the denominator sags.
 // Past that point the reading is neither accurate nor worth taking, and adding load to a
 // machine already at four times its run queue is the rude version of a measurement nobody can
-// use. Skipping is honest: EffectiveCapacity falls back to CPUCapacity, which is exactly
-// today's behaviour.
+// use. Skipping is honest: nothing is derived, and Resolve keeps whatever an earlier
+// calibration measured.
 //
 // 4.0 rather than something tighter, because this host's own ambient load was measured at 2.91
 // per core mid-work (docs/climb-condition.md §4.3) and a gate that skipped there would skip on
@@ -88,7 +124,7 @@ type ProbeResult struct {
 	Reason  string
 	// EffectiveCores is parallel throughput divided by single-worker throughput: how many
 	// cores' worth of work this machine actually delivers when asked for Workers of them.
-	// It is the MAXIMUM over the usable repetitions; see Probe.
+	// It is the SECOND-HIGHEST usable repetition; see Probe.
 	EffectiveCores float64
 	// Workers is how many the parallel phase ran.
 	Workers int
@@ -101,13 +137,35 @@ type ProbeResult struct {
 	// could not tell them apart would be hiding the thing a reader should judge it on.
 	Reps       int
 	UsableReps int
-	// Spread is the range of the usable repetitions, largest minus smallest. It is the
-	// honest width of this measurement: the estimator is a maximum precisely because the
-	// noise is one-sided, so a wide spread means the machine was busy, not that the hardware
-	// is uncertain.
+	// Spread is the range of the usable repetitions, largest minus smallest. It is recorded,
+	// not acted on: it is dominated by the lowest repetition, which the estimator ignores,
+	// and it does not predict whether the answer is good (ProbeMaxDisagreement).
 	Spread float64
+	// Disagreement is how far apart the two repetitions the answer rests on are — the
+	// second- and third-highest usable — as a fraction of the second. It is what decides
+	// whether the figure is trusted; see ProbeMaxDisagreement.
+	Disagreement float64
+	// Attempts is how many times the whole probe ran: a second attempt follows a first whose
+	// repetitions disagreed.
+	Attempts int
 	// Duration is how long one phase ran.
 	Duration time.Duration
+	// Samples is every repetition in the order it ran, usable or not. It is what Spread and
+	// EffectiveCores are summaries of, kept so that the decision the probe made can be
+	// re-made from the evidence rather than trusted (docs/calibration.md §8 was set from it).
+	Samples []RepSample
+}
+
+// RepSample is one repetition of the probe.
+type RepSample struct {
+	// Eff is the clamped scaling ratio. Zero for a repetition that produced no reading.
+	Eff float64
+	// Drift is the disagreement between its two single-worker phases.
+	Drift float64
+	// Usable is whether it survived the drift check.
+	Usable bool
+	// Attempt is which attempt of the probe it belongs to, from 1.
+	Attempt int
 }
 
 // Probe measures how many cores this host actually delivers under parallel load.
@@ -120,8 +178,8 @@ type ProbeResult struct {
 // eight either: the efficiency cores are a fraction of the speed, so a machine asked for eight
 // cores of compiler delivers materially fewer than eight cores of compiling. `budget.MaxSlots`
 // divides capacity by 1.2 cores per slot, so that error lands straight in B_max. Measured on
-// this host, the probe reports about 6.1 of 8 — which is four fast cores plus four at roughly
-// half throughput, and is the number the hardware predicts.
+// this host, the probe reports about 5.6 of 8 — four fast cores plus four at roughly 0.4 of
+// their throughput. (Before GOV-47 this said 6.1; that figure was a maximum, and see below.)
 //
 // A ratio of measured throughputs sees this and a core count cannot. It also, for free, covers
 // every other reason a core is not a core — SMT siblings sharing an execution unit, a noisy
@@ -129,32 +187,36 @@ type ProbeResult struct {
 // thermal limits on a machine that has been busy. None of those are enumerated anywhere; all
 // of them show up as throughput that did not scale.
 //
-// # The shape: three phases, repeated, and the maximum taken
+// # The shape: three phases, repeated, and the second-highest taken
 //
 // One repetition is one worker, then Workers of them, then one worker again. Its ratio is the
 // parallel throughput over the mean of the two single-worker phases, and those two phases are
 // also the canary that says whether the machine held still — ProbeMaxDrift, which is the
 // lesson docs/climb-condition.md §4.4 paid for with a discarded run.
 //
-// # Why the MAXIMUM over repetitions, and not the mean or the median
+// # Which repetition, and why not the maximum
 //
-// BECAUSE THE NOISE IS ONE-SIDED, AND THAT IS A FACT ABOUT THE MECHANISM RATHER THAN A HOPE.
-// The only thing background work can do to this ratio is depress it: other runnable threads
-// steal a share of the parallel phase, so every contaminated repetition reads LOW and none can
-// read high. The hardware's true parallel scaling is therefore the upper envelope of the
-// samples, not their centre — and the mean of a set of measurements whose errors all point the
-// same way is a biased estimate of the wrong thing.
+// THE NOISE IS TWO-SIDED, AND THE MAXIMUM PICKS THE WRONG SIDE OF IT. Background work steals a
+// share of the parallel phase and reads LOW; that much is what the estimator used to assume was
+// all there is. But a single-worker baseline that runs slow — scheduled onto an efficiency core,
+// or caught behind another thread — shrinks the denominator and reads HIGH, and the maximum
+// selects precisely that repetition. Measured over 30 trials on this host (docs/calibration.md
+// §8): the repetition that won the maximum had a median drift of 0.123 against 0.011 for every
+// other repetition, and the maximum ranged 5.01 to 7.05 — enough to move b_max between 4 and 5
+// on eleven trials in thirty. A drift gate cannot repair it: tightened to 0.03 it still kept
+// the 7.05, because both baselines of that repetition were slow together and agreed.
 //
-// THE ALTERNATIVE WAS MEASURED AND IS NOT USABLE, which is why this is not an argument from
-// first principles alone. A single repetition, taken twelve times on this host as it settled
-// from loadavg1 16.7 to 8.8, reported 1.89, 3.13, 3.83, 3.94, 5.33, 5.40, 5.47, 6.05 and three
-// failures: a 3.2x spread on a fixed property of the hardware. The maximum over five, taken six
-// times over background load from 7.9 to 12.1, reported 5.70, 5.71, 6.31, 5.69, 6.53 and 6.81.
-// The estimator that is stable across a 50% change in background load is the one that is
-// measuring the machine.
+// THE SECOND-HIGHEST KEEPS WHAT THE MAXIMUM WAS FOR AND DROPS WHAT IT GOT WRONG. It is still
+// the upper envelope, so contention that depresses most repetitions still does not drag the
+// answer down; but one inflated repetition can no longer win. Over the same 30 trials it ranged
+// 4.99 to 5.80 with a standard deviation of 0.18 against the maximum's 0.35, and gave b_max 4
+// on every one. The median and the mean were tried on the same data and are worse (0.25, 0.27):
+// they let contention back in.
 //
-// Spread is reported rather than hidden, and it is what a reader should judge the number on: a
-// wide spread means the machine was busy during the probe, not that the hardware is uncertain.
+// AND IT IS CHECKED BEFORE IT IS USED. The second-highest is only trusted when the third-highest
+// agrees with it (ProbeMaxDisagreement); otherwise the probe measures again, and then declines
+// (ProbeAttempts). A probe that cannot produce a trusted figure reports that, and Derive writes
+// nothing from it.
 //
 // # Politeness
 //
@@ -194,46 +256,79 @@ func Probe(ctx context.Context, cores int, ambient float64, opts Options) ProbeR
 		return r
 	}
 
-	opts.announce(probeNotice(workers, time.Duration(reps)*3*d))
-
-	best, worst, bestDrift := 0.0, 0.0, 0.0
-	for i := 0; i < reps; i++ {
+	for attempt := 1; attempt <= ProbeAttempts; attempt++ {
 		if ctx.Err() != nil {
 			break
 		}
-		eff, drift, ok := oneRep(ctx, workers, d)
-		if !ok {
-			continue
+		if attempt == 1 {
+			opts.announce(probeNotice(workers, time.Duration(reps)*3*d))
+		} else {
+			opts.announce(probeRetryNotice(r.Reason, time.Duration(reps)*3*d))
 		}
-		r.UsableReps++
-		if eff > best {
-			best, bestDrift = eff, drift
+		r.Attempts = attempt
+		var samples []RepSample
+		for i := 0; i < reps; i++ {
+			if ctx.Err() != nil {
+				break
+			}
+			eff, drift, ok := oneRep(ctx, workers, d)
+			samples = append(samples, RepSample{Eff: eff, Drift: drift, Usable: ok, Attempt: attempt})
 		}
-		if worst == 0 || eff < worst {
-			worst = eff
+		r.Samples = append(r.Samples, samples...)
+		if summarise(&r, samples) {
+			return r
 		}
 	}
-
-	if r.UsableReps < ProbeMinUsableReps {
-		// Distinguished from a skip: the probe ran and the machine would not hold still for
-		// it. Falling back to the uncalibrated core count is the same outcome either way,
-		// but they are different facts and the provenance note says which happened.
-		r.Reason = "the machine would not hold still: too few repetitions survived the drift check"
-		return r
+	if r.Reason == "" {
+		r.Reason = "cancelled before the probe finished"
 	}
-	r.EffectiveCores = math.Round(best*100) / 100
-	r.Spread = math.Round((best-worst)*100) / 100
-	r.Drift = bestDrift
-	r.OK = true
 	return r
 }
+
+// summarise judges one attempt's repetitions, filling r, and reports whether they produced a
+// figure that can be trusted. It is pure so the decision can be tested against repetitions
+// recorded on real hardware rather than against whatever the test machine happens to do.
+func summarise(r *ProbeResult, samples []RepSample) bool {
+	var usable []RepSample
+	for _, s := range samples {
+		if s.Usable {
+			usable = append(usable, s)
+		}
+	}
+	sort.Slice(usable, func(i, j int) bool { return usable[i].Eff > usable[j].Eff })
+	r.UsableReps = len(usable)
+	r.OK, r.EffectiveCores, r.Spread, r.Drift, r.Disagreement = false, 0, 0, 0, 0
+
+	if len(usable) < ProbeMinUsableReps {
+		// Distinguished from a skip: the probe ran and the machine would not hold still for
+		// it. A skip is a decision and this is a failed measurement; the provenance note
+		// says which happened.
+		r.Reason = "the machine would not hold still: too few repetitions survived the drift check"
+		return false
+	}
+	est, next := usable[1], usable[2]
+	r.Spread = round2(usable[0].Eff - usable[len(usable)-1].Eff)
+	r.Disagreement = round3((est.Eff - next.Eff) / est.Eff)
+	if r.Disagreement > ProbeMaxDisagreement {
+		r.Reason = fmt.Sprintf("the repetitions disagreed: the two the answer rests on are %.0f%% apart, "+
+			"more than the %.0f%% a figure is trusted at", r.Disagreement*100, ProbeMaxDisagreement*100)
+		return false
+	}
+	r.EffectiveCores = round2(est.Eff)
+	r.Drift = est.Drift
+	r.Reason = ""
+	r.OK = true
+	return true
+}
+
+func round2(v float64) float64 { return math.Round(v*100) / 100 }
+func round3(v float64) float64 { return math.Round(v*1000) / 1000 }
 
 // oneRep runs a single three-phase repetition and returns its scaling ratio.
 //
 // A repetition that fails its drift check returns ok false and is dropped rather than clamped
-// to something. The maximum over the survivors is the estimator; feeding it a reading taken
-// across a machine that changed speed would let exactly the wrong sample win, because a
-// denominator that sagged mid-repetition produces a ratio that is too HIGH.
+// to something: a denominator that sagged mid-repetition produces a ratio that is too HIGH,
+// and the estimator takes the upper envelope. Its raw ratio is still returned, for the record.
 func oneRep(ctx context.Context, workers int, d time.Duration) (eff, drift float64, ok bool) {
 	one := spin(ctx, 1, d)
 	many := spin(ctx, workers, d)
@@ -248,7 +343,8 @@ func oneRep(ctx context.Context, workers int, d time.Duration) (eff, drift float
 	}
 	drift = math.Abs(oneAgain-one) / single
 	if drift > ProbeMaxDrift {
-		return 0, drift, false
+		// The raw ratio is returned for the record only; ok false means no caller uses it.
+		return many / single, drift, false
 	}
 	eff = many / single
 	if eff < 1 {
@@ -259,9 +355,8 @@ func oneRep(ctx context.Context, workers int, d time.Duration) (eff, drift float
 	}
 	if eff > float64(workers) {
 		// Above the worker count means the measurement caught the machine getting FASTER
-		// between phases — the reverse of drift, and the same non-reading. Clamping matters
-		// more here than anywhere else in this file precisely because the estimator is a
-		// maximum: an unclamped outlier would win every time.
+		// between phases — the reverse of drift, and the same non-reading. Clamped so that a
+		// physically impossible figure is never what the estimator reports.
 		eff = float64(workers)
 	}
 	return eff, drift, true

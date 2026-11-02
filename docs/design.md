@@ -945,21 +945,46 @@ the provenance, and says to re-run it mid-session.
 instantaneous and therefore *is* measurable in seconds, which is what separates it from the
 run queue. `runtime.NumCPU()` reports 8 on a machine with four performance and four efficiency
 cores; the probe measures parallel throughput over single-worker throughput and reports about
-**6.1**, which is what that hardware physically predicts. It also catches, without enumerating
-them, every other reason a core is not a core — SMT siblings, a noisy cloud neighbour, a quota
-the cgroup reader missed. A calibrated `B_max` may only **lower** the per-tick
+**5.6** on that machine (GOV-47; an earlier "about 6.1" came from the estimator replaced below).
+It also catches, without enumerating them, every other reason a core is not a core — SMT
+siblings, a noisy cloud neighbour, a quota the cgroup reader missed. A calibrated `B_max` may only **lower** the per-tick
 `floor(capacity / 1.2)`, never raise it, because that recomputation exists so a cgroup quota
 changed under a running daemon is followed within the second.
 
-**The probe's estimator is the maximum over repetitions, and that is a measured choice.**
-Background work can only ever depress the ratio, so the noise is one-sided and the hardware's
-true scaling is the upper envelope. Measured: a single three-phase reading, taken twelve times
-as this host settled, ranged **1.89 to 6.05** — a 3.2× spread on a fixed property, with four of
-twelve failing their drift check. The maximum over five, taken six times across background load
-from 7.9 to 12.1, gave **5.70, 5.71, 6.31, 5.69, 6.53, 6.81**. The estimator that survives a
-50% change in background load is the one measuring the machine. The probe is announced before
-it runs, is about 3.8 s of load, and declines outright on a machine already loaded past 4.0 per
-core, where it would be measuring the other workload.
+**The probe's estimator is the second-highest repetition, and it is checked before it is
+used.** Contention can only depress the ratio, which is why this section used to specify the
+maximum. But a single-worker baseline that runs slow — on an efficiency core, or behind another thread — shrinks the
+denominator and reads *high*, and the maximum selects exactly that repetition. Measured over 30 trials on the reference host
+([calibration.md](calibration.md) §8): the winning repetition's median drift was **0.123**
+against **0.011** for the rest, the maximum ranged **5.01 to 7.05**, and b_max flipped between 4
+and 5 on eleven of the thirty. The second-highest keeps the upper envelope that resists
+contention, cannot be won by one inflated repetition, and over the same trials ranged
+**4.99 to 5.80**, b_max 4 every time. Validated on 23 further probes it was not fitted to:
+**5.18 to 5.78**, b_max 4 every time, where the maximum over the same repetitions would have
+written 5 on four of them.
+
+**The probe's answer is trusted only when the repetitions it rests on agree.** The second- and
+third-highest usable repetitions must be within **6%** of each other (`ProbeMaxDisagreement`).
+That is a different quantity from the in-repetition drift check, which every repetition of the
+runs GOV-47 was filed over passed; and it is not the spread, which over the same trials did not
+predict a bad answer (+0.12 correlation, against +0.61 for this gap). A disagreeing attempt is
+measured once more, and a second disagreement **declines**. In validation two probes of 23 needed
+the second attempt and none declined. The check bounds the probe's disagreement with itself, not
+its error: one later live run read 6.30 from repetitions that agreed, which is an escape no
+comparison between repetitions can catch ([calibration.md](calibration.md) §8.4). `calibrate`
+prints every repetition so the next one can be diagnosed. A declined, skipped or failed probe
+derives nothing: the stored b_max is kept and the output says so, and where nothing is stored,
+b_max is written as uncalibrated (zero) rather than as the raw core count — which on the
+reference host would be 6 against a measured 4. The run-queue cut is resolved the same way and
+independently: each output is kept or replaced on its own measurement.
+
+**Ambient load does not predict the probe's answer, so `calibrate` gives no advice about it.**
+Across both batches, loadavg1 ran from 2.1 to 30.7 where the probe ran, and the answer's
+correlation with ambient run queue was −0.05 and −0.02. The advice `calibrate` prints — re-run it mid-session — is about the
+run-queue cut, whose baseline *is* the ambient load, and the output says it is about the cut
+only. The probe is announced before it runs, is about 3.8 s of load per attempt, and declines
+outright on a machine already loaded past 4.0 per core, where it would be measuring the other
+workload.
 
 **Not calibrated: the setpoint, and the EWMA window.** Both would be numbers no code reads. The
 setpoint stopped being a control input when GOV-32 removed utilisation from the loop. The EWMA
