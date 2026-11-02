@@ -46,7 +46,7 @@ func calibrateCommand(args []string, stdout, stderr io.Writer, checkDaemon bool)
 	fs := flag.NewFlagSet("governor calibrate", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	dryRun := fs.Bool("dry-run", false, "measure and print, but write nothing")
-	noProbe := fs.Bool("no-probe", false, "skip the load probe; B_max falls back to the core count")
+	noProbe := fs.Bool("no-probe", false, "skip the load probe; b_max keeps its stored value")
 	quiet := fs.Bool("quiet", false, "print only what changed")
 	if err := fs.Parse(args); err != nil {
 		return 2
@@ -84,13 +84,11 @@ func calibrateCommand(args []string, stdout, stderr io.Writer, checkDaemon bool)
 		fmt.Fprintf(stderr, "governor calibrate: %v\n", err)
 		return 1
 	}
-	d := calibrate.Derive(m)
+	prev := calibrate.Prior{RunQueueMax: before.RunQueueMax, BMax: before.BMax, At: before.CalibratedAt}
+	o := calibrate.Resolve(calibrate.Derive(m), prev)
 
 	if !*quiet {
-		fmt.Fprint(stdout, calibrate.Report(m, d, calibrate.Derived{
-			RunQueueMax: before.RunQueueMax,
-			BMax:        before.BMax,
-		}))
+		fmt.Fprint(stdout, calibrate.Report(m, o, prev))
 	}
 
 	if *dryRun {
@@ -102,17 +100,17 @@ func calibrateCommand(args []string, stdout, stderr io.Writer, checkDaemon bool)
 	// a merge into the user's config, not a replacement of it: `calibrate` owns three fields
 	// and has no business resetting a hand-edited endpoint or a wait timeout.
 	after := before
-	after.RunQueueMax = d.RunQueueMax
-	after.BMax = d.BMax
+	after.RunQueueMax = o.RunQueueMax
+	after.BMax = o.BMax
 	after.CalibratedAt = m.At.UTC().Format(time.RFC3339)
-	after.CalibratedFrom = calibrate.Provenance(m)
+	after.CalibratedFrom = calibrate.Provenance(m, o)
 
 	if err := store.Save(ctx, after); err != nil {
 		fmt.Fprintf(stderr, "governor calibrate: %v\n", err)
 		return 1
 	}
 	if *quiet {
-		fmt.Fprintf(stdout, "calibrated: run-queue cut %.2f per core, b_max %d slots\n", d.RunQueueMax, d.BMax)
+		fmt.Fprintf(stdout, "calibrated: run-queue cut %s, b_max %s%s\n", quietCut(o.RunQueueMax), quietBMax(o.BMax), keptNote(o))
 	} else {
 		fmt.Fprintf(stdout, "\nwritten to %s\n", path)
 	}
@@ -164,4 +162,31 @@ func noteDaemonDrift(stdout io.Writer) {
 // runs this binary rather than whatever bare `governor` resolves to (GOV-43/GOV-45/GOV-46).
 func calibrateFix() string {
 	return governorCommand("install")
+}
+
+// keptNote is the --quiet line's admission that a number was carried forward, not measured.
+func keptNote(o calibrate.Outcome) string {
+	switch {
+	case o.BMaxKept && o.RunQueueMaxKept:
+		return " (both kept from the previous calibration)"
+	case o.BMaxKept:
+		return " (b_max kept: the probe was not trusted)"
+	case o.RunQueueMaxKept:
+		return " (run-queue cut kept: the load average could not be read)"
+	}
+	return ""
+}
+
+func quietCut(v float64) string {
+	if v == 0 {
+		return "uncalibrated"
+	}
+	return fmt.Sprintf("%.2f per core", v)
+}
+
+func quietBMax(n int) string {
+	if n == 0 {
+		return "uncalibrated"
+	}
+	return fmt.Sprintf("%d slots", n)
 }

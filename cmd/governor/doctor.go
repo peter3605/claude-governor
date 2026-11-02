@@ -2202,6 +2202,17 @@ func (d *diagnosis) checkCalibration() {
 			return
 		}
 	}
+	if c.BMax == 0 {
+		// GOV-47: a probe that did not produce a trusted figure writes no b_max rather than the
+		// raw core count, so a host can carry a measured cut and an unmeasured ceiling. Saying
+		// "b_max 0 slots" and passing would hide that the ceiling is the uncalibrated one.
+		d.add("calibration", warn,
+			fmt.Sprintf("measured %s: run-queue cut %.2f per core, but b_max was not measured — "+
+				"the probe did not produce a figure it trusted, so the ceiling comes from the core count",
+				c.CalibratedAt, c.RunQueueMax),
+			governorCommand("calibrate"))
+		return
+	}
 	d.add("calibration", pass, detail, "")
 }
 

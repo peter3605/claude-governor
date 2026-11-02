@@ -17,6 +17,13 @@ func probeNotice(workers int, total time.Duration) string {
 		workers, total.Round(100*time.Millisecond))
 }
 
+// probeRetryNotice is the line printed before a second attempt: why the first was not used,
+// and that the load is about to happen again.
+func probeRetryNotice(why string, total time.Duration) string {
+	return fmt.Sprintf("not using that measurement (%s); measuring once more: about %s of full load, starting now",
+		why, total.Round(100*time.Millisecond))
+}
+
 // Provenance is the note recorded in the config beside the calibrated numbers: when this host
 // was measured, and from what.
 //
@@ -25,7 +32,7 @@ func probeNotice(workers int, total time.Duration) string {
 // rather than a nicety. It is one line so it survives being read in a JSON file, and it names
 // the reading that decided the threshold rather than merely the tool that wrote it, because
 // "governor calibrate wrote this" tells a reader nothing they could act on.
-func Provenance(m Measurement) string {
+func Provenance(m Measurement, o Outcome) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "governor calibrate %s", m.At.UTC().Format(time.RFC3339))
 	fmt.Fprintf(&b, "; %d cores", m.Cores)
@@ -39,8 +46,10 @@ func Provenance(m Measurement) string {
 	fmt.Fprintf(&b, "; ambient run queue %.2f per core (loadavg1 %.2f)", m.AmbientRunQueue, m.LoadAvg1)
 	switch {
 	case m.Probe.OK:
-		fmt.Fprintf(&b, "; probe measured %.2f effective cores of %d (max of %d usable of %d reps, spread %.2f)",
-			m.Probe.EffectiveCores, m.Probe.Workers, m.Probe.UsableReps, m.Probe.Reps, m.Probe.Spread)
+		fmt.Fprintf(&b, "; probe measured %.2f effective cores of %d (second-highest of %d usable of %d reps, "+
+			"%.1f%% from the next, spread %.2f, attempt %d)",
+			m.Probe.EffectiveCores, m.Probe.Workers, m.Probe.UsableReps, m.Probe.Reps,
+			m.Probe.Disagreement*100, m.Probe.Spread, m.Probe.Attempts)
 	case m.Probe.Skipped:
 		fmt.Fprintf(&b, "; probe skipped (%s)", m.Probe.Reason)
 	case m.Probe.Reason != "":
@@ -48,7 +57,18 @@ func Provenance(m Measurement) string {
 	default:
 		b.WriteString("; probe not run")
 	}
-	fmt.Fprintf(&b, "; run-queue cut = ambient + %.2f headroom, floored at the shipped 2.0", BuildHeadroom)
+	switch {
+	case o.BMaxKept:
+		fmt.Fprintf(&b, "; b_max %d kept from the calibration of %s, not re-measured", o.BMax, orUnknown(o.KeptFrom))
+	case o.BMax == 0:
+		b.WriteString("; b_max not calibrated")
+	}
+	if o.RunQueueMaxKept {
+		fmt.Fprintf(&b, "; run-queue cut %.2f kept from the calibration of %s, ambient unreadable",
+			o.RunQueueMax, orUnknown(o.KeptFrom))
+	} else {
+		fmt.Fprintf(&b, "; run-queue cut = ambient + %.2f headroom, floored at the shipped 2.0", BuildHeadroom)
+	}
 	return b.String()
 }
 
@@ -62,7 +82,7 @@ func orUnknown(s string) string {
 // Report renders a calibration for a person, which is a different job from Provenance. It is
 // what `governor calibrate` prints: what was measured, what was derived, and — the part a
 // one-line note cannot carry — what to do about a reading that is not representative.
-func Report(m Measurement, d Derived, prev Derived) string {
+func Report(m Measurement, o Outcome, prev Prior) string {
 	var b strings.Builder
 
 	b.WriteString("measured\n")
@@ -80,24 +100,55 @@ func Report(m Measurement, d Derived, prev Derived) string {
 	case m.Probe.OK:
 		fmt.Fprintf(&b, "  effective cores    %.2f of %d under parallel load\n",
 			m.Probe.EffectiveCores, m.Probe.Workers)
-		fmt.Fprintf(&b, "                     (max of %d usable of %d repetitions, spread %.2f)\n",
-			m.Probe.UsableReps, m.Probe.Reps, m.Probe.Spread)
+		fmt.Fprintf(&b, "                     (second-highest of %d usable of %d repetitions, %.1f%% from the next)\n",
+			m.Probe.UsableReps, m.Probe.Reps, m.Probe.Disagreement*100)
 	case m.Probe.Skipped:
 		fmt.Fprintf(&b, "  effective cores    not measured: %s\n", m.Probe.Reason)
+	case m.Probe.Reason != "":
+		fmt.Fprintf(&b, "  effective cores    not trusted, nothing derived from it: %s\n", m.Probe.Reason)
 	default:
-		fmt.Fprintf(&b, "  effective cores    probe failed: %s\n", m.Probe.Reason)
+		fmt.Fprintf(&b, "  effective cores    not measured (--no-probe)\n")
+	}
+	// Every repetition, trusted or not. GOV-47's one live escape — 6.30 from repetitions that
+	// agreed with each other — could not be diagnosed, because only the summary was printed.
+	if len(m.Probe.Samples) > 0 {
+		fmt.Fprintf(&b, "  repetitions        %s\n", repetitions(m.Probe.Samples))
 	}
 
 	b.WriteString("\nderived\n")
-	fmt.Fprintf(&b, "  run-queue cut      %.2f per core%s\n", d.RunQueueMax, moved(d.RunQueueMax, prev.RunQueueMax))
-	fmt.Fprintf(&b, "  b_max              %d slots%s\n", d.BMax, movedInt(d.BMax, prev.BMax))
+	switch {
+	case o.RunQueueMaxKept:
+		fmt.Fprintf(&b, "  run-queue cut      %.2f per core  (kept: the load average could not be read)\n", o.RunQueueMax)
+	case o.RunQueueMax == 0:
+		fmt.Fprintf(&b, "  run-queue cut      not calibrated: the load average could not be read\n")
+	default:
+		fmt.Fprintf(&b, "  run-queue cut      %.2f per core%s\n", o.RunQueueMax, moved(o.RunQueueMax, prev.RunQueueMax))
+	}
+	switch {
+	case o.BMaxKept:
+		fmt.Fprintf(&b, "  b_max              %d slots  (kept from %s: this probe was not trusted, so it changes nothing)\n",
+			o.BMax, orUnknown(o.KeptFrom))
+	case o.BMax == 0:
+		fmt.Fprintf(&b, "  b_max              not calibrated: the daemon derives it from the core count until a probe succeeds\n")
+	default:
+		fmt.Fprintf(&b, "  b_max              %d slots%s\n", o.BMax, movedInt(o.BMax, prev.BMax))
+	}
 
 	// THE ADVICE IS PART OF THE OUTPUT, because the limitation it names is the one this
 	// measurement genuinely has and the one a reader cannot see from the numbers.
+	//
+	// IT IS ABOUT THE CUT AND SAYS SO, because it used to be readable as advice about the
+	// probe, and the probe has no such limitation: over 53 recorded probes on one host its
+	// answer did not track ambient load (correlation -0.05 and -0.02 in two batches, loadavg1
+	// 2.1 to 30.7 — docs/calibration.md §8). Telling someone to calibrate "while busy" for the sake of b_max
+	// would be advice the evidence does not support, and the second paragraph says the thing
+	// that makes the re-run safe: an untrusted probe cannot make b_max worse.
 	b.WriteString("\nThe run-queue cut is placed above what this machine was doing in the minute\n")
 	b.WriteString("before now. That is the right baseline only if now is representative — a\n")
 	b.WriteString("machine calibrated while idle will throttle once you are actually working.\n")
 	b.WriteString("Re-run `governor calibrate` mid-session to correct it.\n")
+	b.WriteString("\nThat advice is about the cut only. b_max does not depend on how busy the\n")
+	b.WriteString("machine is, and a probe that does not trust its own answer keeps the stored one.\n")
 	return b.String()
 }
 
@@ -113,4 +164,23 @@ func movedInt(now, before int) string {
 		return ""
 	}
 	return fmt.Sprintf("  (was %d)", before)
+}
+
+// repetitions renders every repetition in run order: its ratio, with a dagger on one the drift
+// check dropped, and a bar between attempts.
+func repetitions(samples []RepSample) string {
+	var parts []string
+	attempt := samples[0].Attempt
+	for _, r := range samples {
+		if r.Attempt != attempt {
+			parts = append(parts, "|")
+			attempt = r.Attempt
+		}
+		mark := ""
+		if !r.Usable {
+			mark = "†"
+		}
+		parts = append(parts, fmt.Sprintf("%.2f%s", r.Eff, mark))
+	}
+	return strings.Join(parts, " ")
 }

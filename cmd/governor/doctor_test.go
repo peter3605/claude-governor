@@ -1065,6 +1065,13 @@ func TestDoctorReportsWhetherThisHostWasEverMeasured(t *testing.T) {
 			state: "ok",
 		},
 		{
+			// GOV-47: the cut was measured, the probe declined and nothing was stored before it.
+			name: "calibrated, but the probe never produced a trusted b_max", write: true,
+			body: fmt.Sprintf(`{"schema": %d, "run_queue_max": 4.7, "b_max": 0, "calibrated_at": "2026-11-01T00:00:00Z", "calibrated_from": "governor calibrate 2026-11-01T00:00:00Z; %d cores (4 performance, 4 efficiency); b_max not calibrated"}`,
+				configSchemaVersion, runtime.NumCPU()),
+			state: "warn",
+		},
+		{
 			name: "calibrated on a machine with a different core count", write: true,
 			body: fmt.Sprintf(`{"schema": %d, "run_queue_max": 3.4, "b_max": 5, "calibrated_at": "2026-09-16T00:00:00Z", "calibrated_from": "governor calibrate 2026-09-16T00:00:00Z; %d cores (no performance/efficiency split published by this platform)"}`,
 				configSchemaVersion, runtime.NumCPU()+9),

@@ -255,19 +255,27 @@ governor calibrate
 It reads your core count and memory, reads how loaded the machine already is, and runs a
 short load probe. The probe is announced before it starts, and it is skipped if the machine is
 already busy. The probe measures how many cores this hardware actually delivers in parallel,
-which is often fewer than it advertises. The output, and the config it writes, record when the
-measurement was taken and from what.
+which is often fewer than it advertises. It checks its own repetitions against each other and
+only uses an answer they agree on: if they disagree it measures once more, and if they still
+disagree it keeps whatever b_max an earlier calibration measured rather than writing a worse
+one. The output, and the config it writes, record when the measurement was taken, from what,
+and which numbers were kept rather than re-measured.
 
 `governor install` runs it once at the end. **Re-run it while you are doing real work**, when:
 
 - **You calibrated on an idle machine.** The cut level is placed above what the machine was
   doing in the minute before calibrate ran. Measured idle, the governor will throttle you as
-  soon as you are not.
+  soon as you are not. This is about the cut level only: the probe's answer does not depend on
+  how busy the machine is ([§5.2a](design.md#52a-calibration-where-those-constants-come-from-on-a-machine-that-is-not-this-one)), so there is
+  no need to quiet the machine for it, and re-running cannot make b_max worse.
 - **Your normal workload changes**, for example a new project with heavier builds, or a
   language server that is always running.
 - **The hardware changes.** `governor doctor`'s `calibration` check warns when the config was
   measured on a machine with a different core count, and when the machine has never been
   measured at all.
+- **`governor doctor` says b_max was not measured.** The cut level was measured but the probe
+  never produced an answer it trusted, so the ceiling comes from the raw core count. Run
+  calibrate again.
 
 **Calibration takes effect when the daemon next starts.** The daemon reads its config once, at
 start-up ([§13.4](design.md#134-config-and-upgrade)), and `governor install` leaves a healthy

@@ -254,3 +254,169 @@ the numbers are now at least *converged* for the workload they do describe.
 so the concurrency curve carries throughput beside run queue. Then the operating point is a
 measurement rather than an inheritance, and both this constant and `RunQueueBand` can be derived
 from the same curve.
+
+---
+
+## 8. The probe (GOV-47)
+
+Sections 1–7 calibrate the run-queue cut. This section is about the other number `calibrate`
+writes, b_max, which comes from the load probe: effective cores, divided by 1.2 cores per slot
+and floored. On this host, 4.8 to 6.0 effective cores is b_max 4. Below 4.8 is 3, and 6.0 or
+more is 5.
+
+### 8.1 The seven runs that opened the story
+
+Seven `governor calibrate` runs on this MacBook Air (8 cores, 4 performance) on 2026-10-31 and
+2026-11-01, same binary. The figures come from the story as filed, from config.json, and from
+the calibrate output kept in two session transcripts of 2026-10-31. **"Not recorded" means none
+of those sources holds the figure.** Nothing here was reconstructed. Run-queue cut is ambient + 4.30.
+
+| run | loadavg1 | ambient rq / core | effective cores (max) | spread | reps usable | b_max | run-queue cut | source |
+|---|---|---|---|---|---|---|---|---|
+| A | not recorded | not recorded | probe failed | — | not recorded | **6** (core-count fallback) | not recorded | story |
+| B | 5.79 | 0.72 | 5.37 | 0.84 | **3 of 5** | 4 | 5.02 | 2026-10-31 transcript |
+| C | 16.65 | 2.08 | 5.74 | 0.37 | not recorded | 4 | 6.38 | story |
+| D | 3.38 | 0.42 | 5.78 | 1.02 | 5 of 5 | 4 | 4.72 | config.json, 2026-11-01T19:34:07Z |
+| E | 2.75 | 0.34 | 4.75 | 1.45 | not recorded | **3** | 4.64 | story |
+| F | not recorded | 1.04 or 1.78 | 5.70 | 0.60 | not recorded | 4 | 5.34 or 6.08 | story |
+| G | not recorded | 1.78 or 1.04 | 5.01 | 1.10 | not recorded | 4 | 6.08 or 5.34 | story |
+
+The story lists the six successful runs' cuts (4.64, 4.72, 5.02, 5.34, 6.08, 6.38) and their
+spreads, but it does not pair F and G with a cut. One correction to the story: it says every run
+reported "5 of 5 repetitions usable". Run B's own output says 3 of 5. A further run on 2026-10-31
+(loadavg1 4.11, ambient 0.51, max 5.39, spread 0.74, 4 of 5 usable, cut 4.81) is in the same
+transcript but is not one of the seven.
+
+These are summaries. Each run printed only its max and its range, and the repetitions behind
+them were not kept. So the bound could not be set from these runs, and §8.2 re-measured instead.
+
+### 8.2 Thirty probes with every repetition kept
+
+`go run ./tools/probetrace -trials 30 -gap 20s`: the same ambient read and `Probe` call
+calibrate makes, 20 s apart, recording every repetition. The machine was in ordinary use, with
+loadavg1 between 2.1 and 27.4. Raw data: [`data/calibration/gov-47-probe-trials-max.json`](data/calibration/gov-47-probe-trials-max.json).
+
+Every one of the 30 reported OK. These are the estimators that could be computed from the same
+repetitions:
+
+| estimator | range | sd | b_max over 30 probes |
+|---|---|---|---|
+| **maximum** (shipped) | 5.01 – **7.05** | 0.345 | 4 ×19, **5 ×11** |
+| second-highest | 4.99 – 5.80 | **0.184** | **4 ×30** |
+| median | 4.41 – 5.70 | 0.247 | 3 ×1, 4 ×29 |
+| mean | 4.52 – 5.83 | 0.266 | 3 ×1, 4 ×29 |
+
+**The maximum's premise is wrong.** probe.go argued that noise is one-sided: contention steals
+from the parallel phase, so contaminated repetitions read low and none read high. The data says
+otherwise. **The repetition that won the maximum had a median drift of 0.123. Every other
+repetition had 0.011.** The winning repetition is systematically the one whose single-worker
+baseline moved. A slow baseline shrinks the denominator and inflates the ratio, which is exactly
+the case `oneRep`'s own comment warned about. The 25% drift gate is far too loose to stop it.
+
+**Tightening the drift gate does not fix it.** At gates of 0.10, 0.05 and 0.03 the maximum still
+reached 7.05 (trial 22). Both baselines of that repetition were slow together, so they agreed with
+each other and the drift check, which compares them, could not see it. This is the story's
+trap stated as a measurement: the bound has to be a different quantity from drift.
+
+**What predicts a bad answer.** Error here means how far the second-highest landed from its
+median across the 30 probes, 5.64. Correlation of each candidate with that error:
+
+| candidate | correlation with error |
+|---|---|
+| full spread (max − min) / max | +0.12 |
+| ambient run queue | −0.03 |
+| top-two gap (max − second) / max | −0.30 |
+| **gap between 2nd and 3rd, / 2nd** | **+0.61** |
+
+The spread was the obvious candidate and it predicts almost nothing. It is dominated by the
+lowest repetition, which the estimator already ignores. The gap between the two repetitions an
+answer rests on does predict it. Over the 30 probes that gap was 5.2% or less on 29. The 30th was
+11.6%, on trial 26, the probe whose answer was furthest off (4.99, the only one more than half a
+slot from 5.64).
+
+### 8.3 What was changed
+
+- **Estimator: the second-highest usable repetition.** It keeps the upper envelope, which is
+  what made the maximum resist contention. A single inflated repetition can no longer win.
+- **Trust bound: the 2nd and 3rd highest must agree within 6%** (`ProbeMaxDisagreement`). The
+  bound sits just above the body of §8.2's distribution and rejects the one answer in it that was wrong.
+- **On a disagreement: measure once more, then decline** (`ProbeAttempts` = 2). Each attempt is
+  announced.
+- **A declined, skipped or failed probe derives nothing.** The stored b_max is kept, and the
+  output and provenance say so. With nothing stored, b_max is written as 0 (uncalibrated), and
+  the daemon derives its own ceiling. Before this, the probe fell back to the raw core count:
+  run A's b_max 6, written as if measured.
+- **The run-queue cut is resolved the same way, independently.** An unreadable load average
+  used to write 0 over a good cut.
+
+### 8.4 Validation, on probes the bound was not set from
+
+The same tool after the change: 25 trials, 15 s apart. Raw data:
+[`data/calibration/gov-47-probe-trials-validation.json`](data/calibration/gov-47-probe-trials-validation.json).
+
+| | |
+|---|---|
+| probes | 25. Two were skipped by `ProbeSkipAbove`: something else on the machine pushed loadavg1 to 48.3 and 38.7, ambient 6.0 and 4.8 per core |
+| accepted | **23 of 23** that ran. 21 passed on the first attempt and 2 on the retry. None declined |
+| effective cores | **5.18 – 5.78**, sd 0.135, median 5.63 (§8.2's centre: 5.64) |
+| b_max | **4 on all 23** |
+| the maximum, over the same accepted attempts | 5.58 – 6.20. It would have written **b_max 5 on 4 of 23** |
+| correlation with ambient run queue | −0.02, loadavg1 2.4 to 30.7 where the probe ran |
+
+**The retry rate came in higher than §8.2 predicted**: 2 in 23 first attempts went over 6%, not
+about 1 in 30. At that rate two disagreements in a row, and so a decline, would be roughly one
+calibration in 130. A decline costs nothing but the update, because the stored value stands.
+
+**One live escape, after validation.** The first real `governor calibrate --dry-run` with the
+change in place reported **6.30** effective cores, b_max 5, with the two repetitions it rests on
+3.0% apart. That is outside every one of the 53 recorded probes, whose highest was 5.80, and the
+agreement check passed it. At least two repetitions read high together, and a check that
+compares repetitions with each other cannot see that. calibrate printed only its summary, so the
+repetitions are lost and the cause is unknown. Six probes recorded straight afterwards
+([`data/calibration/gov-47-probe-trials-after-escape.json`](data/calibration/gov-47-probe-trials-after-escape.json))
+read 5.51–5.69, normal. So the honest count is **one escape in 59 probes run**. The maximum
+would have reported at least 6.30 on the same run, so this is a failure the change does not fix,
+not one it causes. The third-highest repetition would be less exposed to it, and it was checked
+on all the recorded data. It is noisier (sd 0.25 against 0.18 in §8.2) and gave b_max 3 once,
+so it was not adopted. **`calibrate` now prints every repetition**, so the next escape can be
+diagnosed rather than counted.
+
+### 8.5 The story's remaining questions, answered from this data
+
+**Does ambient load predict the probe? No.** Correlation is −0.05 in §8.2 and −0.02 in §8.4,
+with loadavg1 up to 30.7 per probe. Of the seven original runs, the best (C) was taken at
+loadavg1 16.65 and the worst (E) at 2.75. So `calibrate` gives no advice about load for the
+probe's sake. Its closing advice to re-run mid-session is about the run-queue cut, whose baseline
+*is* the ambient load. The output now says the advice applies to the cut only, and that an
+untrusted probe cannot make b_max worse.
+
+**Should the two outputs be measured under the same conditions?** They want different things,
+and it turns out not to matter. The cut needs representative working load. The probe, up to
+`ProbeSkipAbove`, is indifferent to load. So taking both mid-work in one command is right for
+both, and the command stays one command. What it does about the separation is resolve each
+output on its own measurement. A failed probe no longer touches the cut, an unreadable load
+average no longer touches b_max, and `--no-probe` now re-takes the cut alone without disturbing
+a measured b_max. The cut tracking ambient load across the seven runs (4.64 → 6.38) is the cut
+working as designed, not a defect.
+
+**Thermal history.** The story offered that run E, minutes after loadavg1 16.65 on a fanless
+chassis, read low because the machine was warm. Under the new estimator this is moot. §8.2's
+trials 12–14 and §8.4's trials 20–24 were taken as the machine came down from loadavg1 27–31,
+and they answered 5.40–5.73, inside the normal range. Whatever depressed run E, the second-highest
+with the agreement check is not affected by it here.
+
+**"About 6.1 of 8."** probe.go documented this for this hardware. It came from the maximum, and
+the second-highest centres on 5.6. probe.go and design.md §5.2a now say 5.6.
+
+### 8.6 Limits
+
+One host, 59 probes, one afternoon and evening. The 6% bound comes from this machine's
+distribution. A machine whose repetitions are noisier will retry and decline more, which keeps
+whatever an earlier calibration measured. That is the intended failure direction, but nobody has
+measured how often it happens elsewhere.
+
+**A run whose repetitions are wrong together still gets through**, as §8.4's escape did. The
+agreement check bounds how much the probe can disagree with itself, not how wrong it can be.
+Re-running calibrate gives a fresh draw. Nothing yet compares a new answer against the stored
+one, so a single run can still move b_max by a slot. Whether calibrate should refuse a move
+that a second probe does not confirm is the obvious next question, and it is not answered here.

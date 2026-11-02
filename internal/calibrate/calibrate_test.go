@@ -149,8 +149,10 @@ func TestAnUnreadableHostFallsBackToTheShippedDefaults(t *testing.T) {
 		t.Errorf("run-queue cut %.2f from a host whose load could not be read; want 0, so the compiled-in %.2f stands",
 			d.RunQueueMax, budget.RunQueueMax)
 	}
-	if want := budget.MaxSlots(8); d.BMax != want {
-		t.Errorf("b_max %d from an unreadable host, want %d — the same ceiling it had before calibration", d.BMax, want)
+	// Zero, not budget.MaxSlots(8): the daemon reads zero as "uncalibrated" and derives that
+	// same ceiling itself, while a written 6 would claim a measurement nobody took (GOV-47).
+	if d.BMax != 0 {
+		t.Errorf("b_max %d from an unreadable host, want 0 so the daemon's own derivation stands", d.BMax)
 	}
 }
 
@@ -200,12 +202,61 @@ func TestTheProbeIsSkippedOnALoadedMachineRatherThanReportingContention(t *testi
 
 // TestAProbeThatCouldNotRunLeavesTheCeilingWhereItWas.
 //
-// The fallback has to be exactly today's behaviour, or a skipped probe silently becomes a
-// different governor rather than an uncalibrated one.
+// GOV-47 clause 2. A skipped or failed probe used to fall back to CPUCapacity, which on an
+// 8-core Apple laptop wrote b_max 6 against a measured ceiling of 4 — the most permissive answer
+// available, from the least reliable run, over a value an earlier run had measured. A probe that
+// produced nothing derives nothing, and Resolve keeps what is stored.
 func TestAProbeThatCouldNotRunLeavesTheCeilingWhereItWas(t *testing.T) {
-	skipped := Measurement{Cores: 8, CPUCapacity: 8, Probe: ProbeResult{Skipped: true, Reason: "busy"}}
-	if got, want := Derive(skipped).BMax, budget.MaxSlots(8); got != want {
-		t.Errorf("b_max %d after a skipped probe, want the uncalibrated %d", got, want)
+	for _, probe := range []ProbeResult{
+		{Skipped: true, Reason: "busy"},
+		{Reason: "the machine would not hold still"},
+		{}, // --no-probe
+	} {
+		m := Measurement{Cores: 8, CPUCapacity: 8, AmbientOK: true, AmbientRunQueue: 0.5, Probe: probe}
+		d := Derive(m)
+		if d.BMax != 0 {
+			t.Errorf("probe %+v derived b_max %d; an unmeasured ceiling must derive nothing, not the core count",
+				probe, d.BMax)
+		}
+		o := Resolve(d, Prior{BMax: 4, RunQueueMax: 4.72, At: "2026-11-01T19:34:07Z"})
+		if o.BMax != 4 || !o.BMaxKept {
+			t.Errorf("probe %+v overwrote a stored b_max of 4 with %d (kept=%v)", probe, o.BMax, o.BMaxKept)
+		}
+		if o.RunQueueMaxKept || o.RunQueueMax != deriveRunQueueMax(0.5) {
+			t.Errorf("a declined probe held back the run-queue cut, which it has no bearing on: %+v", o)
+		}
+		if p := Provenance(m, o); !strings.Contains(p, "b_max 4 kept from the calibration of 2026-11-01T19:34:07Z") {
+			t.Errorf("provenance does not say the ceiling was kept rather than measured: %s", p)
+		}
+		if r := Report(m, o, Prior{BMax: 4}); !strings.Contains(r, "kept from") {
+			t.Errorf("report does not say the ceiling was kept:\n%s", r)
+		}
+	}
+}
+
+// TestWithNothingStoredAnUnmeasuredCeilingIsWrittenAsUncalibrated: zero, the inert default the
+// daemon already understands, rather than a figure dressed up as a measurement.
+func TestWithNothingStoredAnUnmeasuredCeilingIsWrittenAsUncalibrated(t *testing.T) {
+	m := Measurement{Cores: 8, CPUCapacity: 8, Probe: ProbeResult{Skipped: true, Reason: "busy"}}
+	o := Resolve(Derive(m), Prior{})
+	if o.BMax != 0 || o.BMaxKept {
+		t.Errorf("fresh host, declined probe: wrote b_max %d (kept=%v), want 0", o.BMax, o.BMaxKept)
+	}
+	if p := Provenance(m, o); !strings.Contains(p, "b_max not calibrated") {
+		t.Errorf("provenance does not say the ceiling is uncalibrated: %s", p)
+	}
+}
+
+// TestAnUnreadableLoadAverageKeepsTheStoredCut: the run-queue half of the same rule. The two
+// outputs come from different measurements, so each is kept or replaced on its own evidence.
+func TestAnUnreadableLoadAverageKeepsTheStoredCut(t *testing.T) {
+	m := Measurement{Cores: 8, CPUCapacity: 8, Probe: ProbeResult{OK: true, EffectiveCores: 5.74, Workers: 8}}
+	o := Resolve(Derive(m), Prior{BMax: 3, RunQueueMax: 4.72, At: "x"})
+	if o.RunQueueMax != 4.72 || !o.RunQueueMaxKept {
+		t.Errorf("unreadable ambient overwrote the stored cut: %+v", o)
+	}
+	if o.BMax != 4 || o.BMaxKept {
+		t.Errorf("a trusted probe did not replace the stored ceiling: %+v", o)
 	}
 }
 
@@ -223,7 +274,7 @@ func TestProvenanceNamesTheReadingsAndNotJustTheTool(t *testing.T) {
 		AmbientRunQueue: 2.91, LoadAvg1: 23.28,
 		Probe: ProbeResult{OK: true, EffectiveCores: 6.1, Workers: 8, UsableReps: 5, Reps: 5, Spread: 0.4},
 	}
-	got := Provenance(m)
+	got := Provenance(m, Resolve(Derive(m), Prior{}))
 	t.Log(got)
 	for _, want := range []string{
 		"2026-09-16T12:00:00Z", // when
@@ -247,7 +298,7 @@ func TestProvenanceNamesTheReadingsAndNotJustTheTool(t *testing.T) {
 // the same claim one layer up.
 func TestProvenanceSaysWhenTheSplitWasNotMeasured(t *testing.T) {
 	m := Measurement{At: time.Now(), Cores: 8, PerformanceCores: 8, CPUCapacity: 8}
-	if got := Provenance(m); strings.Contains(got, "8 performance") {
+	if got := Provenance(m, Outcome{}); strings.Contains(got, "8 performance") {
 		t.Errorf("provenance claims a measured performance-core split on a platform that publishes none:\n%s", got)
 	}
 }
