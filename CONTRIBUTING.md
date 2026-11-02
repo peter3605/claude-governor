@@ -262,11 +262,29 @@ contributor does not need it.
 
 ## Releasing
 
-A release is a tag. Pushing `vX.Y.Z` runs `.github/workflows/release.yml`, which builds the
-four binaries, publishes the GitHub release, and then tests the published release on a clean
-macOS machine. The Homebrew tap is then updated by hand. The whole procedure:
+A release is a tag. Pushing `vX.Y.Z` runs `.github/workflows/release.yml`, which takes the
+release notes from [CHANGELOG.md](CHANGELOG.md), builds the four binaries, publishes the
+GitHub release, and then tests the published release on a clean macOS machine. The Homebrew
+tap is then updated by hand. The whole procedure:
 
-### 1. Tag a green `main` with an annotated tag
+### 1. Write the CHANGELOG entry, and merge it before you tag
+
+The release's GitHub notes are the [CHANGELOG.md](CHANGELOG.md) entry for its version, word
+for word: `release.yml`'s first job runs `tools/changelog` against the tag and publishes what
+it prints. **A tag with no entry fails the release** before anything is built. So the entry
+comes first, in its own pull request, through CI and merged to `main`:
+
+```sh
+go run ./tools/changelog -version X.Y.Z      # prints the entry exactly as it will be published
+```
+
+Write it for the person upgrading, in the format the top of [CHANGELOG.md](CHANGELOG.md)
+states. Say what they will notice and what they have to do, not which commits landed. Any
+release that bumps the protocol or the config schema says so (`governor version` prints both).
+There is no `Unreleased` section to promote, so the entry is written fresh from
+`git log vPREVIOUS..origin/main`.
+
+### 2. Tag a green `main` with an annotated tag
 
 ```sh
 git fetch origin
@@ -283,19 +301,21 @@ are annotated; v0.1.2 was pushed as a lightweight tag by mistake. Do not repeat 
 Tag only a commit whose CI is green. The release workflow does not run the test suite; it
 trusts that `main` already did.
 
-### 2. Watch `release.yml`, all three jobs
+### 3. Watch `release.yml`, all four jobs
 
 ```sh
 gh run list --workflow release --limit 1
 gh run watch <run-id>
 ```
 
+- **`notes`** extracts this version's entry from `CHANGELOG.md` with `tools/changelog`, and
+  fails if there is none. Nothing else runs until it passes.
 - **`build`** builds `governor-<os>-<arch>` for darwin and linux, arm64 and amd64, with the
   version stamped from the tag (`governor version` prints `governor X.Y.Z`). darwin is built
   on `macos-latest` with cgo **on**; linux is built with cgo off, so it is static.
 - **`publish`** writes `checksums.txt` (sha256 of every binary), generates `governor.rb`
-  from that file with `tools/brewformula`, and attaches all of it to a GitHub release with
-  generated notes. `install.sh` downloads from `releases/latest`, so from this moment the
+  from that file with `tools/brewformula`, and attaches all of it to a GitHub release whose
+  body is the `notes` job's output. `install.sh` downloads from `releases/latest`, so from this moment the
   release is live for anyone running the one-liner.
 - **`clean-macos`** runs **after** `publish`, against the release as published. On a fresh
   macOS runner with a fresh `HOME` it checks:
@@ -314,11 +334,11 @@ It needs the repository to be public, because it downloads from
 **Known issue:** on current Homebrew, the formula step in `clean-macos` fails with
 `Refusing to load formula local/governor/governor from untrusted tap local/governor`, because
 the job does not yet trust the throwaway tap it creates. That happened on v0.1.2. If that is
-the **only** failure, the release itself is sound. Do the Homebrew check by hand in step 4
+the **only** failure, the release itself is sound. Do the Homebrew check by hand in step 5
 before you announce anything. Any other failure in `clean-macos` means the release is bad:
-go to step 5.
+go to step 6.
 
-### 3. Copy that release's `governor.rb` into the tap
+### 4. Copy that release's `governor.rb` into the tap
 
 The tap is a separate repository, `peter3605/homebrew-claude-governor`, so that
 `brew install peter3605/claude-governor/governor` resolves. Copy the formula **attached to
@@ -343,7 +363,7 @@ This step is manual on purpose. Automating it would mean storing a token with wr
 the tap repository as a secret in this one. That is the maintainer's decision, and it has not
 been made.
 
-### 4. Verify
+### 5. Verify
 
 ```sh
 # the tap holds exactly what the release attached
@@ -362,7 +382,7 @@ The marketplace needs no step of its own. Its entry is a command source that run
 ([design.md §13.2a](docs/design.md#132a-the-marketplace-route-and-why-the-plugin-is-build-governor)),
 so it always serves whatever version is installed.
 
-### 5. When `clean-macos` fails: a new patch tag, never a re-tag
+### 6. When `clean-macos` fails: a new patch tag, never a re-tag
 
 By the time `clean-macos` runs, the release is already published. `releases/latest` points at
 it, and someone may already have installed it. **Never move or re-push a tag**, and never
@@ -371,7 +391,8 @@ worse than a bad release. Instead:
 
 1. Leave the bad release where it is, and do not copy its formula into the tap.
 2. Fix the problem on `main` through a normal pull request.
-3. Tag the next patch version from the fixed `main`, and run this procedure again from step 1.
+3. Run this procedure again from step 1 for the next patch version: its CHANGELOG entry says
+   what was wrong with the bad release, as [0.1.1's](CHANGELOG.md#011---2026-10-29) does.
 
 **The worked example is v0.1.0 to v0.1.1.** v0.1.0 published all four binaries, and then
 `clean-macos` failed: the generated `governor.rb` carried a redundant `version` line, which
@@ -379,3 +400,25 @@ worse than a bad release. Instead:
 so that it no longer writes that line. v0.1.1 was tagged from the fixed `main` eighteen
 minutes after v0.1.0, `clean-macos` passed, and v0.1.1's formula was the first one copied into
 the tap. v0.1.0 was left as it was.
+
+### Testing a change to `release.yml`
+
+`release.yml` runs only on a tag, so a broken edit to it would otherwise first show up on a
+real release. Test it with a throwaway **pre-release** tag instead: any tag with a semver
+suffix, such as `v0.1.3-rc.1`. The release it publishes is marked as a pre-release, which
+`releases/latest` skips, so `install.sh` and Homebrew users never see it. `clean-macos` is
+skipped for it, because it would only test the previous release.
+
+```sh
+git switch -c release-test origin/main      # plus the release.yml change under test
+# no CHANGELOG entry for 0.1.3-rc.1: the notes job must fail, and nothing is published
+git tag -a v0.1.3-rc.1 -m test && git push origin v0.1.3-rc.1
+# now commit a `## [0.1.3-rc.2] - YYYY-MM-DD` entry on this branch, and tag that commit
+git tag -a v0.1.3-rc.2 -m test && git push origin v0.1.3-rc.2
+# the published pre-release's body must equal what the tool prints
+diff <(gh release view v0.1.3-rc.2 --json body -q .body) <(go run ./tools/changelog -version 0.1.3-rc.2)
+```
+
+Afterwards delete every test release and tag: `gh release delete <tag> --cleanup-tag --yes`
+for the ones that published, `git push origin :refs/tags/<tag>` for the ones that did not.
+Never commit a test entry to `main`.
