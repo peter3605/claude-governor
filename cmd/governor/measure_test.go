@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"sort"
 	"strings"
 	"testing"
@@ -69,7 +68,8 @@ func TestMeasureGrantRoundTrip(t *testing.T) {
 	report(t, "grant round-trip, in process", inProc)
 
 	// End to end, through the real binary, exactly as a hook invokes it.
-	bin := buildGovernor(t)
+	// The package's one build, so the end-to-end figure includes everything a hook pays for.
+	bin := realGovernor(t)
 	endToEnd := make([]time.Duration, 0, 50)
 	for i := 0; i < 50; i++ {
 		if d.table.InUse() >= budget-2 {
@@ -117,16 +117,4 @@ func pct(sorted []time.Duration, p int) time.Duration {
 		i = len(sorted)
 	}
 	return sorted[i-1]
-}
-
-// buildGovernor builds the real binary, so the end-to-end figure includes everything a hook
-// pays for rather than everything except the parts that are hard to measure.
-func buildGovernor(t *testing.T) string {
-	t.Helper()
-	bin := filepath.Join(t.TempDir(), "governor")
-	out, err := exec.Command("go", "build", "-o", bin, ".").CombinedOutput()
-	if err != nil {
-		t.Fatalf("go build: %v\n%s", err, out)
-	}
-	return bin
 }

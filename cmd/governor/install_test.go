@@ -66,14 +66,15 @@ func governor(t *testing.T, args ...string) (int, string, string) {
 	return code, stdout.String(), stderr.String()
 }
 
-// installOK runs `governor install --no-daemon` and fails the test if it does not succeed.
+// installOK runs `governor install --no-daemon --no-probe` and fails the test if it does not
+// succeed. --no-probe for the reason withoutProbe gives.
 //
 // --no-daemon in every test but the daemon ones: starting a detached process from a unit
 // test leaves something running past the test that spawned it if anything goes wrong, and
 // the daemon's own start and stop are covered directly in TestInstallStartsAndUninstallStopsTheDaemon.
 func installOK(t *testing.T, extra ...string) string {
 	t.Helper()
-	code, stdout, stderr := governor(t, append([]string{"install", "--no-daemon"}, extra...)...)
+	code, stdout, stderr := governor(t, append([]string{"install", "--no-daemon", "--no-probe"}, extra...)...)
 	if code != 0 {
 		t.Fatalf("governor install: exit %d\nstdout: %s\nstderr: %s", code, stdout, stderr)
 	}
@@ -1076,9 +1077,38 @@ func runReal(t *testing.T, p paths, args ...string) (int, string, string) {
 	return runRealBinary(t, realGovernor(t), p, args...)
 }
 
+// withoutProbe adds --no-probe to an install (GOV-B24).
+//
+// Every install calibrates, and calibration's load probe is about four seconds of every core
+// at full load. Thirty-odd real installs paying it made it most of this package's run time -
+// measured 2026-11-02: install --no-daemon took 4.9s, of which the probe was 3.8-4.6s, against
+// 0.06s for doctor and about 0.5s for the daemon start. No test but one is about what the
+// probe measured, so the probe runs in that one (TestInstallLeavesTheDaemonOnTheConfigItWrote,
+// through runRealWithProbe) and is skipped everywhere else. Everything else calibrate does -
+// the ambient read, the cut, the write - still runs on every install.
+//
+// Do NOT drop this to "fix" a test that wants a probed b_max: call runRealWithProbe there.
+func withoutProbe(args []string) []string {
+	if len(args) > 0 && args[0] == "install" {
+		return append(append([]string{}, args...), "--no-probe")
+	}
+	return args
+}
+
+// runRealWithProbe is runReal for the one install that is meant to pay for the probe.
+func runRealWithProbe(t *testing.T, p paths, args ...string) (int, string, string) {
+	t.Helper()
+	return execGovernor(t, realGovernor(t), p, args...)
+}
+
 // runRealBinary is runReal for a nominated binary, so an upgrade can be staged by running a
 // differently built governor against a home the current one installed into.
 func runRealBinary(t *testing.T, binary string, p paths, args ...string) (int, string, string) {
+	t.Helper()
+	return execGovernor(t, binary, p, withoutProbe(args)...)
+}
+
+func execGovernor(t *testing.T, binary string, p paths, args ...string) (int, string, string) {
 	t.Helper()
 	cmd := exec.Command(binary, args...)
 	cmd.Env = stagedEnv(p)

@@ -419,6 +419,7 @@ func runInstall(args []string, stdout, stderr io.Writer) int {
 	fs.SetOutput(stderr)
 	dryRun := fs.Bool("dry-run", false, "print what would change and write nothing")
 	noDaemon := fs.Bool("no-daemon", false, "install the files but do not start the daemon")
+	noProbe := fs.Bool("no-probe", false, "calibrate without the load probe; b_max keeps its stored value")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
@@ -560,7 +561,7 @@ func runInstall(args []string, stdout, stderr io.Writer) int {
 	// that touches the machine, which is what "runs automatically at the end of install"
 	// means: every file is in place and the daemon is up, so a calibration measuring this
 	// host measures the machine as the governor will actually find it.
-	calibrateDuringInstall(stdout, stderr)
+	calibrateDuringInstall(*noProbe, stdout, stderr)
 	if !*noDaemon {
 		// The daemon above loaded whatever config was on disk BEFORE that calibration. Before
 		// GOV-44 it read the file only at startup, so every install left it serving the
@@ -597,10 +598,14 @@ func runInstall(args []string, stdout, stderr io.Writer) int {
 // story's trap is explicit that an installer which pegs someone's CPU without warning is a bad
 // first impression. `calibrate` announces the probe itself as well; this line is what explains
 // why an install is suddenly busy.
-func calibrateDuringInstall(stdout, stderr io.Writer) {
+func calibrateDuringInstall(noProbe bool, stdout, stderr io.Writer) {
 	fmt.Fprintln(stdout, "\n--- governor calibrate ---")
 	fmt.Fprintln(stdout, "Measuring this machine so its limits come from your hardware, not from ours.")
-	calibrateCommand(nil, stdout, stderr, false)
+	var args []string
+	if noProbe {
+		args = []string{"--no-probe"}
+	}
+	calibrateCommand(args, stdout, stderr, false)
 }
 
 // verifyInstall ends the install by running doctor and printing its findings (GOV-22).

@@ -261,7 +261,10 @@ disagree it keeps whatever b_max an earlier calibration measured rather than wri
 one. The output, and the config it writes, record when the measurement was taken, from what,
 and which numbers were kept rather than re-measured.
 
-`governor install` runs it once at the end. **Re-run it while you are doing real work**, when:
+`governor install` runs it once at the end. `governor install --no-probe` runs it without the
+load probe, for a scripted or CI install where four seconds of full load is unwelcome: the cut
+level is still measured, and b_max keeps whatever an earlier calibration measured, or comes
+from the core count if there was none. **Re-run it while you are doing real work**, when:
 
 - **You calibrated on an idle machine.** The cut level is placed above what the machine was
   doing in the minute before calibrate ran. Measured idle, the governor will throttle you as
