@@ -1,0 +1,52 @@
+name: It refused something it should have allowed
+description: A build or subagent was parked or refused when the machine had room, or a command was treated as a build when it is not one.
+title: "Wrong refusal: "
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        This is the report the project most needs, and the easiest one not to send. When the
+        governor refuses something, it looks like it is working. If a refusal felt wrong,
+        it probably was, and it is how the classifier and the budget get tuned.
+  - type: textarea
+    id: report
+    attributes:
+      label: Output of `governor doctor --report`
+      description: |
+        Run this in a terminal, as soon after the refusal as you can, and paste everything it
+        prints:
+
+            governor doctor --report
+
+        Its "recent gate decisions" section shows the refusal with the reason the governor
+        gave. It is built to be safe to post in public. Paths into your files become `<path>`,
+        credentials become `<redacted>`, and no command text is included. Read it before you
+        paste it anyway.
+      render: text
+    validations:
+      required: true
+  - type: textarea
+    id: refusal
+    attributes:
+      label: The refusal text the session showed
+      description: Copy the message Claude Code displayed. For a refused subagent spawn this is the only record of it, because spawn decisions are not written to disk.
+    validations:
+      required: true
+  - type: dropdown
+    id: kind
+    attributes:
+      label: What was refused
+      options:
+        - A build or test run
+        - A subagent spawn
+        - A command that is not a build at all
+    validations:
+      required: true
+  - type: textarea
+    id: shape
+    attributes:
+      label: What kind of command it was (optional)
+      description: The tool and roughly what it does, such as "cargo check on a small crate". You do not need to paste the command itself.
+    validations:
+      required: false

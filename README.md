@@ -22,6 +22,11 @@ means, overrides, troubleshooting, uninstalling. [How it works](docs/how-it-work
 ten-minute tour of the design. [`docs/`](docs/README.md) indexes everything else. Building,
 testing or releasing it yourself: [CONTRIBUTING.md](CONTRIBUTING.md).
 
+**Something wrong, or refused when it should not have been?** Run `governor doctor --report`
+and paste its output into [a new issue](https://github.com/peter3605/claude-governor/issues/new/choose).
+It is built to be safe to post in public: no paths into your files, no command text, no
+credentials.
+
 **What it is: a jobserver for Claude Code subagents.**
 
 Run several Claude Code sessions at once on a laptop and they will happily saturate it —
