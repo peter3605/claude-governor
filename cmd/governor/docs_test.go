@@ -154,7 +154,8 @@ func TestTheGuideQuotesTheRefusalsTheGateActuallyWrites(t *testing.T) {
 			t.Errorf("guide.md does not quote %s as the gate writes it:\n%s", name, text)
 		}
 	}
-	for _, head := range []string{"Machine at capacity", "This session is at its fair share", "Not enough free build slots"} {
+	for _, head := range []string{"Machine at capacity", "This session is at its fair share", "Not enough free build slots",
+		"This session's own earlier build is holding the slots"} {
 		if !strings.Contains(guide, "`"+head+"`") {
 			t.Errorf("guide.md's table of refusal heads does not name %q", head)
 		}

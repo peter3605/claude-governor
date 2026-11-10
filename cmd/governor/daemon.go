@@ -222,6 +222,14 @@ type refuseReply struct {
 	// NOT bumped: an older gate ignores them and prints the sentence it always printed.
 	Ceiling int    `json:"ceiling,omitempty"`
 	Cut     string `json:"cut,omitempty"`
+	// Own is how much of Slots the REFUSED session holds itself (GOV-49).
+	//
+	// Slots says the machine is holding 3.75 of 4. It does not say whose they are, and
+	// "something on this machine is holding the slots this build needs", read by a model,
+	// became "another session is holding the slots" in a session that held all of them. When
+	// Own equals Slots, no other session is involved, and the only true instruction is about
+	// this session's own earlier command. Additive like Asking: an older gate ignores it.
+	Own float64 `json:"own,omitempty"`
 }
 
 // waitingReply is the interim answer to an acquire the daemon has decided to park
@@ -1459,6 +1467,7 @@ func (d *daemon) refuseForCapacity(req request, limit int, src string) refuseRep
 		Cause:   d.table.Refusal(leaseRequestFor(req), limit),
 		Asking:  lease.WeightOf(leaseRequestFor(req)),
 		Ceiling: ceiling, Cut: cut,
+		Own: d.table.Held(req.Session),
 	}
 	// Logged here rather than at each call site so that a refusal added later cannot be one
 	// the log does not know about. This is the event that costs the model something, and it

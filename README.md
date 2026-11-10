@@ -159,7 +159,7 @@ are otherwise kept. If you added the marketplace entry, run `claude plugin unins
 build-governor@claude-governor` first: that registration lives in Claude Code's own files, so
 `governor uninstall` names it rather than editing them.
 
-Installing twice changes nothing the second time. The six hooks live in the plugin's own
+Installing twice changes nothing the second time. The seven hooks live in the plugin's own
 `hooks/hooks.json`, so the only key touched in your `settings.json` is `statusLine`, and hooks
 of your own are left exactly where they are.
 

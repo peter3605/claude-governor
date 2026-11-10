@@ -48,7 +48,7 @@ import (
 // All three were verified end to end before a line of this file was written; the write-up
 // is hook-surface.md section 15 and design.md sections 9 and 13.3 are corrected to match.
 //
-// The consequence for this file is the good one: the six hooks live in a file we own
+// The consequence for this file is the good one: the seven hooks live in a file we own
 // entirely, so the only thing merged into the user's settings.json is the statusLine key.
 // Everything else is a directory that either exists or does not.
 
@@ -186,7 +186,7 @@ func pluginManifest() ([]byte, error) {
 	})
 }
 
-// pluginHooks is hooks/hooks.json: the six hooks of design.md section 4.1.
+// pluginHooks is hooks/hooks.json: the seven hooks of design.md section 4.1.
 //
 // Generated from wantedHooks rather than written out, so that install and doctor cannot
 // disagree about what a correct install looks like. doctor's whole job is to tell you
@@ -196,9 +196,9 @@ func pluginManifest() ([]byte, error) {
 // Each matcher is its own hook's `covers` joined, and the two are deliberately different
 // expressions. The gate covers every spawn name — the tool answers to Agent and Task within
 // one version, and SendMessage is a second spawn path (section 10.1) — plus Bash, which
-// GOV-15 gates by command text. The PostToolUse finish hook covers Bash alone, because it
-// returns build leases and nothing else; giving it the gate's matcher would run a hook on
-// every subagent spawn to discover there was nothing to return.
+// GOV-15 gates by command text. The two finish hooks, on PostToolUse and PostToolUseFailure,
+// cover Bash alone, because they return build leases and nothing else. Giving them the gate's
+// matcher would run a hook on every subagent spawn to discover there was nothing to return.
 //
 // Only the gate gets a timeout. It is the one that can WAIT (section 4.2); finish never
 // parks, so the 30 s ceiling would be describing a case it does not have.
