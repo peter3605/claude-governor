@@ -52,7 +52,7 @@ The gate is Go, and only Go, because it runs inside a hook that Claude Code bloc
 gated call. An interpreter's start-up time would be a large part of the cost
 ([§2](design.md#2-architecture)).
 
-Six hooks are registered in the plugin's own `hooks/hooks.json`. The gate matches the
+Seven hooks are registered in the plugin's own `hooks/hooks.json`. The gate matches the
 subagent-spawning tool under both of its historical names, `SendMessage` (which can resume a
 subagent), and `Bash` ([§4.1](design.md#41-hook-wiring)). Those tool names were measured, not
 read from documentation, and each Claude Code version they were confirmed on is recorded

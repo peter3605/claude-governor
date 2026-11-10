@@ -2268,3 +2268,102 @@ on. On 2026-10-31 a gate-started daemon read `$CLAUDE_PLUGIN_DATA/config.json` w
 `calibrate`, run from a terminal, wrote `~/.claude/governor/config.json`. design.md §13.3a has
 the consequence and the rule it produced, and docs/dogfooding.md has the log.
 
+
+## 25. `PostToolUseFailure` on `Bash` — the release signal for a failed command (GOV-49)
+
+### 25.0 Provenance
+
+| | |
+|---|---|
+| `claude --version` | `2.1.321 (Claude Code)`, then `~/.local/share/claude/versions/2.1.316` for the version check |
+| Host | macOS (Darwin 25.4.0), arm64 |
+| Date | 2026-11-10 |
+| Model | `haiku`, `claude -p`, `--setting-sources ""`, default permission mode |
+| Story | GOV-49 |
+
+Re-opens §19's finding that "a failing command raises no `PostToolUse`". That is still true.
+What §19 could not see is that a failing command raises a **different** event. §19's probes ran
+on 2.1.270 and registered only `PreToolUse` and `PostToolUse`, or "all eight events" in probe H,
+and `PostToolUseFailure` was not one of those eight.
+
+### 25.1 Method
+
+§0's capture hook, unchanged, registered on **every** current event name: `PreToolUse`,
+`PostToolUse`, `PostToolUseFailure` and `PermissionRequest` with `matcher: "*"`, and
+`Notification`, `UserPromptSubmit`, `Stop`, `SubagentStart`, `SubagentStop`, `PreCompact`,
+`SessionStart` and `SessionEnd` without a matcher. A headless `claude -p` was told to run six
+commands, one `Bash` call each, in order:
+
+1. `echo ok`
+2. `exit 7`
+3. `cd broken && go build ./...`, against §19 probe F's module that does not compile
+4. `definitely-not-a-binary-xyz`
+5. `grep zzzqqq /etc/hosts`
+6. `echo done`
+
+**Not `bypassPermissions`.** The auto-mode classifier refused to launch a headless agent in
+that mode, so `--allowedTools` allowed exactly the six command strings and nothing else. That
+changed one result, and the change is a finding: Claude Code treated command 5 as a read
+outside the working directory, raised a permission request, and in `-p` with no rule for it the
+request was refused.
+
+Two control runs, each `echo ok` then `exit 7`: one on **2.1.316**, and one on 2.1.316 and
+2.1.321 with an extra registration under an invented event name, `ZzzNotARealEvent`.
+
+### 25.2 The answers
+
+| Command | Events after `PreToolUse` | Same `tool_use_id`? |
+|---|---|---|
+| `echo ok` | `PostToolUse` | yes |
+| `exit 7` | **`PostToolUseFailure`** | **yes** |
+| failed `go build` | **`PostToolUseFailure`** | **yes** |
+| missing binary | **`PostToolUseFailure`** | **yes** |
+| `grep`, permission refused | `PermissionRequest`, then **nothing** | — |
+| `echo done` | `PostToolUse` | yes |
+
+| Control | Result |
+|---|---|
+| 2.1.316, `exit 7` | `PostToolUseFailure`, same shape. The event is not new in 2.1.321. |
+| unknown event name in the hooks, on 2.1.316 and 2.1.321 | ignored; every other registered hook fired as normal, and the session ran to completion |
+
+Four consequences:
+
+1. **A failed command can be released exactly.** `PostToolUseFailure` carries the same
+   `tool_use_id` as its `PreToolUse`, so `governor finish` can return the lease on it exactly as
+   it does on `PostToolUse`, with no correlation needed. The failure payload has no
+   `tool_response` at all, so it can never carry a `backgroundTaskId`, and `buildFinish`'s
+   still-running guard passes it through unchanged. A command that errored has ended.
+2. **Registering it cannot break an older Claude Code.** An event name the harness does not
+   know is ignored. It does not invalidate the file or the hooks beside it. The worst case on a
+   version without the event is the old behaviour, where the reaper collects the failure, and
+   the gate keeps working.
+3. **A permission-refused call leaks.** `PreToolUse` fires before the permission check, so the
+   gate takes a lease for a command that then never runs, and neither post event follows. That
+   lease is held to the TTL. This answers the §10.3 question for a headless refusal. An
+   interactive decline is not yet measured.
+4. **`is_interrupt` exists and was `false` here.** What an interrupted command sends, and
+   whether it is killed, is not measured (design.md §10.3).
+
+### 25.3 The payloads
+
+Verbatim apart from the scratch paths, which are shortened to `…/work`.
+
+```json
+{"session_id":"e882698e-bbf5-4e73-8440-2718444d147f","cwd":"…/work","prompt_id":"eb72cd2b-ea4f-4d52-aea6-05e72068b74f","permission_mode":"default","effort":{"level":"medium"},"hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":"exit 7","description":"Exit with status 7"},"tool_use_id":"toolu_01SyfTMdsjtGdXxQQFMRNzYZ"}
+{"session_id":"e882698e-bbf5-4e73-8440-2718444d147f","cwd":"…/work","prompt_id":"eb72cd2b-ea4f-4d52-aea6-05e72068b74f","permission_mode":"default","effort":{"level":"medium"},"hook_event_name":"PostToolUseFailure","tool_name":"Bash","tool_input":{"command":"exit 7","description":"Exit with status 7"},"tool_use_id":"toolu_01SyfTMdsjtGdXxQQFMRNzYZ","error":"Exit code 7","is_interrupt":false,"duration_ms":11}
+{"session_id":"e882698e-bbf5-4e73-8440-2718444d147f","cwd":"…/work","prompt_id":"eb72cd2b-ea4f-4d52-aea6-05e72068b74f","permission_mode":"default","effort":{"level":"medium"},"hook_event_name":"PostToolUseFailure","tool_name":"Bash","tool_input":{"command":"cd broken && go build ./...","description":"Change into broken directory and run go build"},"tool_use_id":"toolu_01QJytGSHK5UEq2LUhDyqdnh","error":"Exit code 1\n# broken\n./main.go:4:6: declared and not used: x\n./main.go:4:14: cannot use \"this does not compile\" (untyped string constant) as int value in variable declaration","is_interrupt":false,"duration_ms":170}
+{"session_id":"e882698e-bbf5-4e73-8440-2718444d147f","cwd":"…/work","prompt_id":"eb72cd2b-ea4f-4d52-aea6-05e72068b74f","permission_mode":"default","effort":{"level":"medium"},"hook_event_name":"PostToolUseFailure","tool_name":"Bash","tool_input":{"command":"definitely-not-a-binary-xyz","description":"Run nonexistent binary to confirm failure"},"tool_use_id":"toolu_018PZajHZZn4R7XzARcoFKLo","error":"Exit code 127\n(eval):1: command not found: definitely-not-a-binary-xyz","is_interrupt":false,"duration_ms":8}
+{"session_id":"e882698e-bbf5-4e73-8440-2718444d147f","cwd":"…/work","prompt_id":"eb72cd2b-ea4f-4d52-aea6-05e72068b74f","permission_mode":"default","effort":{"level":"medium"},"hook_event_name":"PermissionRequest","tool_name":"Bash","tool_input":{"command":"grep zzzqqq /etc/hosts","description":"Search hosts file for zzzqqq"},"permission_suggestions":[{"type":"addRules","rules":[{"toolName":"Read","ruleContent":"//private/etc/**"}],"behavior":"allow","destination":"session"}]}
+```
+
+### 25.4 Folded into design.md
+
+§4.1 registers `finish` on `PostToolUseFailure` as the seventh hook. §6's release table moves
+"command errors" from the reaper to `PostToolUseFailure` and adds the permission-refused row.
+§10.3 is updated.
+
+### 25.5 Still unmeasured
+
+- An interactive permission decline (assumed to behave like consequence 3).
+- `is_interrupt: true`: is an interrupted command killed, and so safe to release?
+- Linux.

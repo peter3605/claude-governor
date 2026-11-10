@@ -974,6 +974,13 @@ func (w wantedHook) matched() bool { return len(w.covers) > 0 }
 var wantedHooks = []wantedHook{
 	{event: "PreToolUse", args: "gate", covers: gatedToolNames},
 	{event: "PostToolUse", args: "finish", covers: []string{buildToolName}},
+	// A Bash call that ERRORS raises PostToolUseFailure instead of PostToolUse, and it carries
+	// the same tool_use_id (docs/hook-surface.md section 25, measured on 2.1.316 and 2.1.321).
+	// Without it, a failed build, which is the normal state of a build under development, kept
+	// its lease until the reaper's TTL and refused its own session's retry (GOV-49). An older
+	// Claude Code that does not know the event ignores it and runs the other hooks, which was
+	// measured in the same section, so registering it cannot break the gate.
+	{event: "PostToolUseFailure", args: "finish", covers: []string{buildToolName}},
 	{event: "SubagentStart", args: "confirm"},
 	{event: "SubagentStop", args: "release"},
 	{event: "SessionStart", args: "session start"},
@@ -1097,7 +1104,7 @@ func gateHooksInstalledAt() time.Time {
 	return newest
 }
 
-// checkHooks reports whether all six hooks are registered and point at a binary that runs.
+// checkHooks reports whether all seven hooks are registered and point at a binary that runs.
 func (d *diagnosis) checkHooks() {
 	sources, err := hookSources()
 	if err != nil {
@@ -1516,7 +1523,7 @@ func (d *diagnosis) checkProtocol() {
 // doctor is invoked. That case says so in its own detail line rather than claiming more than
 // it checked. See section 13.4.
 func (d *diagnosis) checkBinary() {
-	// Only the binaries behind the six hooks of section 4.1. A governor command wired to
+	// Only the binaries behind the seven hooks of section 4.1. A governor command wired to
 	// some other event by hand is the user's business and not evidence about the gate's
 	// build; counting it would report "the hooks point at 2 different binaries" for a
 	// perfectly good install with one extra hook in it.

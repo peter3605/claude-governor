@@ -182,6 +182,9 @@ type acquireResponse struct {
 	// three slots on a six-slot machine say WHY it is quoting three.
 	Ceiling int    `json:"ceiling"`
 	Cut     string `json:"cut"`
+	// Own is how much of Slots the asking session holds itself. See refuseReply.Own. Zero
+	// from a daemon too old to send it, which prints the sentences it always printed.
+	Own float64 `json:"own"`
 }
 
 // hookPayload is the PreToolUse payload, measured in GOV-01 and recorded in
@@ -640,6 +643,14 @@ func denyReason(resp acquireResponse, in intent) string {
 	// only honest thing to say is that what is left is not enough for this particular command.
 	head, why := "Machine at capacity", refusedFull
 	switch {
+	// GOV-49: every held slot is the asking session's own. No other session is involved, so
+	// neither "the machine is contended" nor "other builds" is true. Checked first because it
+	// is the most specific fact: a session that holds everything is also, arithmetically, the
+	// "too big" case, and that sentence names nobody when it should name the session itself.
+	// Builds only: a spawn refusal tells the model to work inline, which is right whoever holds
+	// the slots.
+	case in.kind == "build" && ownsEverything(resp):
+		head, why = "This session's own earlier build is holding the slots", refusedOwn
 	case resp.Cause == "share":
 		head, why = "This session is at its fair share", refusedShare
 	case resp.Slots < float64(resp.Budget):
@@ -676,8 +687,8 @@ func denyReason(resp acquireResponse, in intent) string {
 	return b.String()
 }
 
-// The three situations a capacity refusal can actually be in, which is one more than the two
-// GOV-18 left behind.
+// The four situations a capacity refusal can actually be in: GOV-18 left two, GOV-34 added
+// the third and GOV-49 the fourth.
 //
 // They are a type rather than a pair of bools because the three are mutually exclusive and the
 // instruction half has to pick exactly one sentence per denial count. Two bools would make the
@@ -696,7 +707,19 @@ const (
 	// beside a single one-slot lease — the machine is a third full and the command still
 	// cannot start.
 	refusedTooBig
+	// refusedOwn: every slot in use is held by the asking session itself (GOV-49). Since
+	// PostToolUseFailure releases a failed build, what is left holding is usually this
+	// session's own command still running, often one started with run_in_background. The
+	// other three sentences all point at someone else, so each of them is false here.
+	refusedOwn
 )
+
+// ownsEverything reports whether the asking session holds every held slot. The tolerance is
+// for float sums of 3.75 and 0.08, not a policy: a session holding 3.83 of 3.83 owns all of
+// it, and one holding 3.75 of 3.83 does not.
+func ownsEverything(resp acquireResponse) bool {
+	return resp.Own > 0 && resp.Own+1e-9 >= resp.Slots
+}
 
 // buildEscalation is the instruction half of a capacity deny for a BUILD, and it has to say
 // something completely different from the spawn text below.
@@ -722,12 +745,14 @@ const (
 // being printed for it: a session told "other builds are using every slot" against a visible
 // count of one in four learns that the gate's reasons are not worth reading.
 func buildEscalation(denials int, why refusalWhy) string {
-	pick := func(full, share, tooBig string) string {
+	pick := func(full, share, tooBig, own string) string {
 		switch why {
 		case refusedShare:
 			return share
 		case refusedTooBig:
 			return tooBig
+		case refusedOwn:
+			return own
 		default:
 			return full
 		}
@@ -743,6 +768,11 @@ func buildEscalation(denials int, why refusalWhy) string {
 			// count. What is true is that this particular command is larger than the room
 			// left, and the instruction — wait, retry the same command — is unchanged.
 			"This is a large build and the slots left free are not enough for it.",
+			// The commonest way to get here after GOV-49 is a build started with
+			// run_in_background. It holds its lease until it finishes, because it is still
+			// using the CPU, and this session is asking for a second one beside it.
+			"No other session is holding build slots. They are held by an earlier command "+
+				"from this session that is still running, possibly in the background.",
 		) + " Wait a few seconds and run exactly the same command again; do not look for a " +
 			"different way to build, and do not treat this as a build failure."
 	case denials == 2:
@@ -750,15 +780,27 @@ func buildEscalation(denials int, why refusalWhy) string {
 			"The machine has been saturated for a while.",
 			"This session has been at its share for a while.",
 			"The slots this build needs have not come free for a while.",
+			"This session's own earlier command is still holding them. If you started a "+
+				"build or test in the background, let it finish or stop it first.",
 		) + " Wait longer before retrying the same command, and do not start any further " +
 			"builds or test runs in the meantime."
 	default:
+		if why == refusedOwn {
+			// NOT "the machine is contended". It is not: this session is the only holder, and
+			// a user told otherwise goes looking for another session that does not exist.
+			return fmt.Sprintf("This command was not run, for the %dth time. No other "+
+				"session is holding build slots: an earlier command from this session is. "+
+				"Stop starting builds, tell the user this session's own earlier build or "+
+				"background command is still holding the slots, and let them decide. Do not "+
+				"keep retrying.", denials)
+		}
 		return fmt.Sprintf("This command was not run, for the %dth time. %s Stop starting "+
 			"builds, tell the user the machine is contended, and let them decide — do not "+
 			"keep retrying.", denials, pick(
 			"Something on this machine is holding every build slot.",
 			"Other sessions have been holding their share of the build slots.",
 			"Something on this machine has been holding the slots this build needs.",
+			"",
 		))
 	}
 }

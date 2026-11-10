@@ -92,9 +92,10 @@ type hookAck struct {
 // a thinner request, never to a failed hook.
 type lifecyclePayload struct {
 	SessionID string `json:"session_id"`
-	// ToolUseID keys a Build lease. PostToolUse carries the SAME one its PreToolUse did,
-	// measured in every pairing observed (docs/hook-surface.md section 19), so the release
-	// needs no correlation — unlike the agent path, where SubagentStart carries no key.
+	// ToolUseID keys a Build lease. PostToolUse and PostToolUseFailure carry the SAME one
+	// their PreToolUse did, measured in every pairing observed (docs/hook-surface.md sections
+	// 19 and 25), so the release needs no correlation. The agent path differs: SubagentStart
+	// carries no key.
 	ToolUseID string `json:"tool_use_id"`
 	// ToolName is read so that a PostToolUse for some other tool costs nothing.
 	ToolName string `json:"tool_name"`
@@ -191,9 +192,12 @@ func buildRelease(p lifecyclePayload, _ io.Writer) (hookRequest, bool) {
 // directions:
 //
 //   - ABSENT when the command errors. A failing `go build` — the normal state of a build
-//     under development — emits no PostToolUse at all. Nothing can be done here about that;
-//     the reaper collects those at DefaultBuildTTL, which is why that TTL is a control
-//     constant and not a safety margin.
+//     under development — emits no PostToolUse at all. It emits PostToolUseFailure instead,
+//     with the same tool_use_id and no tool_response (hook-surface.md section 25), and this
+//     same function handles it: install registers `finish` on both events (GOV-49). Before
+//     that, the reaper collected every failed build at DefaultBuildTTL, and the session's own
+//     retry was refused against its own leaked lease for up to five minutes. A failed command
+//     has ended, so there is no backgroundTaskId to hold it for.
 //   - PRESENT WHILE THE COMMAND IS STILL RUNNING when it was backgrounded (a launch receipt
 //     ~50 ms in) or when it exceeded its timeout, after which the harness backgrounds it
 //     rather than killing it. Both carry a backgroundTaskId, and nothing whatsoever fires
@@ -211,7 +215,11 @@ func buildFinish(p lifecyclePayload, diag io.Writer) (hookRequest, bool) {
 		return hookRequest{}, false
 	}
 	if p.ToolUseID == "" {
-		fmt.Fprintf(diag, "governor finish: PostToolUse carried no tool_use_id; the lease will rely on its TTL\n")
+		event := p.HookEventName
+		if event == "" {
+			event = "PostToolUse"
+		}
+		fmt.Fprintf(diag, "governor finish: %s carried no tool_use_id; the lease will rely on its TTL\n", event)
 		return hookRequest{}, false
 	}
 	if id := p.ToolResponse.BackgroundTaskID; id != "" {

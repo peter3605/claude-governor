@@ -1004,6 +1004,19 @@ func (t *Table) Slots() float64 {
 	return t.weight
 }
 
+// Held is how much budget one session holds, in slots: the same sum the admission rule's
+// first-slot escape reads (heldLocked).
+//
+// It exists for the refusal text (GOV-49). A refusal that cannot tell "every held slot is
+// this session's own" from "other sessions are holding them" printed the second sentence for
+// both. On 2026-11-08 a session refused against its own failed build told its user "another
+// session is holding the slots" when no other session held any.
+func (t *Table) Held(session string) float64 {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.heldLocked(session)
+}
+
 // SessionStat is one session's line in a status snapshot.
 type SessionStat struct {
 	Session

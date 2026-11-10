@@ -144,6 +144,9 @@ a test.
     "PostToolUse":   [{ "matcher": "Bash",
                         "hooks": [{ "type": "command",
                                     "command": "${CLAUDE_PLUGIN_ROOT}/bin/governor finish" }] }],
+    "PostToolUseFailure": [{ "matcher": "Bash",
+                        "hooks": [{ "type": "command",
+                                    "command": "${CLAUDE_PLUGIN_ROOT}/bin/governor finish" }] }],
     "SubagentStart": [{ "hooks": [{ "type": "command",
                                     "command": "${CLAUDE_PLUGIN_ROOT}/bin/governor confirm" }] }],
     "SubagentStop":  [{ "hooks": [{ "type": "command",
@@ -184,6 +187,16 @@ gate that can wait and this one never parks. What it can and cannot be trusted t
 measured in [hook-surface.md](hook-surface.md) §19 and folded into §4.3 and §5.6 — the short
 version is that it is absent when a command fails and arrives early when a command is
 backgrounded, so the reaper does more of this job than it does anywhere else.
+
+**`PostToolUseFailure` is the seventh hook, and it is the other half of the sixth (GOV-49).** A
+`Bash` call that *errors* raises it instead of `PostToolUse`, with the same `tool_use_id`, so
+the same `governor finish` returns the lease exactly ([hook-surface.md](hook-surface.md) §25,
+measured on 2.1.316 and 2.1.321). Before it was registered, every failed build held its lease
+until the reaper's TTL, and the failing session's own retry was refused against it for up to
+five minutes: Day 7 of [dogfooding.md](dogfooding.md) has two refusals that end within two
+seconds of the TTL. An unknown event name is ignored by Claude Code without disturbing the
+other hooks (same section), so a version that predates the event loses only this release
+path, never the gate.
 
 `timeout` is set explicitly rather than inherited: the default was measured at over 150 s with
 no established ceiling (§10.1), which is not a number to build a wait window on. 30 s gives the
@@ -1205,13 +1218,16 @@ a posture. It is the measured behaviour.
 |---|---|---|
 | command succeeds | `PostToolUse` | its real runtime |
 | non-zero exit the harness interprets (`grep`, no match) | `PostToolUse` | its real runtime |
-| **command errors** — non-zero exit, failed compile, missing binary | **the reaper, at TTL** | the full TTL |
+| **command errors** — non-zero exit, failed compile, missing binary | `PostToolUseFailure` (GOV-49; hook-surface.md §25) | its real runtime |
+| **permission refused** — the call needed approval and did not get it | **the reaper, at TTL** — `PreToolUse` fired and took the lease, then neither post event did (§25) | the full TTL |
 | **`run_in_background: true`** | **the reaper, at TTL** | the full TTL |
 | **`timeout` exceeded** (backgrounded, not killed) | **the reaper, at TTL** | the full TTL |
 | session dies | `SessionEnd`, or the reaper's session check | — |
 
-Three of six rows are the reaper. A failing build is the *normal* state of a build under
-development, so this is not a tail case.
+Three of seven rows are the reaper. Until GOV-49 there were three of six, and the third was
+the failing build, the *normal* state of a build under development. `PostToolUseFailure`
+moved that row to an exact release. What remains on the reaper are commands that are still
+running (background, timeout) and the permission-refused call, which leaks.
 
 **The TTL is therefore a control constant, not a safety margin, and it is set from
 measurement.** Over the corpus `tools/bashcorpus` collects — 20,614 `Bash` calls from 498
@@ -1809,7 +1825,7 @@ claude-governor/                  the repo
 
 ~/.claude/skills/build-governor/ the installed plugin, written by `governor install`
 ├── .claude-plugin/plugin.json    name, version, description
-├── hooks/hooks.json              the six hooks in section 4.1
+├── hooks/hooks.json              the seven hooks in section 4.1
 ├── .mcp.json                     the advisory server in section 8
 ├── skills/heavy-build/SKILL.md   the bundled skill (section 8)
 ├── commands/governor.md          the slash command (section 9.1)
@@ -2226,10 +2242,21 @@ Named so they are not mistaken for settled:
 - Whether the observed `PreToolUse`/`SubagentStart` interleaving holds under machine load
   heavy enough to slow the harness itself. Phase 0's traces are the place to watch for it.
 - Whether `SubagentStart` fires for a subagent restored by session resume.
-- Whether a user **declining the permission prompt** suppresses `PostToolUse` — another `Bash`
-  lease leak path if it does. Every probe in `hook-surface.md` §19 ran `bypassPermissions`.
+- Whether a user **declining the permission prompt interactively** behaves like the refusal
+  §25 measured headlessly: there, a `Bash` call refused permission raised `PreToolUse` and
+  `PermissionRequest` and then **neither** post event, so its lease leaks to the TTL. The
+  interactive decline is assumed to be the same, and has not been measured.
+- What `PostToolUseFailure` does for a command the user **interrupts** (`is_interrupt: true`).
+  `finish` releases on it, which is correct only if an interrupted command is also killed.
 - Whether the `backgroundTaskId` discriminator of §19.3 holds for tools other than `Bash`.
 - Linux: every measurement above is macOS. Re-run the probe on Linux before trusting §10 there.
+
+**No longer on this list, measured 2026-11-10 on 2.1.316 and 2.1.321 for GOV-49**
+(`hook-surface.md` §25): a `Bash` call that errors (`exit 7`, a failed `go build`, a missing
+binary) raises `PostToolUseFailure`, carrying the same `tool_use_id` as its `PreToolUse`, the
+`session_id`, `error` (`"Exit code N"` and the stderr) and `is_interrupt`. Claude Code ignores
+an unknown hook event name and runs the rest. §19's "a failing command raises no event" is
+still true of `PostToolUse` itself. It was never true that nothing fires.
 
 **No longer on this list, measured 2026-09-16 on 2.1.273 for GOV-17** (`hook-surface.md` §21):
 a skills-dir plugin's bundled `SKILL.md` **is** surfaced to the model; its frontmatter
@@ -2622,7 +2649,7 @@ Uninstall is only verifiable if this list is exhaustive, so it is normative.
 | Path | Written by | Removed by |
 |---|---|---|
 | `~/.claude/skills/build-governor/.claude-plugin/plugin.json` | install | uninstall |
-| `~/.claude/skills/build-governor/hooks/hooks.json` (the six hooks) | install | uninstall |
+| `~/.claude/skills/build-governor/hooks/hooks.json` (the seven hooks) | install | uninstall |
 | `~/.claude/skills/build-governor/.mcp.json` (the advisory server, section 8) | install | uninstall |
 | `~/.claude/skills/build-governor/commands/governor.md` (the slash command, section 9.1) | install | uninstall |
 | `~/.claude/skills/build-governor/skills/heavy-build/SKILL.md` (the advice's detail, section 8) | install | uninstall |

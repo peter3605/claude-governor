@@ -194,13 +194,14 @@ told. The first words say which situation it is
 | `Machine at capacity` | every slot is taken |
 | `This session is at its fair share` | the machine has room, but it belongs to other sessions that are asking ([§6.1](design.md#61-fair-share)) |
 | `Not enough free build slots` | the machine has room, but less than this command needs |
+| `This session's own earlier build is holding the slots` | no other session holds any; this session's own earlier command is still running, often one started in the background |
 
 When the budget is below what this machine allows, the refusal also names the cause, for
 example `budget cut from 6 by run queue`.
 
 **What to do:** let the model retry, which is what it is told to do. If the same session is
 refused three times, it is told to stop starting builds and tell you that the machine is
-contended. At that point you decide: wait, check `governor status` for what is holding the
+contended, or, when the slots are its own, that its own earlier command is still holding them. At that point you decide: wait, check `governor status` for what is holding the
 slots, or override the budget for a while.
 
 ---
