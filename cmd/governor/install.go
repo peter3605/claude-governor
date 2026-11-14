@@ -152,8 +152,12 @@ func resolvePaths() (paths, error) {
 // cost nothing. The moment install started calibrating, an uninstall left config.json behind
 // and ~/.claude/governor/ could never empty — the one piece of residue a user cannot see in a
 // directory listing they were told would be gone.
-var stateFiles = []string{"sock", "statusline.json", daemonPIDFile, daemonLogFile, daemonStartFile, onboardMarker,
-	surfaceFile, surfaceTempFile, config.File}
+//
+// daemonLogFile + daemonLogRotatedSuffix is the daemon log's one kept generation (GOV-B29).
+// It is diagnostics, not measurement: unlike samples.jsonl it is removed by a plain
+// uninstall, as daemon.log always has been.
+var stateFiles = []string{"sock", "statusline.json", daemonPIDFile, daemonLogFile, daemonLogFile + daemonLogRotatedSuffix,
+	daemonStartFile, onboardMarker, surfaceFile, surfaceTempFile, config.File}
 
 // stateGlobs are patterns rather than names, for the residue whose name is not known in
 // advance. They are matched inside the state directory only, and never recursively.

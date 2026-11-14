@@ -58,6 +58,10 @@ type Lease struct {
 	Depth   int
 	// Weight is how much of the budget this lease holds, in slots.
 	Weight float64
+	// Class is the gate's cost class for a Build lease ("medium", "heavy"), carried only so
+	// a release can be logged against it (GOV-B29). Nothing decides anything on it; Weight
+	// is what admission reads. Empty on an Agent lease and from a gate that sends none.
+	Class string
 	// ToolUseID is the PreToolUse key a Build lease is released by. Empty on an Agent
 	// lease, whose SubagentStart carries no such key and must be correlated FIFO instead.
 	ToolUseID    string
@@ -76,3 +80,21 @@ type Lease struct {
 type Liveness interface {
 	Alive(l Lease) bool
 }
+
+// Released is a lease that has just left the table, and when and why.
+//
+// IT EXISTS SO THE DAEMON CAN LOG A RELEASE (GOV-B29). Every path that removes a lease
+// returns one, rather than the table logging itself: the table holds its lock while it
+// drops, and the log is a file write that belongs after the reply, outside any lock.
+type Released struct {
+	Lease
+	// At is when the table dropped it, on the table's own clock, so that held time is
+	// At - GrantedAt with both ends from the same source.
+	At time.Time
+	// Why is set by the reaper only: "expired", "session-dead" or "owner-dead". The other
+	// paths are named by their caller, which knows which hook it is answering.
+	Why string
+}
+
+// Held is how long the lease was held.
+func (r Released) Held() time.Duration { return r.At.Sub(r.GrantedAt) }

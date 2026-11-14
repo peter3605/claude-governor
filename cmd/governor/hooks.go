@@ -59,6 +59,9 @@ type hookRequest struct {
 
 	// finish
 	ToolUseID string `json:"tool_use_id,omitempty"`
+	// HookEvent is PostToolUse or PostToolUseFailure, for the daemon's release log only
+	// (GOV-B29, request.HookEvent).
+	HookEvent string `json:"hook_event,omitempty"`
 
 	// confirm
 	Lease string `json:"lease,omitempty"`
@@ -232,6 +235,7 @@ func buildFinish(p lifecyclePayload, diag io.Writer) (hookRequest, bool) {
 		Principal: localPrincipal(),
 		Session:   p.SessionID,
 		ToolUseID: p.ToolUseID,
+		HookEvent: p.HookEventName,
 	}, true
 }
 

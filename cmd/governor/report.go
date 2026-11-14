@@ -67,9 +67,9 @@ const (
 	// one leak could carry.
 	reportLineMax = 240
 	// reportTailBytes is how far back from the end of a file the report reads. samples.jsonl
-	// is bounded at trace.MaxBytes since GOV-B26, but daemon.log is not, a log from before the
-	// bound can still be hundreds of megabytes, and the report needs the last few records of
-	// each, not all of it.
+	// is bounded at trace.MaxBytes since GOV-B26 and daemon.log at daemonLogMaxBytes since
+	// GOV-B29, but a log from before either bound can still be hundreds of megabytes, and the
+	// report needs the last few records of each, not all of it.
 	reportTailBytes = 512 << 10
 )
 
@@ -279,12 +279,23 @@ func daemonLogTail() string {
 	if err != nil {
 		return "(cannot resolve the state directory)"
 	}
-	lines, err := tail(filepath.Join(dir, daemonLogFile))
-	if err != nil {
-		if os.IsNotExist(err) {
+	path := filepath.Join(dir, daemonLogFile)
+	lines, err := tail(path)
+	if err != nil && !os.IsNotExist(err) {
+		return fmt.Sprintf("(cannot read the daemon log: %v)", err)
+	}
+	// THE LOG ROTATES (GOV-B29), for the reason recentDecisions reads samples.jsonl.1: just
+	// after a rotation the live file holds a line or two, and the report would show almost
+	// nothing on a machine with months of log.
+	if len(lines) < reportLogLines {
+		older, oerr := tail(path + daemonLogRotatedSuffix)
+		if oerr != nil && !os.IsNotExist(oerr) {
+			return fmt.Sprintf("(cannot read the daemon log: %v)", oerr)
+		}
+		lines = append(older, lines...)
+		if len(lines) == 0 && os.IsNotExist(err) && os.IsNotExist(oerr) {
 			return "(no daemon log)"
 		}
-		return fmt.Sprintf("(cannot read the daemon log: %v)", err)
 	}
 	if len(lines) > reportLogLines {
 		lines = lines[len(lines)-reportLogLines:]

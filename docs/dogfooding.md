@@ -99,6 +99,12 @@ binds** (design.md §4.5). Nothing is written on an ordinary grant, so the log i
 | `park-expired session=… waited=20s` | …and none did |
 | `deny session=… reason=capacity in_use=4/4 denials=K` | the budget bound and it cost a spawn |
 | `deny session=… reason=depth` | a subagent tried to fan out. Not a capacity finding |
+| `cut 4->2 cause=run-queue rq=7.10 cut=6.59 ceiling=4` | the loop moved the budget, and what moved it (GOV-B29). Also `cause=thermal`, `climb … cause=climb`, `restore … cause=idle`, `ceiling … cause=ceiling` |
+| `release session=… kind=build class=heavy weight=2.00 held=1m23s by=PostToolUse` | a lease came back, and what returned it: `PostToolUse`, `PostToolUseFailure`, `SubagentStop`, `SessionEnd`, `reaper:<why>`, `handback` (GOV-B29) |
+
+Since GOV-B29 every line in the file, not only these, starts with an RFC 3339 timestamp, and
+the file rotates to `daemon.log.1` at 4 MiB. A budget line is written when the number
+changes, never on a tick.
 
 Read it with:
 

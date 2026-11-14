@@ -291,7 +291,33 @@ type Controller struct {
 	// what keeps the budget where it is; the field keeps naming it. For thermal it is the end
 	// of the hysteresis, which holds the floor on purpose and is thermal's doing until it ends.
 	cut string
+	// moved names what changed the budget on the most recent Step, or is empty when that
+	// Step left it where it was. See Moved.
+	moved string
 }
+
+// The causes Moved reports. They are the vocabulary of the daemon's budget log (GOV-B29),
+// where each one is the answer to "what did that": a line with no cause is a line nobody
+// can check a week of "it felt tight" against.
+const (
+	MovedThermal  = "thermal"   // severe thermal state floored it
+	MovedRunQueue = "run-queue" // the run queue crossed the cut level: multiplicative decrease
+	MovedClimb    = "climb"     // recovered with demand waiting: one slot up
+	MovedIdle     = "idle"      // recovered and idle long enough: back to the ceiling (GOV-46 b)
+	MovedCeiling  = "ceiling"   // the ceiling moved and carried the budget with it
+)
+
+// Moved names what changed the budget on the last Step, or "" if it did not change.
+//
+// It reports the LAST thing that moved it on that tick. A tick can do two: the ceiling rises
+// and lifts a budget that was at it, then the run queue cuts from the new height. The cut is
+// what the reader needs, so it wins, which is the order Step applies them in anyway.
+func (c *Controller) Moved() string { return c.moved }
+
+// CutAt and ClimbAt are the run-queue levels this controller cuts above and climbs at or
+// below, for a log line that shows a reading against the threshold it was judged by.
+func (c *Controller) CutAt() float64   { return c.runQueueMax() }
+func (c *Controller) ClimbAt() float64 { return c.climbRunQueue() }
 
 // Cut names the signal currently holding the budget below its ceiling: "run queue",
 // "thermal", or "" when nothing is.
@@ -439,10 +465,22 @@ func (c *Controller) Step(r Reading) int {
 		c.started = true
 		c.seen = max
 	}
+	// moved is computed by comparing b before and after each branch, rather than by setting
+	// it inside the branches, so that a branch which runs but leaves b where it was (a halve
+	// at the floor, a climb at the ceiling) is not reported as a change.
+	c.moved = ""
+	from := c.b
+	mark := func(cause string) {
+		if c.b != from {
+			c.moved = cause
+			from = c.b
+		}
+	}
 	if max > c.seen && c.b >= c.seen {
 		// Case (a). Before the switch, so a machine that is busy on this very tick still cuts
 		// from the new ceiling — the same "begin high, cut fast" shape as start().
 		c.b = max
+		mark(MovedCeiling)
 	}
 	c.seen = max
 
@@ -481,6 +519,7 @@ func (c *Controller) Step(r Reading) int {
 		c.b = Floor
 		c.clean = 0
 		c.cut = "thermal"
+		mark(MovedThermal)
 	case Cutting(r, c.runQueueMax()):
 		// MULTIPLICATIVE DECREASE, on the run queue alone. It halves rather than stepping
 		// down because the cost of being over is bounded by how fast you can get back, and
@@ -491,6 +530,7 @@ func (c *Controller) Step(r Reading) int {
 			c.b = Floor
 		}
 		c.cut = "run queue"
+		mark(MovedRunQueue)
 	case c.clean < NominalTicksBeforeIncrease:
 		// Coming back from a thermal cut. Hold at the floor until the machine has been clean
 		// for three consecutive ticks, so the budget does not oscillate against the
@@ -504,12 +544,20 @@ func (c *Controller) Step(r Reading) int {
 		if c.b < max {
 			c.b++
 		}
+		mark(MovedClimb)
 	case climbing:
 		// Recovered, and nobody is asking for more. Nothing holds the budget down; it is
 		// unused, or — once the governor has been idle long enough — reset (case b).
 		c.cut = ""
 		if idle && c.quiet >= IdleTicksBeforeReset {
 			c.b = max
+		}
+		if c.b < from {
+			// The reset goes TO the ceiling, so it only lowers the budget when the ceiling
+			// came down under it. That is the ceiling's doing, and the log says so.
+			mark(MovedCeiling)
+		} else {
+			mark(MovedIdle)
 		}
 	}
 
@@ -518,6 +566,7 @@ func (c *Controller) Step(r Reading) int {
 		// cgroup quota can change — so it is enforced on every tick rather than only on the
 		// increase.
 		c.b = max
+		mark(MovedCeiling)
 	}
 	if c.b >= max {
 		// Back at the ceiling: nothing is holding the budget down any more, so there is no
