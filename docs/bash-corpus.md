@@ -317,7 +317,8 @@ fast, and away from the iOS UI suite and the large pytest runs that would be hea
 bias phase-0-findings.md §1 records, pushing in the same conservative direction. Ecosystems with
 no measured shape here (Rust, JVM, .NET, containers) are classed by analogy to the four that
 were measured, and that is marked in the table in `classify.go` rather than presented as
-evidence.
+evidence. `docker compose` is the exception since GOV-B30: it was measured directly, outside
+this corpus, and §11 carries how.
 
 ## 6. What this means for GOV-15
 
@@ -616,3 +617,77 @@ cheaper than this much machinery for a gain confined to one shape on hosts like 
 - **It does not rule out per-shape weights in principle.** If the daemon ever has a reason to
   walk the tree at 1 Hz during builds for its own purposes, the per-build peak becomes nearly
   free, and the admission side needs no change (see above). That would be the moment to refile.
+
+## 11. `docker compose` by subcommand (GOV-B30, answered 2026-11-14)
+
+**Until GOV-B30, every `docker compose` call was one Heavy row.** That included `docker compose
+exec db psql -c 'select 1'`, which then weighed 3.75 slots on a four-slot machine. Dogfooding
+found it (GOV-38, ledger #6): over 11-03 to 11-09, compose was 39 of 78 Heavy gated calls on
+this host, the largest single reason a Heavy lease was usually holding three of four slots.
+Compose is now classed by its own subcommand, found after compose's global flags (`-f x.yml`,
+`--profile p`, ...) and docker's (`--context`, `-H`). `docker-compose` is read the same way.
+
+### Measured on the VM, because the client tree reads zero
+
+Neither this corpus nor `tools/childcpu` could size compose, for two separate reasons:
+
+- **Too few labelled calls.** The regenerated corpus (see the recount below) holds 83 commands
+  that mention compose, all from 10-29 onward. Only 3 fall inside the 1 Hz sample window,
+  which ended 2026-11-01. Transcripts before 10-04 have been pruned, so the 20,105-call corpus
+  of §1 cannot be rebuilt either.
+- **On macOS the work isn't in the child tree.** A container's CPU is spent in Docker
+  Desktop's VM (`com.apple.Virtualization.VirtualMachine` and `com.docker.*`), and none of
+  that descends from the `docker` client. Measured on every command below, the client tree
+  read 0.00-0.06 cores, including the 20-second build at 3.1 cores. A child-tree label calls
+  all of compose free, and for this shape bashcorpus's `child_*` columns are not evidence.
+
+So each subcommand was run three times against a throwaway postgres project. CPU time of the
+VM plus `com.docker.*` processes was sampled every 0.25 s, with a 4-second idle baseline
+subtracted before each run. Host: this laptop, Docker Desktop, 8 cores, image already cached.
+
+| Subcommand | Wall | Mean cores | Peak cores | Class |
+|---|---:|---:|---:|---|
+| `build --no-cache` (`go build -a std`) | 19-21 s | 3.1 | 6.4-6.7 | **Heavy** |
+| `build` (cached) | 1.6 s | 1.4 | 2.3 | Heavy (by verb) |
+| `up -d --wait` (creates a container) | 3.1-3.5 s | 0.6-1.0 | 3.1-3.2 | **Medium** |
+| `run --rm <svc> psql --version` | 0.9-1.4 s | 2.2-2.6 | 3.5-4.8 | **Medium** |
+| `start`, `stop` | 0.6 s | 0.9-1.7 | 1.1-2.1 | ungated |
+| `down` | 0.9-1.0 s | 1.3-1.6 | 2.2-3.1 | ungated |
+| `exec <svc> psql -c ...` | 0.6 s | 0.1-0.2 | 0.2-0.7 | ungated |
+| `ps`, `logs`, `config` | 0.6 s | < 0.25 | < 0.75 | ungated |
+
+**The line between gated and ungated isn't the peak.** A 0.25 s sample inflates the peak of a
+sub-second burst. The line is whether the command can do unbounded work. `start`, `stop` and
+`down` are bounded lifecycle bursts of about one core-second, over before a 1 Hz controller
+could see them, so a lease buys nothing. `up`, `run` and `create` stay gated at Medium because
+they pull a missing image and *build* a missing `build:` service without any `--build` flag.
+`run` also executes whatever its command is, and the floor above is with a trivial command.
+Any `--build` adds a `build` invocation, which is Heavy. `exec` is classified by the command it
+executes, like `uv run`: `exec db psql` is free, `exec app pytest` is pytest. An unrecognised
+compose verb is Medium: not free, and not the Heavy that was the bug.
+
+**Linux will differ, in one direction.** It has no VM, so dockerd's containers are host
+processes. They are still not the client's children, though, so a child-tree measurement
+misses them there too. The class boundary is set by what the verbs can do, not by these
+magnitudes, and doesn't depend on the platform.
+
+### The recount
+
+Over the regenerated corpus (4,520 `Bash` calls, 10-04 to 11-14), the old rule gated **38**
+commands as `docker compose`, every one Heavy. Under the new rule:
+
+| Before | After | Calls | Why |
+|---|---|---:|---|
+| Heavy | **ungated** | 27 | `ps` 12, `exec … psql` 11, `config` 4, every `config` behind `-f`/`--env-file`/`--profile` |
+| Heavy | Medium | 6 | still gated, by a `pytest` in the same command |
+| Heavy | Medium | 2 | `create` |
+| Heavy | Medium | 2 | `up`, alongside `pytest` |
+| Heavy | Heavy | 1 | still Heavy, by a `docker build` in the same command |
+
+So 37 of 38 change class, and none is now Heavy because of compose. No command outside compose
+changed class. The gated share of the corpus falls from 676 to 649 calls (15.0% → 14.4%).
+
+**The hot path didn't measurably slow.** `BenchmarkClassify` over the fixture, run
+interleaved with `main` five times at `-count 2`: median 2,618 ns/op against 2,582, inside the
+run-to-run spread (2,483-3,012 for `main` alone), and allocations unchanged at 43/op. The new
+parsing runs only for commands whose binary is `docker` or `docker-compose`.

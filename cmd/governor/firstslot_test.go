@@ -24,7 +24,8 @@ import (
 // capacity (1/4 build slots, thermal: nominal)". One of four slots is not capacity, the
 // session that read it held nothing, and the machine measured CPU 0.54 throughout.
 //
-// The arithmetic was right and the outcome was wrong. `docker compose` classifies Heavy, a
+// The arithmetic was right and the outcome was wrong. `docker compose` classified Heavy then
+// (GOV-B30 has since classed it by subcommand, so the test uses `docker compose build`), a
 // Heavy build weighs budget.SlotsFor(4.5) = 3.75 slots, and 1.00 + 3.75 > 4 — so on this
 // machine's calibrated ceiling of four, a Heavy build cannot be admitted beside ANY other
 // lease, however small. The other session held its 1.00 for ten minutes and the blocked
@@ -50,7 +51,7 @@ func TestAFirstSlotIsNotRefusedBecauseAnotherSessionHasOne(t *testing.T) {
 	// ceiling has left free — which is the whole point: waiting cannot make this fit while
 	// the holder holds, so refusing it is refusing it forever.
 	payload := `{"session_id":"blocked","hook_event_name":"PreToolUse","tool_name":"Bash",` +
-		`"tool_input":{"command":"docker compose up -d"},"tool_use_id":"toolu_compose"}`
+		`"tool_input":{"command":"docker compose build"},"tool_use_id":"toolu_compose"}`
 
 	// runGateFor asserts the grant contract: exit 0, empty stdout, inside the latency
 	// ceiling. A refusal fails all three — it parks for the full wait and then prints a

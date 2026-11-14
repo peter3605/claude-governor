@@ -22,7 +22,7 @@ they run:
 - **A subagent spawn**: an `Agent` call, or a `SendMessage` that resumes a subagent. It
   weighs a small fraction of a slot ([design.md §5.2](design.md#52-aimd)).
 - **A build-shaped `Bash` command**, such as `go test ./...`, `cargo build`, `npm test` or
-  `docker compose`. It weighs one slot or more, depending on its cost class
+  `docker compose build`. It weighs one slot or more, depending on its cost class
   ([§5.5](design.md#55-classification-which-bash-is-build-shaped)).
 
 Everything else is untouched. `ls`, `git status`, `cat` and most other `Bash` calls are
