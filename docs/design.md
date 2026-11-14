@@ -210,7 +210,7 @@ deadline in §4.4 is what protects the session from a wedged daemon.
 | Free slot in this session's share | exit 0, silent | nothing; normal permission flow continues |
 | No slot, one likely within `wait_max` | block, then grant | a brief stall, then the spawn proceeds |
 | Still no slot at the deadline | `deny` + reason | a refusal it can act on (below) |
-| Caller is itself a subagent | `deny`, at once | nested fan-out refused (invariant, §6.3) |
+| Caller is itself a subagent, and the call is a spawn | `deny`, at once | nested fan-out refused (invariant, §6.3); a subagent's *build* is not covered by this row and is rationed by capacity like any other build |
 | Daemon unreachable | exit 0, silent | nothing |
 
 Block-and-wait is preferred over deny wherever the wait fits inside the hook timeout,
@@ -1539,6 +1539,18 @@ is the *caller's* depth, fixed by the paragraph above at exactly two distinguish
 0 for the main session and 1 for a subagent — so it is never greater than 1 and the rule
 never fired. The enforceable rule is the single test §10.1 already names: `agent_id` present
 means nested, and nested is refused. The daemon therefore denies at depth ≥ 1.
+
+**Spawns only (corrected in GOV-B35).** The rule covers a spawn (`Agent`, `Task`, an empty
+`tool_name`, a `SendMessage` resume — whatever the gate governs as a spawn). It does **not**
+cover a build. A build holds its lease and finishes; it never waits on a slot for a child, so
+it cannot cause the nested deadlock above. Many builds are launched by subagents (§1), and
+build concurrency is exactly what is rationed, so **a subagent's builds are rationed by
+capacity like any other build**: granted, parked, or refused for capacity, never for depth.
+The gate sends `depth: 0` with every build, and the daemon ignores `depth` on a request whose
+`kind` is `build` — both, because during an upgrade an older gate still sends `depth: 1` with
+a subagent's build and an older daemon still refuses one. A request with no `kind` is an older
+gate's spawn and stays subject to the rule. The `request_build` tool asks only about
+builds, so it never relays a depth refusal: a `depth` answer to it is read as unrecognised.
 
 The depth refusal is decided **before** the budget is consulted and is never parked. A nested
 spawn is not short of a slot, it is not allowed one, and holding it for twenty seconds to

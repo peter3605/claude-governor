@@ -44,7 +44,8 @@ Four things do not change:
   wrong, the call goes ahead ungoverned. A broken governor costs you governance, never a
   stalled session ([§3](design.md#3-invariants), invariant 1).
 - **Nested fan-out is refused.** A subagent that tries to spawn its own subagents is told to
-  do the work itself ([§6.3](design.md#63-depth)).
+  do the work itself ([§6.3](design.md#63-depth)). Its builds and test runs are not nested
+  fan-out: they share the build budget like anyone else's.
 - **Sessions that were already open stay ungoverned.** Claude Code binds hooks when a
   session starts, so a window opened before install never loads them until you restart it.
   That was measured on Claude Code 2.1.267
@@ -173,7 +174,8 @@ keeps retrying, the wording gets firmer on the second and third refusal
 ([§4.2](design.md#42-decision-table)).
 
 A nested spawn, meaning a subagent trying to start its own subagents, is refused at once
-whatever the load:
+whatever the load. This covers spawns only: a subagent's `go test` or `cargo build` is rationed
+by capacity like any other build.
 
 ```
 Nested subagent spawns are refused: this Agent call comes from a subagent, and only the main session may fan out. Do this task inline in the agent you are already in. Do not retry the Agent call.

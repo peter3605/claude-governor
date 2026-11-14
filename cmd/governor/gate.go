@@ -622,6 +622,14 @@ func awaitParked(diag io.Writer, conn net.Conn, replies *bufio.Reader, clock *bu
 // daemon did not send is a fabrication. CPU is null until GOV-12 lands the sampler, and
 // thermal is "unknown" on Linux by design.
 func denyReason(resp acquireResponse, in intent) string {
+	if resp.Reason == "depth" && in.kind == "build" {
+		// Only an older daemon says this to a build (GOV-B35): this gate sends depth 0 with
+		// one, and a current daemon ignores depth on a build either way. The caller made no
+		// Agent call, so the spawn text below would be false. Name the stale daemon instead.
+		return "The governor daemon refused this build as if it were a nested spawn, which " +
+			"it is not: the running daemon is older than this gate and needs restarting. " +
+			"Run this command from the main session in the meantime."
+	}
 	if resp.Reason == "depth" {
 		// Nothing conditional to say: this refusal does not depend on load, and naming a
 		// slot count would invite a retry once the count moved. It never will for this
@@ -850,8 +858,13 @@ func escalation(denials int) string {
 
 // acquireRequestFor builds the wire request from the hook payload and the gate's decision.
 func acquireRequestFor(p hookPayload, in intent, speaks int) acquireRequest {
+	// Depth is sent for a spawn only (design.md section 6.3, GOV-B35). The depth rule exists
+	// to stop an agent holding a slot while it waits for one for its own child; a build
+	// holds its lease and finishes, so a subagent's build is rationed by capacity like any
+	// other. Sending depth 1 with it made an older daemon refuse `go test` from a subagent
+	// with the nested-spawn text, while the MCP tool had just said yes.
 	depth := 0
-	if p.AgentID != "" {
+	if p.AgentID != "" && in.kind != "build" {
 		depth = 1
 	}
 	return acquireRequest{
