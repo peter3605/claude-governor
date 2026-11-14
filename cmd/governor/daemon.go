@@ -1490,7 +1490,12 @@ func (d *daemon) acquire(req request) any {
 			case l := <-w.granted:
 				// The pump removed it from the queue before handing over the lease.
 				d.event("park-granted session=%s waited=%v", req.Session, time.Since(parked).Round(time.Millisecond))
-				return d.granted(l, limit, src)
+				// Re-read for the same reason the expiry path does (GOV-B34): the waiter
+				// was admitted against the budget in force when the pump ran — a pin set
+				// since it parked, say — and the grant must report that one, not the
+				// number captured when it parked.
+				limit, quotas, _ := d.budgetNow(req.Principal)
+				return d.granted(l, limit, sourceName(quotas))
 			case <-timer.C:
 				d.event("park-expired session=%s waited=%v", req.Session, time.Since(parked).Round(time.Millisecond))
 				// ONE LAST PUMP BEFORE GIVING UP (GOV-B31). Room does not only appear on a
