@@ -285,7 +285,7 @@ and the head sentence depends on what is actually true:
 | held < budget | `Not enough free build slots` |
 
 ```
-Not enough free build slots (1/4 build slots held, this one needs 3.8, thermal: nominal).
+Not enough free build slots (1/4 build slots held, this one needs 4, thermal: nominal).
 This command was not run. This is a large build and the slots left free are not enough for
 it. Wait a few seconds and run exactly the same command again; do not look for a different
 way to build, and do not treat this as a build failure.
@@ -869,8 +869,28 @@ count and a quantity of budget are different numbers once a subagent weighs 0.08
 Heavy build 3.75, so the wire carries both — `in_use` is still the count, and an additive
 `slots` field is what the status line and the deny text render beside `budget`. Four agents
 reading "4/6 slots" on a machine that is 5% full is a number that invites exactly the wrong
-response. Whole values print whole; a fraction prints to one place, so a machine holding only
-agents reads "0.2/6 slots" rather than rounding to a reassuring zero.
+response.
+
+**Slot counts are shown whole; only the display rounds (GOV-B32).** The owner saw "3.8/4
+slots" — one Heavy build at 3.75 plus one subagent at 0.08 — and asked for whole numbers,
+rounded up if anything. Two ways to get there were open: round the *display*, or make the
+*weights* integers. The display rounds, and admission keeps its fractional weights, because:
+
+- **Rounding the weights is a control change, and a harsher one than it looks.** A Heavy
+  weighed at 4 on a four-slot ceiling is exclusive: the 3.8 the owner saw was a spawn at
+  0.08 beside a Heavy at 3.75, which fits (3.83 ≤ 4); at weights 1 + 4 it would not. An agent rounded to 1 would let four subagents
+  fill the machine, which is the error GOV-15 exists to correct.
+- **The slot scale may yet move.** GOV-B33 revisits what one slot means; doing accounting
+  changes here would mean doing them twice.
+
+So the daemon sends two additive display fields beside `slots`: `build_slots`, the sum held
+by builds, which every surface rounds **up** (a Heavy at 3.75 reads as 4, three Mediums as
+3), and `agents`, the count of live agent leases, which is shown *beside* the figure rather
+than rounded into it — `4/4 slots - 2 agents`. A machine holding only agents reads
+`0/6 slots - 3 agents`: honest about builds, and not empty. The refusal's "this one needs N"
+is rounded up the same way and is only stated for builds. A daemon from before this change
+sends neither field, and its mixed total is rounded to the nearest slot instead, so its
+agents are not rounded up with it.
 
 **Measured against a real fan-out, the loop controls and it over-controls.**
 [control-proof.md](control-proof.md) drove ten concurrent `go build -a` runs through a live

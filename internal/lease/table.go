@@ -1013,6 +1013,30 @@ func (t *Table) Slots() float64 {
 	return t.weight
 }
 
+// Split divides what is held into the two figures a person is shown (GOV-B32): the slots
+// held by builds, and the NUMBER of live agent leases.
+//
+// It is display only. Admission compares Slots, the exact fractional sum, and nothing here
+// changes that. The split exists because a renderer that rounds the held figure up to a whole
+// slot must not round an agent's ~0.08 up with it — four agents would read "4/4 slots" on a
+// machine that is 8% full — so agents are counted beside the figure rather than inside it.
+func (t *Table) Split() (buildSlots float64, agents int) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.splitLocked()
+}
+
+func (t *Table) splitLocked() (buildSlots float64, agents int) {
+	for _, l := range t.byID {
+		if l.Kind == Agent {
+			agents++
+			continue
+		}
+		buildSlots += l.Weight
+	}
+	return buildSlots, agents
+}
+
 // Held is how much budget one session holds, in slots: the same sum the admission rule's
 // first-slot escape reads (heldLocked).
 //
@@ -1036,11 +1060,14 @@ type SessionStat struct {
 // Snapshot is a consistent view of the table for the status operation. Every count is taken
 // under one lock, so status can never report a total that disagrees with its own parts.
 type Snapshot struct {
-	InUse     int
-	Slots     float64
-	Tentative int
-	Confirmed int
-	Sessions  []SessionStat
+	InUse int
+	Slots float64
+	// BuildSlots and Agents are Split, taken under the same lock as the rest (GOV-B32).
+	BuildSlots float64
+	Agents     int
+	Tentative  int
+	Confirmed  int
+	Sessions   []SessionStat
 }
 
 // Snapshot reads the table for status.
@@ -1073,6 +1100,7 @@ func (t *Table) Snapshot() Snapshot {
 	}
 	s.InUse = len(t.byID)
 	s.Slots = t.weight
+	s.BuildSlots, s.Agents = t.splitLocked()
 	for _, st := range per {
 		s.Sessions = append(s.Sessions, *st)
 	}

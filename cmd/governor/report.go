@@ -219,7 +219,8 @@ func reportBudget(d *diagnosis) string {
 		return "unknown (no daemon to ask)"
 	}
 	r := d.reply
-	s := fmt.Sprintf("%s/%d slots held, %d waiting", formatSlots(r.Slots), r.Budget, r.Waiting)
+	s := fmt.Sprintf("%d/%d slots held%s, %d waiting", heldSlots(r.Slots, r.BuildSlots), r.Budget,
+		agentsClause(r.Agents, ", "), r.Waiting)
 	if r.Ceiling > 0 {
 		s += fmt.Sprintf(", ceiling %d", r.Ceiling)
 	}
@@ -358,7 +359,7 @@ func recentDecisions() string {
 		if shapes == "" {
 			shapes = "-"
 		}
-		s := fmt.Sprintf("%s  %-11s %-6s w%s  %s  %s", ts, b.Outcome, b.Class, formatSlots(b.Weight),
+		s := fmt.Sprintf("%s  %-11s %-6s w%d  %s  %s", ts, b.Outcome, b.Class, wholeSlots(b.Weight),
 			strings.TrimPrefix(sessionLabel(b.SessionID), "session "), shapes)
 		if b.WaitedMS > 0 {
 			s += fmt.Sprintf("  waited %.0fms", b.WaitedMS)

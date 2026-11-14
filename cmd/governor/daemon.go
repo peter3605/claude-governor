@@ -188,6 +188,13 @@ type refuseReply struct {
 	CPU     *float64        `json:"cpu"`
 	Thermal signals.Thermal `json:"thermal"`
 	Source  string          `json:"source"`
+	// BuildSlots and Agents are what a renderer shows in place of Slots (GOV-B32): the slots
+	// held by builds, which it rounds UP to a whole number, and the count of live agent
+	// leases, which it names beside that figure rather than rounding into it. Display only;
+	// admission reads the exact Slots. A pointer so that a daemon from before GOV-B32, which
+	// sends neither, is told apart from one holding no builds.
+	BuildSlots *float64 `json:"build_slots,omitempty"`
+	Agents     int      `json:"agents,omitempty"`
 	// Denials is how many times this session has been refused inside denyWindow, counting
 	// this one. The gate escalates its reason text on it. It is counted here rather than in
 	// the gate because each gate is a separate process that remembers nothing, and this is
@@ -283,6 +290,15 @@ type adviseReply struct {
 	Budget     int     `json:"budget"`
 	InUse      int     `json:"in_use"`
 	Slots      float64 `json:"slots"`
+	// See refuseReply.BuildSlots.
+	BuildSlots *float64 `json:"build_slots,omitempty"`
+	Agents     int      `json:"agents,omitempty"`
+}
+
+// split is the table's display split in the shape the replies carry (GOV-B32).
+func (d *daemon) split() (*float64, int) {
+	b, n := d.table.Split()
+	return &b, n
 }
 
 // versionReply answers a request in a protocol version this binary does not speak.
@@ -320,8 +336,11 @@ type statusReply struct {
 	// Slots is how much of the budget those leases weigh. See refuseReply.Slots: since
 	// GOV-15 a count of leases and a quantity of budget are different numbers, and only this
 	// one is comparable with Budget.
-	Slots   float64 `json:"slots"`
-	Waiting int     `json:"waiting"`
+	Slots float64 `json:"slots"`
+	// See refuseReply.BuildSlots.
+	BuildSlots *float64 `json:"build_slots,omitempty"`
+	Agents     int      `json:"agents,omitempty"`
+	Waiting    int      `json:"waiting"`
 	// CPU is the 5 s EWMA of host utilisation in [0,1] (design.md section 5.1), or null when
 	// nothing has sampled yet. It is the smoothed figure rather than the instantaneous one
 	// because a raw read swings hard enough to make anything reading it oscillate — the
@@ -1388,11 +1407,13 @@ func (d *daemon) acquire(req request) any {
 	// saying so would stall a session to reach an answer that was already known.
 	if req.Depth > maxFanOutDepth {
 		d.event("deny session=%s reason=depth", req.Session)
-		return refuseReply{
+		r := refuseReply{
 			V: d.speaks, Reason: "depth",
 			Budget: limit, InUse: d.table.InUse(), Slots: d.table.Slots(), Source: src,
 			CPU: nil, Thermal: d.thermal(),
 		}
+		r.BuildSlots, r.Agents = d.split()
+		return r
 	}
 
 	// THE FAST PATH IS CLOSED WHILE ANYONE IS WAITING (GOV-18). Taking a slot here when the
@@ -1524,6 +1545,7 @@ func (d *daemon) acquire(req request) any {
 func (d *daemon) advise(req request) adviseReply {
 	limit, _ := budget.Min(context.Background(), d.sources, req.Principal)
 	reply := adviseReply{V: d.speaks, Budget: limit, InUse: d.table.InUse(), Slots: d.table.Slots()}
+	reply.BuildSlots, reply.Agents = d.split()
 
 	if req.Depth > maxFanOutDepth {
 		reply.Reason = "depth"
@@ -1577,6 +1599,7 @@ func (d *daemon) refuseForCapacity(req request, limit int, src string) refuseRep
 		Ceiling: ceiling, Cut: cut,
 		Own: d.table.Held(req.Session),
 	}
+	r.BuildSlots, r.Agents = d.split()
 	// Logged here rather than at each call site so that a refusal added later cannot be one
 	// the log does not know about. This is the event that costs the model something, and it
 	// is the one a week of dogfooding is read for.
@@ -1828,6 +1851,7 @@ func (d *daemon) status(req request) statusReply {
 	}
 	out := statusReply{
 		V: d.speaks, Budget: limit, InUse: snap.InUse, Slots: snap.Slots,
+		BuildSlots: &snap.BuildSlots, Agents: snap.Agents,
 		// Parked acquires, from the FIFO of design.md section 6.2.
 		Waiting:           d.waits.len(),
 		BinaryVersion:     binaryVersion,

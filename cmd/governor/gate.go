@@ -155,6 +155,10 @@ type acquireResponse struct {
 	// InUse counts leases and the budget counts slots, and four agents reading "4/6 slots"
 	// on a machine that is 5% full is a number that invites exactly the wrong response.
 	Slots float64 `json:"slots"`
+	// BuildSlots and Agents are the display split (GOV-B32); see refuseReply.BuildSlots.
+	// Nil from a daemon older than that story.
+	BuildSlots *float64 `json:"build_slots,omitempty"`
+	Agents     int      `json:"agents,omitempty"`
 	// CPU is a pointer because the daemon has no sampler until GOV-12 and sends null
 	// rather than a fabricated 0.0, which would read as an idle machine. A deny must not
 	// claim a CPU figure it was not given.
@@ -660,15 +664,17 @@ func denyReason(resp acquireResponse, in intent) string {
 	case resp.Slots < float64(resp.Budget):
 		head, why = "Not enough free build slots", refusedTooBig
 	}
-	// formatSlots rather than %.1f so a machine holding four whole builds says "4/6" and not
-	// "4.0/6": the decimal is there to stop a machine holding only agents rounding to a
-	// reassuring zero, not to decorate the common case.
-	fmt.Fprintf(&b, "%s (%s/%d build slots held", head, formatSlots(resp.Slots), resp.Budget)
+	// WHOLE SLOTS (GOV-B32): the build figure rounded up, with agents counted beside it
+	// rather than rounded into it. See heldSlots.
+	fmt.Fprintf(&b, "%s (%d/%d build slots held%s", head, heldSlots(resp.Slots, resp.BuildSlots),
+		resp.Budget, agentsClause(resp.Agents, ", "))
 	// The number whose absence made the incident's message unreadable. Conditional like every
 	// other clause here: a daemon too old to send it sends zero, and a refusal claiming a
 	// command needs no slots would be the fabrication section 4.2 forbids.
-	if resp.Asking > 0 {
-		fmt.Fprintf(&b, ", this one needs %s", formatSlots(resp.Asking))
+	// Builds only: an agent asks about 0.08 of a slot, and rounding that up to "needs 1"
+	// would state a cost twelve times the real one (GOV-B32).
+	if resp.Asking > 0 && in.kind == "build" {
+		fmt.Fprintf(&b, ", this one needs %d", wholeSlots(resp.Asking))
 	}
 	if resp.CPU != nil {
 		fmt.Fprintf(&b, ", CPU %.0f%%", *resp.CPU*100)

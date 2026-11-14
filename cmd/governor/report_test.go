@@ -88,7 +88,7 @@ func TestTheReportIsSafeToPasteInPublic(t *testing.T) {
 		// The header facts clause 1 names.
 		"governor     " + binaryVersion, "install ", "cores", "thermal", "claude code", "budget",
 		// The decision, by its safe fields: outcome, class, weight, shape, wait, short session.
-		"denied", "heavy", "w3.8", "pytest", "parked", "waited 1544ms", "1f2e3d4c",
+		"denied", "heavy", "w4", "pytest", "parked", "waited 1544ms", "1f2e3d4c",
 		// The reason text survives with the secret and the path taken out of it.
 		"why: refused: <redacted> at <path>",
 		// The log survives too, with ids shortened and the state directory named, not spelled.

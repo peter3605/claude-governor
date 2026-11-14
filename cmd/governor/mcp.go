@@ -132,6 +132,10 @@ type adviseResponse struct {
 	Budget     int     `json:"budget"`
 	InUse      int     `json:"in_use"`
 	Slots      float64 `json:"slots"`
+	// BuildSlots and Agents are the display split (GOV-B32); see refuseReply.BuildSlots.
+	// Nil from a daemon older than that story.
+	BuildSlots *float64 `json:"build_slots,omitempty"`
+	Agents     int      `json:"agents,omitempty"`
 }
 
 // advice is what the tool answers, and it is the shape design.md section 8 specifies:
@@ -346,7 +350,8 @@ func adviseOn(args requestBuildArgs, diag io.Writer, dialer transport.Dialer, bu
 	}
 	if resp.Granted {
 		return advice{Granted: true, Reason: fmt.Sprintf(
-			"capacity available (%s/%d build slots in use)", formatSlots(resp.Slots), resp.Budget)}
+			"capacity available (%d/%d build slots in use%s)", heldSlots(resp.Slots, resp.BuildSlots),
+			resp.Budget, agentsClause(resp.Agents, ", "))}
 	}
 	if !advisoryRefusalsHonoured[resp.Reason] {
 		fmt.Fprintf(diag, "governor mcp: daemon refused for reason %q, which this binary does "+
@@ -360,9 +365,10 @@ func adviseOn(args requestBuildArgs, diag io.Writer, dialer transport.Dialer, bu
 	return advice{
 		Granted:    false,
 		WaitHintMS: resp.WaitHintMS,
-		Reason: fmt.Sprintf("machine at capacity (%s/%d build slots in use). Do not run this "+
+		Reason: fmt.Sprintf("machine at capacity (%d/%d build slots in use%s). Do not run this "+
 			"command now: %s and ask again. This is not a build failure.",
-			formatSlots(resp.Slots), resp.Budget, waitAdvice(resp.WaitHintMS)),
+			heldSlots(resp.Slots, resp.BuildSlots), resp.Budget, agentsClause(resp.Agents, ", "),
+			waitAdvice(resp.WaitHintMS)),
 	}
 }
 
