@@ -87,8 +87,8 @@ A slot is roughly one ordinary build. Slot counts are always whole: a large buil
 weighs 3.75 slots reads as 4, because the figure rounds up. Only the display rounds — the
 governor still admits work on the exact weights ([§5.2](design.md#52-aimd)). A subagent is a
 small fraction of a slot (about 0.08), so it is not rounded into the figure at all; it is
-counted beside it, and a machine running only agents reads `0/6 slots - 3 agents - cpu 12% -
-thermal ok`.
+counted beside it, and a machine running only agents reads
+`0/6 slots - 3 agents - cpu 12% - thermal ok`.
 
 Some lines you may see:
 
@@ -165,7 +165,7 @@ because they are different situations.
 ### A refused spawn
 
 ```
-Machine at capacity (4/4 build slots held, this one needs 0.1, CPU 93%, thermal: nominal). Run this task inline yourself rather than delegating it. Do not retry the Agent call.
+Machine at capacity (4/4 build slots held, CPU 93%, thermal: nominal). Run this task inline yourself rather than delegating it. Do not retry the Agent call.
 ```
 
 The work still happens. The session does it itself instead of delegating it. If the session

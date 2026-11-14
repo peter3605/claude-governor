@@ -856,10 +856,14 @@ func TestStatuslineAgainstTheRealDaemon(t *testing.T) {
 		// Taken through the table rather than over the wire because the point here is what
 		// the status reply says about leases, not how they were acquired.
 		limit := 4
-		if _, ok := d.table.Acquire(lease.Request{Session: sampleSessionID, Depth: 0}, limit); !ok {
+		// Builds of one whole slot each: since GOV-B32 the figure counts what builds hold and
+		// agents are named beside it, so agent leases would not move it.
+		if _, ok := d.table.Acquire(lease.Request{Session: sampleSessionID, Kind: lease.Build,
+			ToolUseID: "tu-mine", Weight: 1}, limit); !ok {
 			t.Fatalf("acquire: no room in a budget of %d", limit)
 		}
-		if _, ok := d.table.Acquire(lease.Request{Session: "another-session", Depth: 0}, limit); !ok {
+		if _, ok := d.table.Acquire(lease.Request{Session: "another-session", Kind: lease.Build,
+			ToolUseID: "tu-other", Weight: 1}, limit); !ok {
 			t.Fatalf("acquire: no room in a budget of %d", limit)
 		}
 		d.table.StartSession(lease.Session{ID: sampleSessionID, Weight: 1})
@@ -980,6 +984,7 @@ func TestGovernorStatusWhenTheDaemonIsDown(t *testing.T) {
 // illustration nobody can name a view for is an illustration nobody checked.
 func TestTheDocsIllustrateTheStatusLineThatActuallyRenders(t *testing.T) {
 	cpu := 0.61
+	heavyHeld := 3.75
 	renders := map[string]string{} // line -> the view that produced it
 	for name, v := range map[string]statusView{
 		"section 9, a governed session with both load signals": {
@@ -990,6 +995,13 @@ func TestTheDocsIllustrateTheStatusLineThatActuallyRenders(t *testing.T) {
 		},
 		"section 9, a session whose hooks never loaded": {
 			OK: true, Ungoverned: true,
+		},
+		// GOV-B32: section 5.2's whole-slot examples.
+		"section 5.2, a Heavy beside two agents, shown whole": {
+			OK: true, InUse: 3, Slots: 3.75 + 0.16, BuildSlots: &heavyHeld, Agents: 2, Budget: 4,
+		},
+		"section 5.2, only agents": {
+			OK: true, InUse: 3, Slots: 0.24, BuildSlots: new(float64), Agents: 3, Budget: 6,
 		},
 		// The only view here with OK false, added by GOV-B17 when section 9 came to
 		// illustrate this line while recording what the 50 ms budget actually buys. The

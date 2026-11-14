@@ -58,7 +58,8 @@ func guideStatusLines() []guideStatusLine {
 		{"governed, with both load signals", statusView{
 			OK: true, InUse: 3, Slots: 3, Budget: 5, CPU: cpu(0.61), Thermal: signals.Nominal}},
 		{"governed, holding only agents", statusView{
-			OK: true, InUse: 3, Slots: 0.2, Budget: 6, CPU: cpu(0.12), Thermal: signals.Nominal}},
+			OK: true, InUse: 3, Slots: 0.2, BuildSlots: new(float64), Agents: 3, Budget: 6,
+			CPU: cpu(0.12), Thermal: signals.Nominal}},
 		{"governed and idle", statusView{OK: true, Budget: 4}},
 		{"this session holds one", statusView{
 			OK: true, InUse: 3, Slots: 3, Budget: 5, Mine: 1, CPU: cpu(0.61), Thermal: signals.Nominal}},
@@ -113,7 +114,7 @@ func TestTheGuideShowsEveryLineTheStatusLineCanPrint(t *testing.T) {
 		render(statusView{OK: true, Paused: true}, 0),     // paused
 		" slots",
 		" yours)",
-		agentsClause(2, ""), // GOV-B32
+		agentsClause(3, ""), // GOV-B32
 		" waiting",
 		"cpu ",
 		"boosted",
