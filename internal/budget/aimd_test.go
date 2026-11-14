@@ -560,3 +560,29 @@ func runQueueFor(builds int) float64 {
 	}
 	return curve[len(curve)-1].rq
 }
+
+// TestMovedIsEmptyWhenABranchRunsButTheBudgetStays: the daemon logs a transition when Moved
+// names a cause (GOV-B29), so a branch that runs and changes nothing must not name one. A
+// halve at the floor and a climb at the ceiling both run their branch and leave the number
+// where it was, and a line for either would be a line per tick under sustained load.
+func TestMovedIsEmptyWhenABranchRunsButTheBudgetStays(t *testing.T) {
+	c := &Controller{Max: 4, RunQueueMax: 2}
+	busy := Reading{RunQueue: 9}
+	c.Step(busy) // 4 -> 2
+	if c.Moved() != MovedRunQueue {
+		t.Fatalf("Moved = %q after a cut, want %q", c.Moved(), MovedRunQueue)
+	}
+	c.Step(busy) // 2 -> 1
+	c.Step(busy) // 1 -> 1: halved at the floor
+	if c.Moved() != "" {
+		t.Errorf("Moved = %q on a cut at the floor, want empty", c.Moved())
+	}
+
+	c = &Controller{Max: 4, RunQueueMax: 2}
+	for i := 0; i < NominalTicksBeforeIncrease+1; i++ {
+		c.Step(Reading{RunQueue: 0.1, DemandWaiting: true}) // at the ceiling already
+	}
+	if c.Moved() != "" {
+		t.Errorf("Moved = %q on a climb at the ceiling, want empty", c.Moved())
+	}
+}

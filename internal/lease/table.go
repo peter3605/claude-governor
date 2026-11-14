@@ -215,6 +215,8 @@ type Request struct {
 	Weight float64
 	// ToolUseID keys a Build lease for release. Ignored for an Agent lease.
 	ToolUseID string
+	// Class is carried onto the lease for the release log only (Lease.Class).
+	Class string
 }
 
 // Fits reports whether Acquire would admit this request right now, WITHOUT taking a lease,
@@ -592,6 +594,7 @@ func (t *Table) grantLocked(r Request, w float64) Lease {
 		Kind:      r.Kind,
 		Depth:     r.Depth,
 		Weight:    w,
+		Class:     r.Class,
 		ToolUseID: r.ToolUseID,
 		GrantedAt: now,
 	}
@@ -619,24 +622,23 @@ func (t *Table) grantLocked(r Request, w float64) Lease {
 // Unlike the agent path this needs no correlation at all: PostToolUse carries the SAME
 // tool_use_id as the PreToolUse that took the lease, measured in every pairing observed
 // (hook-surface.md section 19). The session is checked for the same reason Release checks it.
-func (t *Table) ReleaseBuild(session, toolUseID string) bool {
+func (t *Table) ReleaseBuild(session, toolUseID string) (Released, bool) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
 	id, ok := t.byTool[toolUseID]
 	if !ok {
-		return false
+		return Released{}, false
 	}
 	l, ok := t.byID[id]
 	if !ok {
 		delete(t.byTool, toolUseID)
-		return false
+		return Released{}, false
 	}
 	if session != "" && l.Session != session {
-		return false
+		return Released{}, false
 	}
-	t.dropLocked(l)
-	return true
+	return t.dropLocked(l, ""), true
 }
 
 // Confirm binds a tentative lease to a live agent at SubagentStart.
@@ -731,29 +733,28 @@ func (t *Table) takePendingLocked(session, want string) string {
 //
 // SubagentStop fires more than once for the same agent, so a release for an agent holding
 // no lease is a no-op reported as false, never an error.
-func (t *Table) Release(session, agentID string) bool {
+func (t *Table) Release(session, agentID string) (Released, bool) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
 	id, ok := t.byAgent[agentID]
 	if !ok {
-		return false
+		return Released{}, false
 	}
 	l, ok := t.byID[id]
 	if !ok {
 		// The index outlived the lease it pointed at. Drop the dangling entry.
 		delete(t.byAgent, agentID)
-		return false
+		return Released{}, false
 	}
 	if session != "" && l.Session != session {
 		// Another session is claiming this agent. This should not happen, and the answer is
 		// to do nothing at all: dropping the lease would free a slot still in use, and
 		// dropping the index would leave a live lease that no release can ever reach. Left
 		// alone, the lease stays correct and the reaper remains its backstop.
-		return false
+		return Released{}, false
 	}
-	t.dropLocked(l)
-	return true
+	return t.dropLocked(l, ""), true
 }
 
 // Drop removes one lease by ID, whatever state it is in. It reports whether there was one.
@@ -763,33 +764,31 @@ func (t *Table) Release(session, agentID string) bool {
 // now rather than waiting out a TTL. It is deliberately not part of the release path, which
 // keys off agent_id and has a session to check against; a lease that was never confirmed has
 // neither.
-func (t *Table) Drop(id string) bool {
+func (t *Table) Drop(id string) (Released, bool) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
 	l, ok := t.byID[id]
 	if !ok {
-		return false
+		return Released{}, false
 	}
-	t.dropLocked(l)
-	return true
+	return t.dropLocked(l, ""), true
 }
 
 // ReleaseSession drops every lease held by a session, and forgets the session. It is the
 // SessionEnd path, and it is what stops a crashed session's leases from waiting out their
 // TTL.
-func (t *Table) ReleaseSession(session string) int {
+func (t *Table) ReleaseSession(session string) []Released {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
-	n := 0
+	var out []Released
 	for _, l := range t.leasesForLocked(session) {
-		t.dropLocked(l)
-		n++
+		out = append(out, t.dropLocked(l, ""))
 	}
 	delete(t.sessions, session)
 	delete(t.pending, session)
-	return n
+	return out
 }
 
 // StartSession registers a session, or updates one that re-registers.
@@ -847,23 +846,28 @@ func (t *Table) AdoptSession(s Session) bool {
 // Invariant 2 (design.md section 3): leases expire on their own. The stop hooks are assumed
 // never to fire — leaks are the default outcome here, not the edge case — so this is the
 // mechanism the budget's correctness actually rests on.
-func (t *Table) Reap() int {
+//
+// It returns what it dropped and why, for the daemon's release log (GOV-B29).
+func (t *Table) Reap() []Released {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
 	now := t.opt.Now()
 	dead := t.deadSessionsLocked()
-	dropped := 0
+	var dropped []Released
 	for _, l := range t.snapshotLeasesLocked() {
+		var why string
 		switch {
 		case !l.ExpiresAt.IsZero() && now.After(l.ExpiresAt):
+			why = "expired"
 		case dead[l.Session]:
+			why = "session-dead"
 		case l.State == Confirmed && t.opt.Liveness != nil && !t.opt.Liveness.Alive(*l):
+			why = "owner-dead"
 		default:
 			continue
 		}
-		t.dropLocked(l)
-		dropped++
+		dropped = append(dropped, t.dropLocked(l, why))
 	}
 	// A session whose process is gone is not coming back, and leaving it registered would
 	// have the reaper stat a dead PID every two seconds forever and have status keep
@@ -929,7 +933,11 @@ func (t *Table) deadSessionsLocked() map[string]bool {
 // It is the ONLY place a lease leaves the table, which is what lets the running weight be
 // maintained incrementally rather than recomputed: a second removal path would silently
 // leak budget that no test would see until the machine stopped granting.
-func (t *Table) dropLocked(l *Lease) {
+//
+// It returns a copy of what it removed, stamped with the table's clock, so every removal
+// path can report it without a second lookup (GOV-B29).
+func (t *Table) dropLocked(l *Lease, why string) Released {
+	gone := Released{Lease: *l, At: t.opt.Now(), Why: why}
 	if _, ok := t.byID[l.ID]; ok {
 		t.weight -= l.Weight
 		if t.weight < 0 {
@@ -958,6 +966,7 @@ func (t *Table) dropLocked(l *Lease) {
 			t.pending[l.Session] = append([]string(nil), keep...)
 		}
 	}
+	return gone
 }
 
 func (t *Table) leasesForLocked(session string) []*Lease {

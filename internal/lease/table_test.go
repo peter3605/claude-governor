@@ -63,7 +63,7 @@ func TestLifecycleTentativeConfirmedReleased(t *testing.T) {
 		t.Fatalf("in use %d after confirm, want 1 — confirming must not create a second lease", tbl.InUse())
 	}
 
-	if !tbl.Release("s1", "ag_1") {
+	if _, ok := tbl.Release("s1", "ag_1"); !ok {
 		t.Fatal("release of a confirmed lease reported nothing held")
 	}
 	if tbl.InUse() != 0 {
@@ -160,10 +160,10 @@ func TestReleaseToleratesRepeats(t *testing.T) {
 	l, _ := tbl.Acquire(Request{Session: "s1", Depth: 0}, 4)
 	tbl.Confirm("s1", l.ID, "ag_1", 1, time.Time{})
 
-	if !tbl.Release("s1", "ag_1") {
+	if _, ok := tbl.Release("s1", "ag_1"); !ok {
 		t.Fatal("first release reported nothing held")
 	}
-	if tbl.Release("s1", "ag_1") {
+	if _, ok := tbl.Release("s1", "ag_1"); ok {
 		t.Fatal("second release claimed to free a lease that was already gone")
 	}
 	if tbl.InUse() != 0 {
@@ -179,14 +179,14 @@ func TestReleaseFromTheWrongSessionChangesNothing(t *testing.T) {
 	l, _ := tbl.Acquire(Request{Session: "s1", Depth: 0}, 4)
 	tbl.Confirm("s1", l.ID, "ag_1", 1, time.Time{})
 
-	if tbl.Release("s2", "ag_1") {
+	if _, ok := tbl.Release("s2", "ag_1"); ok {
 		t.Fatal("a release from another session freed the lease")
 	}
 	if tbl.InUse() != 1 {
 		t.Fatalf("in use %d after a mismatched release, want 1", tbl.InUse())
 	}
 	// The owning session can still release it: the index must have survived.
-	if !tbl.Release("s1", "ag_1") {
+	if _, ok := tbl.Release("s1", "ag_1"); !ok {
 		t.Fatal("the owning session could no longer release its own lease")
 	}
 	if tbl.InUse() != 0 {
@@ -213,7 +213,7 @@ func TestConfirmWithNoAgentIDStillHoldsItsSlot(t *testing.T) {
 		t.Fatalf("in use %d, want 1", tbl.InUse())
 	}
 	c.advance(2 * time.Minute)
-	if n := tbl.Reap(); n != 1 {
+	if n := len(tbl.Reap()); n != 1 {
 		t.Fatalf("reaped %d, want 1 — the TTL is the only thing that can collect it", n)
 	}
 }
@@ -226,7 +226,7 @@ func TestReleaseSessionDropsEverythingItHeld(t *testing.T) {
 	tbl.Acquire(Request{Session: "s2", Depth: 0}, 8)
 	tbl.Confirm("s1", a.ID, "ag_1", 1, time.Time{})
 
-	if n := tbl.ReleaseSession("s1"); n != 2 {
+	if n := len(tbl.ReleaseSession("s1")); n != 2 {
 		t.Fatalf("released %d leases for s1, want 2 (one confirmed, one tentative)", n)
 	}
 	if tbl.InUse() != 1 {
@@ -246,11 +246,11 @@ func TestReaperCollectsExpiredTentativeLeases(t *testing.T) {
 
 	tbl.Acquire(Request{Session: "s1", Depth: 0}, 4)
 	c.advance(29 * time.Second)
-	if n := tbl.Reap(); n != 0 {
+	if n := len(tbl.Reap()); n != 0 {
 		t.Fatalf("reaped %d leases inside the TTL, want 0", n)
 	}
 	c.advance(2 * time.Second)
-	if n := tbl.Reap(); n != 1 {
+	if n := len(tbl.Reap()); n != 1 {
 		t.Fatalf("reaped %d leases past the TTL, want 1", n)
 	}
 	if tbl.InUse() != 0 {
@@ -270,7 +270,7 @@ func TestReaperCollectsConfirmedLeasesWhoseOwnerIsGone(t *testing.T) {
 	l, _ := tbl.Acquire(Request{Session: "s1", Depth: 0}, 4)
 	tbl.Confirm("s1", l.ID, "ag_1", 4242, c.now())
 
-	if n := tbl.Reap(); n != 1 {
+	if n := len(tbl.Reap()); n != 1 {
 		t.Fatalf("reaped %d leases whose owner is dead, want 1", n)
 	}
 	if tbl.InUse() != 0 {
@@ -288,13 +288,13 @@ func TestReaperSparesConfirmedLeasesWhoseOwnerIsAlive(t *testing.T) {
 	tbl.Confirm("s1", l.ID, "ag_1", 4242, c.now())
 
 	c.advance(59 * time.Minute)
-	if n := tbl.Reap(); n != 0 {
+	if n := len(tbl.Reap()); n != 0 {
 		t.Fatalf("reaped %d live leases, want 0", n)
 	}
 	// The TTL is still a backstop: a lost SubagentStop must not hold a slot indefinitely
 	// just because its session is still running.
 	c.advance(2 * time.Minute)
-	if n := tbl.Reap(); n != 1 {
+	if n := len(tbl.Reap()); n != 1 {
 		t.Fatalf("reaped %d leases past the confirmed TTL, want 1", n)
 	}
 }

@@ -1566,6 +1566,12 @@ per connection. Deliberately boring — this is a hot path.
  "pid":48213,"pid_started_at":1757212800}
 // -> release
 {"v":1,"op":"release","session":"abc123","agent_id":"ag_77"}
+// -> finish (a Build lease, keyed by the tool_use_id its acquire carried). `hook_event` is
+//    PostToolUse or PostToolUseFailure, for the daemon's release log only (GOV-B29): never
+//    acted on, read from a closed set, and absent from an older hook, which is logged as
+//    PostToolUse. Additive; no protocol bump. It is not `hook_event_name`, the PAYLOAD's key,
+//    so that one name does not mean two things on either side of the hook.
+{"v":1,"op":"finish","session":"abc123","tool_use_id":"toolu_01...","hook_event":"PostToolUseFailure"}
 // -> session
 {"v":1,"op":"session","action":"start","session":"abc123","pid":48001,"weight":1}
 // -> status (statusline, doctor, /governor)
@@ -1831,7 +1837,7 @@ claude-governor/                  the repo
 ├── commands/governor.md          the slash command (section 9.1)
 └── bin/governor                  the binary those hooks run
 
-state  → ~/.claude/governor/      sock, daemon.pid, daemon.log, daemon.start, statusline.json,
+state  → ~/.claude/governor/      sock, daemon.pid, daemon.log, daemon.log.1, daemon.start, statusline.json,
                                   statusline.json.*, onboarded, surface.json, surface.json.tmp,
                                   config.json, samples.jsonl, samples.jsonl.1,
                                   samples.pre-bound-<ts>.jsonl, sampler.lock, sampler.log
@@ -2661,6 +2667,7 @@ Uninstall is only verifiable if this list is exhaustive, so it is normative.
 | `~/.claude/governor/sock` | daemon | uninstall |
 | `~/.claude/governor/daemon.pid` | daemon | uninstall |
 | `~/.claude/governor/daemon.log` | install, when it starts the daemon | uninstall |
+| `~/.claude/governor/daemon.log.1` | daemon, rotating the file above at 4 MiB (GOV-B29) | uninstall |
 | `~/.claude/governor/statusline.json` | `statusline`, when the directory already exists | uninstall |
 | `~/.claude/governor/statusline.json.*` | `statusline`, staging the file above before the rename | uninstall, **by pattern** — see below |
 | `~/.claude/governor/daemon.start` | the gate, when it lazily starts a daemon and the directory already exists | uninstall |

@@ -107,6 +107,16 @@ type request struct {
 	Class string  `json:"class"`
 	Slots float64 `json:"slots"`
 
+	// finish
+	//
+	// HookEvent is which hook sent a finish, PostToolUse or PostToolUseFailure (GOV-49 wired
+	// both), so a release can be logged with what released it (GOV-B29). It is recorded and
+	// never acted on. It is additive: an older hook sends none and is logged as PostToolUse,
+	// and an older daemon ignores it. The key was checked against every other message on this
+	// connection (section 7's rule), and hook_event_name, the payload's own key, was not
+	// reused, so a field's meaning does not depend on which side of the hook it was read.
+	HookEvent string `json:"hook_event,omitempty"`
+
 	// confirm / release
 	Lease        string `json:"lease"`
 	AgentID      string `json:"agent_id"`
@@ -647,12 +657,21 @@ func (d *daemon) noteSpawnSurface(session, tool string) {
 // inferred from the absence of denials.
 //
 // The log is the daemon's stderr, which `governor install` and a lazy start both point at
-// ~/.claude/governor/daemon.log. Timestamped because it is append-only across restarts and a
-// week of it is read after the fact, not watched.
+// ~/.claude/governor/daemon.log. Every line of it is timestamped, by d.diag rather than here
+// (daemonlog.go), because it is append-only across restarts and a week of it is read after
+// the fact, not watched.
 
 // event records one budget event.
 func (d *daemon) event(format string, args ...any) {
-	fmt.Fprintf(d.diag, "%s budget %s\n", time.Now().Format(time.RFC3339), fmt.Sprintf(format, args...))
+	fmt.Fprintf(d.diag, "budget %s\n", fmt.Sprintf(format, args...))
+}
+
+// released logs leases that have just left the table. Callers on a request path run it
+// after the reply is written (handle), never before, so the log costs a hook nothing.
+func (d *daemon) released(by string, rs ...lease.Released) {
+	for _, r := range rs {
+		d.event("%s", releaseLine(r, by))
+	}
 }
 
 // notePeak logs a new high-water mark for concurrent leases, and only a new one.
@@ -700,10 +719,25 @@ func runDaemon(args []string, stdout, stderr io.Writer) int {
 	if ep == "" {
 		var err error
 		if ep, err = transport.DefaultEndpoint(); err != nil {
-			fmt.Fprintf(stderr, "governor daemon: resolve endpoint: %v\n", err)
+			fmt.Fprintf(newDaemonLog(stderr), "governor daemon: resolve endpoint: %v\n", err)
 			return 1
 		}
 	}
+
+	// From here on every line this process writes, its own start-up lines included, goes
+	// through a timestamped writer (GOV-B29). When stderr is the state directory's
+	// daemon.log that writer also bounds the file. Whenever install or a lazy start launched
+	// the daemon, stdout is that same file, and it shares the writer so the "listening" line
+	// is serialised and stamped with everything else. Run by hand in a terminal, stdout stays
+	// stdout, stamped on its own.
+	stateDir, _ := stateDirFor(ep)
+	logw := newDaemonLog(daemonLogSink(stdout, stderr, stateDir))
+	if sameOpenFile(stdout, stderr) {
+		stdout = logw
+	} else {
+		stdout = newDaemonLog(stdout)
+	}
+	stderr = logw
 
 	// The build digest is taken FIRST, before the socket is bound and before anything can
 	// rename a newer binary over this one's path. Hashed later, it would describe whatever
@@ -713,7 +747,7 @@ func runDaemon(args []string, stdout, stderr io.Writer) int {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	d := newDaemon(*limit, stderr)
+	d := newDaemon(*limit, logw)
 	// The one place the daemon is allowed to look at the real machine.
 	d.observeThisMachine()
 	// And the one place its spawn-surface ledger is given a file. Derived from the endpoint
@@ -851,7 +885,7 @@ func newDaemonWithLeases(limit int, diag io.Writer, opt lease.Options) *daemon {
 		thermal:          signals.ReadThermal,
 		waits:            &waitQueue{},
 		denials:          newDenyLog(nil),
-		diag:             &syncWriter{w: diag},
+		diag:             newDaemonLog(diag),
 		started:          time.Now(),
 		build:            thisBuild(),
 		liveSessions:     noLiveSessions,
@@ -1106,27 +1140,49 @@ func (d *daemon) sample(ctx context.Context) {
 				fmt.Fprintf(d.diag, "governor daemon: sample: %v\n", err)
 				continue
 			}
-			d.signalsMu.Lock()
-			d.latest, d.latestOK = s, true
-			if d.cpuAvg == nil {
-				d.cpuAvg = signals.NewEWMA(signals.DefaultCPUWindow)
-			}
-			d.cpuAvg.Update(s.CPU, time.Now())
-			if avg, ok := d.cpuAvg.Value(); ok && d.loop != nil {
-				// The ceiling comes from the machine on every tick rather than once at
-				// start-up, because CPUCapacity is the cgroup quota where there is one and a
-				// quota can be changed under a running daemon.
-				d.loop.Max = d.ceiling(s.CPUCapacity)
-				d.loop.Step(budget.Reading{
-					CPU:           avg,
-					RunQueue:      s.RunQueue,
-					ThermalSevere: s.Thermal.Severe(),
-					DemandWaiting: demand,
-					InUse:         inUse,
-				})
-			}
-			d.signalsMu.Unlock()
+			d.step(s, demand, inUse)
 		}
+	}
+}
+
+// step publishes one reading and steps the control loop with it, logging the budget if it
+// moved. It is the body of sample's tick, separate so a test can drive the loop through each
+// cause with scripted readings instead of waiting a real second per tick (GOV-B29).
+func (d *daemon) step(s signals.Sample, demand, inUse bool) {
+	var moved string
+	d.signalsMu.Lock()
+	d.latest, d.latestOK = s, true
+	if d.cpuAvg == nil {
+		d.cpuAvg = signals.NewEWMA(signals.DefaultCPUWindow)
+	}
+	d.cpuAvg.Update(s.CPU, time.Now())
+	if avg, ok := d.cpuAvg.Value(); ok && d.loop != nil {
+		// The ceiling comes from the machine on every tick rather than once at start-up,
+		// because CPUCapacity is the cgroup quota where there is one and a quota can be
+		// changed under a running daemon.
+		from, ceilingFrom := d.loop.Budget(), d.loop.Max
+		d.loop.Max = d.ceiling(s.CPUCapacity)
+		to := d.loop.Step(budget.Reading{
+			CPU:           avg,
+			RunQueue:      s.RunQueue,
+			ThermalSevere: s.Thermal.Severe(),
+			DemandWaiting: demand,
+			InUse:         inUse,
+		})
+		// Formatted under the lock, because it reads the controller. Written after it,
+		// because liveBudget takes this lock on every acquire and a file write does not
+		// belong in front of one (GOV-B29).
+		cause := d.loop.Moved()
+		if cause == "" && ceilingFrom != d.loop.Max {
+			// The first Step of a daemon whose ceiling changed before any tick landed:
+			// Budget() had been answering start() from the old ceiling.
+			cause = budget.MovedCeiling
+		}
+		moved = budgetLine(from, to, cause, d.loop, s.RunQueue, string(s.Thermal), ceilingFrom)
+	}
+	d.signalsMu.Unlock()
+	if moved != "" {
+		d.event("%s", moved)
 	}
 }
 
@@ -1139,8 +1195,9 @@ func (d *daemon) reap(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-t.C:
-			if n := d.table.Reap(); n > 0 {
-				fmt.Fprintf(d.diag, "governor daemon: reaped %d lease(s)\n", n)
+			if gone := d.table.Reap(); len(gone) > 0 {
+				fmt.Fprintf(d.diag, "governor daemon: reaped %d lease(s)\n", len(gone))
+				d.released(releasedByReaper, gone...)
 			}
 			// Unconditionally, not only when something was reaped. This is the backstop for
 			// a wake-up that was somehow missed on the release path; a waiter should never
@@ -1203,6 +1260,13 @@ func (d *daemon) handle(conn net.Conn) {
 		reply = p.resolve()
 	}
 
+	if l, ok := reply.(loggedReply); ok {
+		// Logged whether or not the write succeeds. The lease left the table either way,
+		// and a release missing from the log is exactly what this log exists to prevent.
+		d.write(conn, l.reply)
+		l.after()
+		return
+	}
 	d.write(conn, reply)
 }
 
@@ -1236,11 +1300,14 @@ func (d *daemon) dispatch(req request) any {
 	case "confirm":
 		return d.confirm(req)
 	case "release":
-		return d.release(req)
+		reply, gone := d.release(req)
+		return d.thenLog(reply, releasedBySubagentEnd, gone)
 	case "finish":
-		return d.finish(req)
+		reply, gone := d.finish(req)
+		return d.thenLog(reply, finishedBy(req.HookEvent), gone)
 	case "session":
-		return d.session(req)
+		reply, gone := d.session(req)
+		return d.thenLog(reply, releasedBySessionEnd, gone)
 	case "status":
 		return d.status(req)
 	case "advise":
@@ -1250,6 +1317,24 @@ func (d *daemon) dispatch(req request) any {
 	default:
 		return ackReply{V: d.speaks, Reason: "unknown_op", InUse: d.table.InUse()}
 	}
+}
+
+// loggedReply is a reply with log lines that are written only after it has been sent
+// (GOV-B29). A release is answered first and recorded second, so writing the log can never
+// add to the time a hook waits.
+type loggedReply struct {
+	reply any
+	after func()
+}
+
+// thenLog pairs a reply with the release lines for gone, or returns the reply unchanged
+// when nothing was released. Nothing being released is the ordinary case for finish: every
+// `cat` reaches it.
+func (d *daemon) thenLog(reply any, by string, gone []lease.Released) any {
+	if len(gone) == 0 {
+		return reply
+	}
+	return loggedReply{reply: reply, after: func() { d.released(by, gone...) }}
 }
 
 // parkedAcquire is an acquire the daemon is holding rather than answering. handle writes
@@ -1272,6 +1357,11 @@ func leaseRequestFor(req request) lease.Request {
 	r := lease.Request{Session: req.Session, Depth: req.Depth, Weight: req.Slots}
 	if req.Kind == "build" {
 		r.Kind = lease.Build
+		// Carried for the release log only (GOV-B29), and from a closed vocabulary because
+		// the value came off the wire and the log is pasted into public issues.
+		if c := req.Class; c == "medium" || c == "heavy" {
+			r.Class = c
+		}
 		// Only a build is keyed by tool_use_id. An agent lease carries one too on the wire,
 		// but its release comes from SubagentStop with no tool_use_id at all, so indexing it
 		// here would build an index nothing can ever look up.
@@ -1391,7 +1481,9 @@ func (d *daemon) acquire(req request) any {
 			if l, got := d.waits.drop(w); got {
 				// The client is gone and this lease will never be confirmed. Hand the slot
 				// back now instead of letting it wait out its TTL.
-				d.table.Drop(l.ID)
+				if gone, ok := d.table.Drop(l.ID); ok {
+					d.released(releasedByHandback, gone)
+				}
 			}
 		},
 	}
@@ -1561,10 +1653,12 @@ func (d *daemon) confirm(req request) any {
 }
 
 // release returns a lease to the pool.
-func (d *daemon) release(req request) any {
+//
+// It returns what it released alongside the reply, for dispatch to log after sending it.
+func (d *daemon) release(req request) (ackReply, []lease.Released) {
 	// SubagentStop fires more than once for the same agent, so "held nothing" is a normal
 	// answer rather than a failure.
-	ok := d.table.Release(req.Session, req.AgentID)
+	gone, ok := d.table.Release(req.Session, req.AgentID)
 	if ok {
 		// The slot that just came free belongs to whoever has waited longest for it.
 		d.pump()
@@ -1572,8 +1666,9 @@ func (d *daemon) release(req request) any {
 	r := ackReply{V: d.speaks, OK: ok, InUse: d.table.InUse()}
 	if !ok {
 		r.Reason = "no_lease"
+		return r, nil
 	}
-	return r
+	return r, []lease.Released{gone}
 }
 
 // finish returns a Build lease at PostToolUse (GOV-15, hook-surface.md section 19).
@@ -1586,20 +1681,21 @@ func (d *daemon) release(req request) any {
 // path. The gate leases only build-shaped commands, so every `cat` and `git status` in every
 // session reaches this hook with no lease to return. It must be as quiet about that as
 // release is about a repeated SubagentStop.
-func (d *daemon) finish(req request) any {
-	ok := d.table.ReleaseBuild(req.Session, req.ToolUseID)
+func (d *daemon) finish(req request) (ackReply, []lease.Released) {
+	gone, ok := d.table.ReleaseBuild(req.Session, req.ToolUseID)
 	if ok {
 		d.pump()
 	}
 	r := ackReply{V: d.speaks, OK: ok, InUse: d.table.InUse()}
 	if !ok {
 		r.Reason = "no_lease"
+		return r, nil
 	}
-	return r
+	return r, []lease.Released{gone}
 }
 
 // session registers or drops a session.
-func (d *daemon) session(req request) any {
+func (d *daemon) session(req request) (ackReply, []lease.Released) {
 	switch req.Action {
 	case "start":
 		var started time.Time
@@ -1609,17 +1705,17 @@ func (d *daemon) session(req request) any {
 		d.table.StartSession(lease.Session{
 			ID: req.Session, PID: req.PID, PIDStarted: started, Weight: req.Weight,
 		})
-		return ackReply{V: d.speaks, OK: true, InUse: d.table.InUse()}
+		return ackReply{V: d.speaks, OK: true, InUse: d.table.InUse()}, nil
 	case "end":
 		// SessionEnd is what stops a dead session's leases from waiting out their TTL.
-		n := d.table.ReleaseSession(req.Session)
-		fmt.Fprintf(d.diag, "governor daemon: session %s ended, released %d lease(s)\n", req.Session, n)
-		if n > 0 {
+		gone := d.table.ReleaseSession(req.Session)
+		fmt.Fprintf(d.diag, "governor daemon: session %s ended, released %d lease(s)\n", req.Session, len(gone))
+		if len(gone) > 0 {
 			d.pump()
 		}
-		return ackReply{V: d.speaks, OK: true, InUse: d.table.InUse()}
+		return ackReply{V: d.speaks, OK: true, InUse: d.table.InUse()}, gone
 	default:
-		return ackReply{V: d.speaks, Reason: "unknown_action", InUse: d.table.InUse()}
+		return ackReply{V: d.speaks, Reason: "unknown_action", InUse: d.table.InUse()}, nil
 	}
 }
 

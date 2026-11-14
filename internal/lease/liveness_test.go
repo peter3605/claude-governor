@@ -206,13 +206,13 @@ func TestReaperCollectsARealDeadOwnerAndSparesALiveOne(t *testing.T) {
 
 	// Nothing is dead yet, so nothing may be collected. A reaper that dropped a lease here
 	// would be freeing a slot out from under a running agent.
-	if n := tbl.Reap(); n != 0 {
+	if n := len(tbl.Reap()); n != 0 {
 		t.Fatalf("Reap dropped %d lease(s) while both owners were alive, want 0", n)
 	}
 
 	killDead()
 
-	if n := tbl.Reap(); n != 1 {
+	if n := len(tbl.Reap()); n != 1 {
 		t.Fatalf("Reap dropped %d lease(s) after one owner was killed, want exactly 1", n)
 	}
 	if got := tbl.InUse(); got != 1 {
