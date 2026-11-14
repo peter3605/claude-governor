@@ -1038,7 +1038,9 @@ func (d *daemon) cutNow() (ceiling int, cut string) {
 // A PAUSE IS NOT APPLIED HERE. Pausing means "stop capping", and the obvious implementation —
 // return a huge number — would make `governor status` report a budget no source ever computed,
 // which is the fabricated-reading failure section 4.2 and the status line both exist to
-// prevent. acquire skips the capacity test instead, and every surface reports it as a pause.
+// prevent. acquire skips the capacity test instead — and so do the pump, for callers parked
+// before the pause, and advise, so the tool answers what the gate would do (GOV-B34) — and
+// every surface reports it as a pause.
 func (d *daemon) budgetNow(who principal) (int, []budget.Quota, overrideState) {
 	limit, quotas := budget.Min(context.Background(), d.sources, who)
 	over := d.overrides.state()
@@ -1488,7 +1490,12 @@ func (d *daemon) acquire(req request) any {
 			case l := <-w.granted:
 				// The pump removed it from the queue before handing over the lease.
 				d.event("park-granted session=%s waited=%v", req.Session, time.Since(parked).Round(time.Millisecond))
-				return d.granted(l, limit, src)
+				// Re-read for the same reason the expiry path does (GOV-B34): the waiter
+				// was admitted against the budget in force when the pump ran — a pin set
+				// since it parked, say — and the grant must report that one, not the
+				// number captured when it parked.
+				limit, quotas, _ := d.budgetNow(req.Principal)
+				return d.granted(l, limit, sourceName(quotas))
 			case <-timer.C:
 				d.event("park-expired session=%s waited=%v", req.Session, time.Since(parked).Round(time.Millisecond))
 				// ONE LAST PUMP BEFORE GIVING UP (GOV-B31). Room does not only appear on a
@@ -1543,7 +1550,11 @@ func (d *daemon) acquire(req request) any {
 // The depth rule is checked first and for the same reason acquire checks it first — a nested
 // caller is not short of a slot, it is not allowed one, and no amount of waiting changes that.
 func (d *daemon) advise(req request) adviseReply {
-	limit, _ := budget.Min(context.Background(), d.sources, req.Principal)
+	// THE SAME BUDGET ACQUIRE READS (GOV-B34). This used to call budget.Min directly and so
+	// never saw a `governor limit` pin: the tool said yes under a pin the gate would refuse
+	// against, and no above one it would admit under. Reading the overrides is a read, so
+	// this stays as side-effect-free as section 8 requires.
+	limit, _, over := d.budgetNow(req.Principal)
 	reply := adviseReply{V: d.speaks, Budget: limit, InUse: d.table.InUse(), Slots: d.table.Slots()}
 	reply.BuildSlots, reply.Agents = d.split()
 
@@ -1551,7 +1562,8 @@ func (d *daemon) advise(req request) adviseReply {
 		reply.Reason = "depth"
 		return reply
 	}
-	if d.table.Fits(leaseRequestFor(req), limit) {
+	// A pause is acquire's Table.Take path: the cap is off, so the gate would grant.
+	if over.Paused || d.table.Fits(leaseRequestFor(req), limit) {
 		reply.Granted = true
 		reply.Reason = "capacity"
 		return reply
@@ -1657,16 +1669,30 @@ func (d *daemon) pump() {
 	if !ok {
 		return
 	}
-	limit, _ := budget.Min(context.Background(), d.sources, who)
+	//
+	// Through budgetNow, like every other reader (GOV-B34). It used to call budget.Min
+	// directly, so a `governor limit` pin never reached the queue: pinning up left a waiter to
+	// time out against the old budget, and the deny line it then printed was the pinned one.
+	// Still read once, here, outside the lock — budgetNow dials the same sources.
+	limit, _, over := d.budgetNow(who)
 
 	d.waits.mu.Lock()
 	defer d.waits.mu.Unlock()
 
 	for len(d.waits.q) > 0 {
 		w := d.waits.q[0]
-		l, ok := d.table.Acquire(w.req, limit)
-		if !ok {
-			return
+		// A PAUSE ADMITS THE WAITERS TOO (GOV-B34). Pause means the cap is off, and acquire
+		// takes a lease through Table.Take while one is in force; a caller parked a moment
+		// before the pause is asking the same question and gets the same answer, rather than
+		// waiting out a cap that no longer exists. The walk is still from the head.
+		var l lease.Lease
+		if over.Paused {
+			l = d.table.Take(w.req)
+		} else {
+			var ok bool
+			if l, ok = d.table.Acquire(w.req, limit); !ok {
+				return
+			}
 		}
 		d.waits.q = d.waits.q[1:]
 		// Never blocks: granted is buffered, and a waiter is removed from the queue at the

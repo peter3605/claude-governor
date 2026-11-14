@@ -2117,6 +2117,14 @@ context and has no way to know it is still on. Nothing persists across a daemon 
 — the override lives in memory beside the lease table, for the reason §12.2 gives for the
 leases themselves.
 
+**Every reader sees the override (GOV-B34).** A pin is the budget for acquire, for the
+wait-queue pump, for `advise`, and for the deny line alike — one number, read through one
+function. Pinning up admits callers already parked behind the old budget at once rather than
+leaving them to time out; pinning down holds them back. A pause admits the parked callers too:
+pause means the cap is off, a caller that asked a moment before it is asking the same question
+as one that asks a moment after, and making the first wait out a cap that no longer exists
+would answer the two differently. `advise` answers granted under a pause for the same reason.
+
 **The status line says so while an override holds,** and that is the half of this story that
 makes the other half safe. A pinned budget is otherwise indistinguishable from one the control
 loop chose — the same number in the same place — so the line gains a clause:
