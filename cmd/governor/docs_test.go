@@ -113,6 +113,7 @@ func TestTheGuideShowsEveryLineTheStatusLineCanPrint(t *testing.T) {
 		render(statusView{OK: true, Paused: true}, 0),     // paused
 		" slots",
 		" yours)",
+		agentsClause(2, ""), // GOV-B32
 		" waiting",
 		"cpu ",
 		"boosted",

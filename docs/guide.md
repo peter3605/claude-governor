@@ -74,16 +74,21 @@ The parts, in order:
 
 | Part | Shown | Means |
 |---|---|---|
-| 3/5 slots | always | slots in use across **every** session on the machine, out of the current budget |
+| 3/5 slots | always | build slots in use across **every** session on the machine, out of the current budget. Always a whole number, rounded up |
 | (1 yours) | only when this session holds something | how many of those leases are this window's |
 | boosted | while a boost is in force | this session's share was raised by hand ([overrides](#overriding-it-limit-pause-resume-boost)) |
 | pinned | while a limit is in force | the budget is a number a person set, not one the control loop chose |
+| 2 agents | only when subagents are running | live subagents, counted beside the slot figure rather than inside it |
 | 2 waiting | only when something is queued | spawns or builds parked, waiting for a slot |
 | cpu 61% | once the daemon has taken a sample | host CPU, for context. The budget does **not** move on it ([§5.2](design.md#52-aimd)) |
 | thermal ok | when the platform reports a state | `ok`, `fair`, `serious` or `critical`. Absent on Linux, which has no equivalent ([§13.5](design.md#135-platforms)) |
 
-A slot is roughly one ordinary build. A subagent is a small fraction of one, so a machine
-running only agents reads `0.2/6 slots - cpu 12% - thermal ok`, not zero.
+A slot is roughly one ordinary build. Slot counts are always whole: a large build that
+weighs 3.75 slots reads as 4, because the figure rounds up. Only the display rounds — the
+governor still admits work on the exact weights ([§5.2](design.md#52-aimd)). A subagent is a
+small fraction of a slot (about 0.08), so it is not rounded into the figure at all; it is
+counted beside it, and a machine running only agents reads `0/6 slots - 3 agents - cpu 12% -
+thermal ok`.
 
 Some lines you may see:
 
@@ -181,7 +186,7 @@ machine can take it, raise the budget for a while with `limit`, or `pause` gatin
 ### A refused build
 
 ```
-Not enough free build slots (1/4 build slots held, this one needs 3.8, thermal: nominal). This command was not run. This is a large build and the slots left free are not enough for it. Wait a few seconds and run exactly the same command again; do not look for a different way to build, and do not treat this as a build failure.
+Not enough free build slots (1/4 build slots held, this one needs 4, thermal: nominal). This command was not run. This is a large build and the slots left free are not enough for it. Wait a few seconds and run exactly the same command again; do not look for a different way to build, and do not treat this as a build failure.
 ```
 
 **The command did not run.** It did not fail, and its output is not a compiler error. The

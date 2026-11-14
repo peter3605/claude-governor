@@ -138,6 +138,9 @@ func printStatus(stdout io.Writer, c cachedStatus) {
 	}
 	fmt.Fprintf(stdout, "budget %d\n", v.Budget)
 	fmt.Fprintf(stdout, "in use %d\n", v.InUse)
+	// Whole slots and a count of agents, the same figures the status line shows (GOV-B32).
+	fmt.Fprintf(stdout, "slots held %d\n", v.held())
+	fmt.Fprintf(stdout, "agents %d\n", v.Agents)
 	fmt.Fprintf(stdout, "waiting %d\n", v.Waiting)
 	// The manual overrides (section 9.1), printed only when one is in force. This is the
 	// command a person runs after the status line has told them something is odd, so it is the

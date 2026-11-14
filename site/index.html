@@ -716,6 +716,8 @@ footer .bay { display: flex; justify-content: space-between; gap: 20px; flex-wra
 <pre><span class="d">$</span> <span class="w">governor status</span></pre>
 <pre data-fig="status-example">budget <span class="a">6</span>
 in use <span class="a">3</span>
+slots held <span class="a">3</span>
+agents <span class="a">0</span>
 waiting <span class="a">0</span>
 cpu <span class="a">0.78</span>
 thermal <span class="g">nominal</span>
@@ -726,7 +728,7 @@ session 9b04a7e1-c6d5-4f80-a1b3-2e7f90d4c815 weight 1 tentative 0 confirmed 2</p
 <pre data-fig="statusline-example"><span class="g">3/6 slots</span> <span class="d">(1 yours)</span> - cpu <span class="a">78%</span> - thermal <span class="g">ok</span></pre>
 <pre>
 <span class="d">──── a refusal, in session ───────────────────────────</span></pre>
-<pre class="wrap" data-fig="refusal-example"><span class="m">Not enough free build slots</span> <span class="w">(3/6 build slots held, this one needs 3.8, CPU 78%, thermal: nominal).</span> This command was not run. <span class="w">This is a large build and the slots left free are not enough for it.</span> Wait a few seconds and run exactly the same command again; do not look for a different way to build, <span class="w">and do not treat this as a build failure.</span></pre>
+<pre class="wrap" data-fig="refusal-example"><span class="m">Not enough free build slots</span> <span class="w">(3/6 build slots held, this one needs 4, CPU 78%, thermal: nominal).</span> This command was not run. <span class="w">This is a large build and the slots left free are not enough for it.</span> Wait a few seconds and run exactly the same command again; do not look for a different way to build, <span class="w">and do not treat this as a build failure.</span></pre>
     </div>
     <p class="cap">Verbatim: each line is what the shipped binary prints for that state. A refusal names the number, the cause, and one concrete instruction — a vague one produces a retry loop that burns tokens. A refused build is told to wait and run the same command again, never to "do it inline": nothing else on the machine can compile that package, so inline advice it cannot act on would send it looking for a worse way to build. The gate prefers to <em>wait</em> rather than refuse wherever the wait fits inside the hook timeout, because a stall costs nothing and the model never has to reason about it.</p>
     <ul class="dash">

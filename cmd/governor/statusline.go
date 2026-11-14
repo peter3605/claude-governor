@@ -89,11 +89,15 @@ type statusRequest struct {
 // halves of a wire protocol that will at times be different binary versions (invariant 8),
 // and a shared struct hides the moment they diverge.
 type statusResponse struct {
-	V       int     `json:"v"`
-	Budget  int     `json:"budget"`
-	InUse   int     `json:"in_use"`
-	Slots   float64 `json:"slots"`
-	Waiting int     `json:"waiting"`
+	V      int     `json:"v"`
+	Budget int     `json:"budget"`
+	InUse  int     `json:"in_use"`
+	Slots  float64 `json:"slots"`
+	// BuildSlots and Agents are the display split (GOV-B32); see refuseReply.BuildSlots.
+	// Nil from a daemon older than that story.
+	BuildSlots *float64 `json:"build_slots,omitempty"`
+	Agents     int      `json:"agents,omitempty"`
+	Waiting    int      `json:"waiting"`
 	// CPU is a pointer because the daemon sends null when it has not measured, rather than
 	// a fabricated 0.0. Null means "not measured"; rendering it as "cpu 0%" would tell the
 	// reader the machine is idle, which is a claim and not a reading.
@@ -266,11 +270,15 @@ type statusView struct {
 	// InUse is the number of leases held; Slots is how much of the budget they weigh. Since
 	// GOV-15 those are different numbers — a subagent weighs about 0.08 slots and a Heavy
 	// build 3.75 — and only Slots is comparable with Budget.
-	InUse   int
-	Slots   float64
-	Waiting int
-	CPU     *float64
-	Thermal signals.Thermal
+	InUse int
+	Slots float64
+	// BuildSlots and Agents are the display split the slot figure is rendered from
+	// (GOV-B32): see heldSlots. A nil BuildSlots is a daemon older than that story.
+	BuildSlots *float64
+	Agents     int
+	Waiting    int
+	CPU        *float64
+	Thermal    signals.Thermal
 	// Mine is the slots held by the session this line is being rendered for, tentative and
 	// confirmed together. A tentative lease is a spawn in flight and counting it is right:
 	// it is a slot this session is currently consuming.
@@ -403,15 +411,17 @@ func view(c cachedStatus, session string) statusView {
 		return statusView{}
 	}
 	v := statusView{
-		OK:      true,
-		Budget:  c.Reply.Budget,
-		InUse:   c.Reply.InUse,
-		Slots:   c.Reply.Slots,
-		Waiting: c.Reply.Waiting,
-		CPU:     c.Reply.CPU,
-		Thermal: c.Reply.Thermal,
-		Pinned:  c.Reply.Pinned,
-		Paused:  c.Reply.Paused,
+		OK:         true,
+		Budget:     c.Reply.Budget,
+		InUse:      c.Reply.InUse,
+		Slots:      c.Reply.Slots,
+		BuildSlots: c.Reply.BuildSlots,
+		Agents:     c.Reply.Agents,
+		Waiting:    c.Reply.Waiting,
+		CPU:        c.Reply.CPU,
+		Thermal:    c.Reply.Thermal,
+		Pinned:     c.Reply.Pinned,
+		Paused:     c.Reply.Paused,
 	}
 	// Parsed rather than carried as a string so the renderer works in durations. An
 	// unparseable stamp leaves the zero time, and the clause that would have named it is
@@ -490,18 +500,50 @@ func render(v statusView, width int) string {
 	return line
 }
 
-// formatSlots renders held slots without a pointless decimal.
+// WHOLE SLOTS ON EVERY SURFACE (GOV-B32).
 //
-// Whole numbers print whole — "3/6 slots" — because that is the common case once builds are
-// what fill the budget, and a line that said "3.0/6" on every render would look like a
-// precision nobody asked for. A fraction prints to one place, so a machine holding only
-// agents reads "0.2/6 slots" and is visibly nearly empty rather than rounding to a
-// reassuring zero.
-func formatSlots(s float64) string {
-	if r := math.Round(s); math.Abs(s-r) < 0.05 {
-		return strconv.FormatFloat(r, 'f', 0, 64)
+// The owner saw "3.8/4 slots" — one Heavy build at 3.75 plus one subagent at 0.08 — and asked
+// for whole numbers, rounded up if anything. The decision, recorded in design.md section 5.2:
+// ONLY THE DISPLAY ROUNDS. Admission still compares the exact fractional weights, so nothing
+// about who is admitted changes; and a Heavy at 3.75 can still sit beside a few agents on a
+// four-slot machine, which rounding the weights themselves would have forbidden.
+//
+// Agents are not rounded at all. One spawn holds about 0.08 of a slot, so rounding it up to
+// one would have four agents read "4/4" on a machine that is 8% full. They are left out of
+// the figure and counted beside it: "4/4 slots - 2 agents".
+
+// wholeSlots rounds a held build weight UP to a whole number of slots. The tolerance absorbs
+// float noise in a sum, so three Medium builds read 3 and never 4.
+func wholeSlots(s float64) int {
+	if s <= 0 {
+		return 0
 	}
-	return strconv.FormatFloat(s, 'f', 1, 64)
+	return int(math.Ceil(s - 1e-6))
+}
+
+// heldSlots is the held figure shown beside the budget. build is the daemon's build-only sum;
+// nil means a daemon from before GOV-B32 that sent only the mixed total, which is rounded to
+// the NEAREST slot instead: rounding that total up would round its agents up with it.
+func heldSlots(slots float64, build *float64) int {
+	if build == nil {
+		return int(math.Round(slots))
+	}
+	return wholeSlots(*build)
+}
+
+// held is the whole-slot figure this view shows beside its budget.
+func (v statusView) held() int { return heldSlots(v.Slots, v.BuildSlots) }
+
+// agentsClause names the live agent leases, or nothing when there are none.
+func agentsClause(n int, sep string) string {
+	switch {
+	case n <= 0:
+		return ""
+	case n == 1:
+		return sep + "1 agent"
+	default:
+		return sep + strconv.Itoa(n) + " agents"
+	}
 }
 
 // clauses builds the parts of the line, most important first, optionally including the
@@ -513,7 +555,7 @@ func clauses(v statusView, mine bool) []string {
 	// beside the slot BUDGET would put two different units either side of the slash: four
 	// agents would read "4/6 slots" on a machine that is 5% full. Budget is a quantity of
 	// build capacity and this has to be the same quantity.
-	slots := fmt.Sprintf("%s/%d slots", formatSlots(v.Slots), v.Budget)
+	slots := fmt.Sprintf("%d/%d slots", v.held(), v.Budget)
 	if mine {
 		// Whose slots. The machine-wide figure alone does not answer the question a person
 		// in this session is actually asking, which is whether what fills the budget is
@@ -545,6 +587,12 @@ func clauses(v statusView, mine bool) []string {
 		// is the reason the number is what it is. On a narrow terminal the context should go
 		// first and the reason should stay.
 		out = append(out, "pinned"+leftClause(v.PinnedUntil))
+	}
+	if v.Agents > 0 {
+		// The live subagents, counted beside the slot figure rather than rounded into it
+		// (GOV-B32, see wholeSlots). After the overrides, which explain the figure; before
+		// the load signals, which are context for it.
+		out = append(out, agentsClause(v.Agents, ""))
 	}
 	if v.Waiting > 0 {
 		// Only when non-zero, and it is here because a full budget and a full budget with a

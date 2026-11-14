@@ -506,3 +506,26 @@ func TestAdoptSessionNeverOverwritesARegisteredSession(t *testing.T) {
 		}
 	}
 }
+
+// GOV-B32: Split separates what builds hold from how many agents are live, so a renderer can
+// round the first up to whole slots without rounding agents up with it. Display only: Slots,
+// which admission reads, stays the exact sum of both.
+func TestSplitSeparatesBuildsFromAgents(t *testing.T) {
+	tbl := NewTable(Options{})
+	tbl.StartSession(Session{ID: "s1", PID: 10})
+	tbl.Acquire(Request{Session: "s1", Kind: Agent, Weight: 0.08}, 8)
+	tbl.Acquire(Request{Session: "s1", Kind: Agent, Weight: 0.08}, 8)
+	tbl.Acquire(Request{Session: "s1", Kind: Build, Weight: 3.75, ToolUseID: "tu1"}, 8)
+
+	b, n := tbl.Split()
+	if b != 3.75 || n != 2 {
+		t.Fatalf("Split = %v, %d; want 3.75 held by builds and 2 agents", b, n)
+	}
+	s := tbl.Snapshot()
+	if s.BuildSlots != b || s.Agents != n {
+		t.Fatalf("Snapshot split %v, %d disagrees with Split %v, %d", s.BuildSlots, s.Agents, b, n)
+	}
+	if got, want := tbl.Slots(), 3.75+0.16; got < want-1e-9 || got > want+1e-9 {
+		t.Fatalf("Slots = %v, want the exact sum %v: admission must not see the rounding", got, want)
+	}
+}

@@ -93,7 +93,7 @@ func TestNoRefusalClaimsAFullMachineItIsNotOn(t *testing.T) {
 			name: "the 2026-09-21 incident, exactly",
 			// One confirmed lease of a whole slot, a four-slot budget, and a Heavy build.
 			slots: 1, budget: 4, asking: 4.5 / budget.SlotCores, cause: "capacity",
-			wantAll: []string{"Not enough free build slots", "1/4", "needs 3.8"},
+			wantAll: []string{"Not enough free build slots", "1/4", "needs 4"},
 		},
 		{
 			name:  "a genuinely full machine still says so",
@@ -259,7 +259,7 @@ func TestTheIncidentMessageInFull(t *testing.T) {
 		Asking: budget.SlotsFor(4.5), Thermal: "nominal", Cause: "capacity", Denials: 1,
 	}, intent{take: true, kind: "build"})
 
-	const want = "Not enough free build slots (1/4 build slots held, this one needs 3.8, " +
+	const want = "Not enough free build slots (1/4 build slots held, this one needs 4, " +
 		"thermal: nominal). This command was not run. This is a large build and the slots " +
 		"left free are not enough for it. Wait a few seconds and run exactly the same " +
 		"command again; do not look for a different way to build, and do not treat this as " +
