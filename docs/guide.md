@@ -195,6 +195,7 @@ told. The first words say which situation it is
 | `This session is at its fair share` | the machine has room, but it belongs to other sessions that are asking ([§6.1](design.md#61-fair-share)) |
 | `Not enough free build slots` | the machine has room, but less than this command needs |
 | `This session's own earlier build is holding the slots` | no other session holds any; this session's own earlier command is still running, often one started in the background |
+| `Earlier requests are queued for these slots` | the room exists, but requests that asked first are waiting for it and are served first ([§6.2](design.md#62-wait-queue)) |
 
 When the budget is below what this machine allows, the refusal also names the cause, for
 example `budget cut from 6 by run queue`.

@@ -653,6 +653,10 @@ func denyReason(resp acquireResponse, in intent) string {
 		head, why = "This session's own earlier build is holding the slots", refusedOwn
 	case resp.Cause == "share":
 		head, why = "This session is at its fair share", refusedShare
+	// GOV-B31: the room exists, and requests that asked first are waiting for it. Neither
+	// "full" nor "too big" is true, and the reader can see the count say so.
+	case resp.Cause == "queue":
+		head, why = "Earlier requests are queued for these slots", refusedQueued
 	case resp.Slots < float64(resp.Budget):
 		head, why = "Not enough free build slots", refusedTooBig
 	}
@@ -687,8 +691,8 @@ func denyReason(resp acquireResponse, in intent) string {
 	return b.String()
 }
 
-// The four situations a capacity refusal can actually be in: GOV-18 left two, GOV-34 added
-// the third and GOV-49 the fourth.
+// The five situations a capacity refusal can actually be in: GOV-18 left two, GOV-34 added
+// the third, GOV-49 the fourth and GOV-B31 the fifth.
 //
 // They are a type rather than a pair of bools because the three are mutually exclusive and the
 // instruction half has to pick exactly one sentence per denial count. Two bools would make the
@@ -712,6 +716,9 @@ const (
 	// session's own command still running, often one started with run_in_background. The
 	// other three sentences all point at someone else, so each of them is false here.
 	refusedOwn
+	// refusedQueued: the request fits, and requests that asked before it are waiting for the
+	// same room (GOV-B31). The strict FIFO of design.md section 6.2 serves them first.
+	refusedQueued
 )
 
 // ownsEverything reports whether the asking session holds every held slot. The tolerance is
@@ -745,8 +752,10 @@ func ownsEverything(resp acquireResponse) bool {
 // being printed for it: a session told "other builds are using every slot" against a visible
 // count of one in four learns that the gate's reasons are not worth reading.
 func buildEscalation(denials int, why refusalWhy) string {
-	pick := func(full, share, tooBig, own string) string {
+	pick := func(full, share, tooBig, own, queued string) string {
 		switch why {
+		case refusedQueued:
+			return queued
 		case refusedShare:
 			return share
 		case refusedTooBig:
@@ -773,6 +782,8 @@ func buildEscalation(denials int, why refusalWhy) string {
 			// using the CPU, and this session is asking for a second one beside it.
 			"No other session is holding build slots. They are held by an earlier command "+
 				"from this session that is still running, possibly in the background.",
+			"Requests that asked before this one are waiting for the same slots, and they "+
+				"are served first.",
 		) + " Wait a few seconds and run exactly the same command again; do not look for a " +
 			"different way to build, and do not treat this as a build failure."
 	case denials == 2:
@@ -782,6 +793,7 @@ func buildEscalation(denials int, why refusalWhy) string {
 			"The slots this build needs have not come free for a while.",
 			"This session's own earlier command is still holding them. If you started a "+
 				"build or test in the background, let it finish or stop it first.",
+			"Requests that asked earlier have kept being served ahead of it.",
 		) + " Wait longer before retrying the same command, and do not start any further " +
 			"builds or test runs in the meantime."
 	default:
@@ -801,6 +813,7 @@ func buildEscalation(denials int, why refusalWhy) string {
 			"Other sessions have been holding their share of the build slots.",
 			"Something on this machine has been holding the slots this build needs.",
 			"",
+			"Requests that asked earlier have kept being served ahead of this one.",
 		))
 	}
 }

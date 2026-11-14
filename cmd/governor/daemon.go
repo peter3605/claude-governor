@@ -194,7 +194,9 @@ type refuseReply struct {
 	// the only place that can see a session's refusals across all of them.
 	Denials int `json:"denials"`
 	// Cause distinguishes WHICH half of the admission rule refused (GOV-18): "capacity" when
-	// the machine itself is full, "share" when it had room that belongs to another session.
+	// the machine itself is full, "share" when it had room that belongs to another session,
+	// and "queue" when the request fits but the FIFO is serving earlier waiters first
+	// (GOV-B31). It is never empty: see refusalCause.
 	//
 	// The `reason` stays "capacity" deliberately. It is the closed set the gate honours
 	// (section 4.2), and a new reason value would be one an older gate cannot interpret —
@@ -1468,6 +1470,20 @@ func (d *daemon) acquire(req request) any {
 				return d.granted(l, limit, src)
 			case <-timer.C:
 				d.event("park-expired session=%s waited=%v", req.Session, time.Since(parked).Round(time.Millisecond))
+				// ONE LAST PUMP BEFORE GIVING UP (GOV-B31). Room does not only appear on a
+				// release: it also appears when a recently refused session's demand mark
+				// lapses and fair share stops binding, and nothing announces that — the
+				// reaper's 2 s pump finds it eventually. On 2026-11-08 a Heavy that fitted
+				// at the instant its park ended was refused for want of a pump that would
+				// have admitted it, and the retry five seconds later was granted. A waiter
+				// must not be refused beside room the queue would hand it.
+				d.pump()
+				// THE BUDGET IS READ AGAIN, NOT CARRIED FROM THE PARK. The limit captured
+				// twenty seconds ago is not the one the pump just compared against, and a
+				// deny line that prints one limit while admission used another is the
+				// fabrication design.md section 4.2 forbids.
+				limit, quotas, _ := d.budgetNow(req.Principal)
+				src := sourceName(quotas)
 				if l, got := d.waits.drop(w); got {
 					// Granted at the very moment the wait expired. The lease exists and
 					// this caller owns it, so honour it rather than refusing a spawn that
@@ -1556,7 +1572,7 @@ func (d *daemon) refuseForCapacity(req request, limit int, src string) refuseRep
 		Budget: limit, InUse: d.table.InUse(), Slots: d.table.Slots(), Source: src,
 		CPU: nil, Thermal: d.thermal(),
 		Denials: d.denials.record(req.Session),
-		Cause:   d.table.Refusal(leaseRequestFor(req), limit),
+		Cause:   refusalCause(d.table.Refusal(leaseRequestFor(req), limit)),
 		Asking:  lease.WeightOf(leaseRequestFor(req)),
 		Ceiling: ceiling, Cut: cut,
 		Own: d.table.Held(req.Session),
@@ -1566,6 +1582,26 @@ func (d *daemon) refuseForCapacity(req request, limit int, src string) refuseRep
 	// is the one a week of dogfooding is read for.
 	d.event("deny session=%s reason=capacity cause=%s slots=%.2f/%d denials=%d", req.Session, r.Cause, r.Slots, r.Budget, r.Denials)
 	return r
+}
+
+// causeQueued is the cause of a refusal for a request the lease table would admit right now.
+const causeQueued = "queue"
+
+// refusalCause turns Table.Refusal's answer into the cause a refusal carries. It is never
+// empty (GOV-B31).
+//
+// Refusal answers "" when the request WOULD BE ADMITTED, and a capacity refusal is still
+// issued in that state in one situation: the FIFO kept it back. A fresh acquire is not
+// offered to the table at all while anyone is waiting (GOV-18), and a waiter that is not at
+// the head is not reached by a pump that stops at the head. In both, the room exists and
+// belongs to someone who asked first, so that is what the cause says. Printing "" there
+// told the reader nothing, and on 2026-11-08 it was the only clue that the line beside it
+// was wrong.
+func refusalCause(fromTable string) string {
+	if fromTable == "" {
+		return causeQueued
+	}
+	return fromTable
 }
 
 // pump hands freed slots to the longest-waiting callers, in order.

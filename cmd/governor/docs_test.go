@@ -155,7 +155,7 @@ func TestTheGuideQuotesTheRefusalsTheGateActuallyWrites(t *testing.T) {
 		}
 	}
 	for _, head := range []string{"Machine at capacity", "This session is at its fair share", "Not enough free build slots",
-		"This session's own earlier build is holding the slots"} {
+		"This session's own earlier build is holding the slots", "Earlier requests are queued for these slots"} {
 		if !strings.Contains(guide, "`"+head+"`") {
 			t.Errorf("guide.md's table of refusal heads does not name %q", head)
 		}
