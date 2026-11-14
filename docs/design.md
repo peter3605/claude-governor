@@ -281,6 +281,7 @@ and the head sentence depends on what is actually true:
 |---|---|
 | held ≥ budget | `Machine at capacity` |
 | `cause: share` | `This session is at its fair share` |
+| `cause: queue` | `Earlier requests are queued for these slots` |
 | held < budget | `Not enough free build slots` |
 
 ```
@@ -289,6 +290,12 @@ This command was not run. This is a large build and the slots left free are not 
 it. Wait a few seconds and run exactly the same command again; do not look for a different
 way to build, and do not treat this as a build failure.
 ```
+
+`cause` is never empty (GOV-B31). `queue` is the request that fits but was kept back by
+§6.2's FIFO: a fresh acquire while anyone is waiting, or a parked one that expired behind a
+head that does not fit. A parked acquire is pumped once more when its wait expires, before it
+is refused, so a request is not refused beside room the queue would have handed it, and the
+deny line prints the budget read at that moment, not the one read when it parked.
 
 The instruction half is unchanged across all three heads — wait, then run the same command
 again — because the right response does not depend on which of them is true. Only the asserted
