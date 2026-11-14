@@ -154,6 +154,10 @@ type blockingReader struct{}
 
 func (blockingReader) Read([]byte) (int, error) { select {} }
 
+// budgetExpired is the fragment of the gate's diagnostic when its overall budget runs out
+// before anything else gives up.
+const budgetExpired = "expired, failing open"
+
 func TestGateFailsOpen(t *testing.T) {
 	tests := []struct {
 		name string
@@ -164,6 +168,13 @@ func TestGateFailsOpen(t *testing.T) {
 		// wantDiag is a fragment the stderr diagnostic must contain, so that each case is
 		// shown to fail for the reason it is named after rather than by luck.
 		wantDiag string
+		// racesBudget marks a case whose diagnostic comes from a per-operation deadline
+		// (the dial's, or the read's) that races the gate's overall budget. On a loaded
+		// runner either timer can fire first, and which one does is not part of the
+		// fail-open invariant, so such a case also accepts the budget-expiry wording
+		// (GOV-B37, the same resolution GOV-B19 gave lazystart_test.go). Every other case
+		// fails on a deadline that cannot race, or on none, and keeps its one diagnostic.
+		racesBudget bool
 	}{
 		{
 			name: "no socket at all",
@@ -196,7 +207,8 @@ func TestGateFailsOpen(t *testing.T) {
 			endpoint: func(t *testing.T) string {
 				return listenerFunc(t, func(c net.Conn, _ []byte) { select {} })
 			},
-			wantDiag: "read response",
+			wantDiag:    "read response",
+			racesBudget: true,
 		},
 		{
 			name: "replies with garbage",
@@ -215,7 +227,8 @@ func TestGateFailsOpen(t *testing.T) {
 					select {}
 				})
 			},
-			wantDiag: "read response",
+			wantDiag:    "read response",
+			racesBudget: true,
 		},
 		{
 			name: "accepts then closes without replying",
@@ -240,8 +253,11 @@ func TestGateFailsOpen(t *testing.T) {
 			},
 			dialer: blockedDialer{},
 			// The dial is what gives up here, on the context deadline gate passes it — not
-			// the backstop. The backstop's own case is the blocked stdin below.
-			wantDiag: "dial",
+			// the backstop. The backstop's own case is the blocked stdin below. That
+			// deadline and the backstop still race, and on a loaded runner the backstop
+			// can win (PR #96), which is equally a fail-open.
+			wantDiag:    "dial",
+			racesBudget: true,
 		},
 		{
 			name: "endpoint is a scheme v1 does not speak",
@@ -293,7 +309,14 @@ func TestGateFailsOpen(t *testing.T) {
 					d = tt.dialer
 				}
 				diag := runGateFor(t, tt.endpoint(t), payload, d)
-				if !strings.Contains(diag, tt.wantDiag) {
+				switch {
+				case strings.Contains(diag, tt.wantDiag):
+				case tt.racesBudget && strings.Contains(diag, budgetExpired):
+					// The budget beat the case's own deadline. runGateFor has already
+					// held this run to exit 0, empty stdout and the time ceiling.
+				case tt.racesBudget:
+					t.Errorf("stderr = %q, want it to mention %q or %q", diag, tt.wantDiag, budgetExpired)
+				default:
 					t.Errorf("stderr = %q, want it to mention %q", diag, tt.wantDiag)
 				}
 			})
