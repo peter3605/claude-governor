@@ -191,6 +191,22 @@ func TestSampleReportsPlausibleHostSignals(t *testing.T) {
 // generous against the ~15 ms measured on this machine, because CI runners are slower and a
 // flaky performance test gets deleted rather than fixed — but a regression that makes the
 // tick cost a tenth of its own interval will trip it.
+//
+// CPU TIME, NOT WALL CLOCK (GOV-B38). Sample.CostMS is elapsed time around the whole Sample,
+// so asserting on it asserts the runner's spare capacity: a saturated -race runner took a
+// cheapest-of-five 129 ms with no change to the code. What this test bounds is what the
+// sampler itself consumes, which is getrusage's user plus system time across the call — the
+// same quantity TestMeasureSamplerCost reports. Descheduling costs no CPU and no longer
+// counts. Real extra work still does: a busier process table makes the tree walk read more
+// of /proc, and that is cost the daemon genuinely pays. GOV-B04 made the same move in
+// TestSamplerCountsDescendantCPU, for the same reason.
+//
+// A regression that blocks rather than burns (a sleep, a slow syscall) is not caught here;
+// that is the wall-clock figure, which GOVERNOR_MEASURE=1 reports on request.
+//
+// The tests in this package do not run in parallel, so the process's CPU across the call
+// is the sampler's, plus whatever the Go runtime (GC, the race detector) spends alongside
+// it. Taking the cheapest of five keeps one GC cycle from tripping it.
 func TestSamplerStaysCheap(t *testing.T) {
 	if testing.Short() {
 		t.Skip("timing sensitive")
@@ -207,18 +223,22 @@ func TestSamplerStaysCheap(t *testing.T) {
 	}
 
 	const budgetMS = 100.0
-	best := math.MaxFloat64
+	best, bestWall := math.MaxFloat64, 0.0
 	for i := 0; i < 5; i++ {
+		before := processCPU(t)
 		got, err := s.Sample(ctx)
+		cpuMS := float64((processCPU(t) - before).Microseconds()) / 1000
 		if err != nil {
 			t.Fatalf("sample: %v", err)
 		}
-		best = math.Min(best, got.CostMS)
+		if cpuMS < best {
+			best, bestWall = cpuMS, got.CostMS
+		}
 	}
 	if best > budgetMS {
-		t.Errorf("cheapest of 5 warm samples cost %.1f ms, over the %.0f ms budget for a 1 Hz tick", best, budgetMS)
+		t.Errorf("cheapest of 5 warm samples used %.1f ms of CPU, over the %.0f ms budget for a 1 Hz tick", best, budgetMS)
 	}
-	t.Logf("cheapest warm sample: %.1f ms", best)
+	t.Logf("cheapest warm sample: %.1f ms CPU (%.1f ms wall)", best, bestWall)
 }
 
 // TestRootCacheIsTrimmed proves the cache tracks the process table rather than growing

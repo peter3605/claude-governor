@@ -112,6 +112,13 @@ and that widening hid the bug the test exists to catch.
   `TestTheEffectiveBudgetIsTheMinimumOfLocalAndRemote` is load-sensitive in the same way.
   Both have failed only while a Docker build was running on the same machine at the same
   time, and passed when re-run on their own.
+- **The sampler's cost** (`TestSamplerStaysCheap` in `internal/signals/sampler_test.go`).
+  It asserts that the cheapest of five warm samples uses at most 100 ms of CPU time (user
+  plus system, from getrusage), not 100 ms of wall clock. A saturated runner that
+  deschedules the sampler no longer fails it; a sampler that burns more CPU, including a
+  tree walk that reads more of a busier process table, still does. A regression that only
+  blocks without burning CPU is outside it: that wall-clock figure is the opt-in measurement
+  below. Do not raise the 100 ms.
 - **Measurements are opt-in, not asserted.** Wall-clock performance figures are measured with
   `GOVERNOR_MEASURE=1 go test ./cmd/governor/ -run TestMeasure -v` (and the same in
   `internal/signals`), recorded in design.md, and never checked on every push. A latency

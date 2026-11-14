@@ -16,9 +16,9 @@ import (
 // existed because a test asserting a wall-clock figure was measuring the CI runner's spare
 // capacity rather than the code; GOV-B08 and GOV-B10 were both repairs to timing guards that
 // went on flaking afterwards. A per-tick CPU ceiling checked on every push is that test a
-// fourth time. What CI enforces instead is TestSamplerStaysCheap's coarse 100 ms wall-clock
-// budget, which catches a sampler that has become catastrophically slow without pretending
-// to measure a percentage on a shared runner.
+// fourth time. What CI enforces instead is TestSamplerStaysCheap's coarse 100 ms budget of
+// CPU per tick (GOV-B38: CPU, not wall clock), which catches a sampler that has become
+// catastrophically expensive without pretending to measure a percentage on a shared runner.
 //
 //	GOVERNOR_MEASURE=1 go test ./internal/signals/ -run TestMeasureSampler -v
 const measureEnv = "GOVERNOR_MEASURE"
