@@ -224,6 +224,11 @@ var toolchain = map[string]Class{
 	// `terraform output`, `xcrun simctl list`. Blanket-gating them cost 1.5%, 0.7% and 1.5% of
 	// ALL Bash calls on this corpus for almost no captured cost. They gate through heavySub
 	// and dispatcher below, on the subcommands that actually build something.
+
+	// A compose subcommand in neither heavySub nor light — `scale`, or one a later compose
+	// adds. Medium rather than ungated, because a new verb that starts containers is more
+	// likely than one that does nothing; rather than Heavy, because Heavy was GOV-B30.
+	composeBin: Medium,
 }
 
 // heavySub covers binaries that are free in their common form and expensive in one particular
@@ -241,7 +246,6 @@ var heavySub = map[pair]Class{
 	{"pip", "install"}:     Medium,
 	{"pip3", "install"}:    Medium,
 	{"docker", "build"}:    Heavy,
-	{"docker", "compose"}:  Heavy,
 	{"docker", "run"}:      Medium,
 	{"docker", "pull"}:     Medium,
 	{"docker", "push"}:     Medium,
@@ -252,6 +256,42 @@ var heavySub = map[pair]Class{
 	{"uv", "sync"}:         Medium,
 	{"uv", "lock"}:         Medium,
 	{"poetry", "install"}:  Medium,
+
+	// docker compose, by its OWN subcommand (GOV-B30). Until then the whole of `docker
+	// compose` was one Heavy row, so `docker compose exec db psql -c 'select 1'` weighed 3.75
+	// slots on a four-slot machine; compose was 39 of 78 Heavy gated calls over 11-03..11-09.
+	//
+	// MEASURED, on this host (Docker Desktop, 8 cores, 2026-11-14), by sampling the CPU of
+	// Docker Desktop's VM and com.docker.* processes around each command, idle baseline
+	// subtracted, three runs each. NOT by tools/childcpu: on macOS a container's CPU is spent
+	// in the VM, never in the `docker` client's process tree, and the client tree read
+	// 0.00-0.06 cores on EVERY command below, the 20-second build included. A child-tree
+	// measurement would call all of compose free. Linux has no VM, so there the client tree
+	// is still not the container (dockerd is not its child) but the host sampler sees it.
+	//
+	//	build --no-cache (go build -a std)  19-21 s  mean 3.1 cores  peak 6.4-6.7   Heavy
+	//	build (cached)                       1.6 s  mean 1.4        peak 2.3
+	//	up -d --wait (creates a container)   3.1-3.5 s  mean 0.6-1.0  peak 3.1-3.2   Medium
+	//	run --rm <svc> psql --version        0.9-1.4 s  mean 2.2-2.6  peak 3.5-4.8   Medium
+	//	start / stop                         0.6 s  mean 0.9-1.7     peak 1.1-2.1   ungated
+	//	down                                 0.9-1.0 s  mean 1.3-1.6  peak 2.2-3.1   ungated
+	//	exec <svc> psql -c '...'             0.6 s  mean 0.1-0.2     peak 0.2-0.7   ungated
+	//	ps / logs / config                   0.6 s  mean <0.25       peak <0.75     ungated
+	//
+	// The line between gated and not is NOT the peak, which a 0.25 s sample inflates for a
+	// sub-second burst; it is whether the command can do unbounded work. start/stop/down are
+	// bounded lifecycle bursts of about one core-second that finish before a 1 Hz controller
+	// could see them, so a lease buys nothing. up, run and create are gated because they can
+	// pull a missing image and BUILD a missing `build:` service with no --build flag, and
+	// `run` executes whatever its command is: the measured floor above is with the image
+	// cached and a trivial command. --build on any of them adds a `build` invocation, Heavy.
+	{"docker compose", "build"}:  Heavy,
+	{"docker compose", "watch"}:  Heavy, // builds, then rebuilds on every change
+	{"docker compose", "up"}:     Medium,
+	{"docker compose", "run"}:    Medium,
+	{"docker compose", "create"}: Medium,
+	{"docker compose", "pull"}:   Medium, // as {"docker", "pull"}
+	{"docker compose", "push"}:   Medium, // as {"docker", "push"}
 }
 
 // light is the exception list: subcommands of a gated binary that ask the tool about itself
@@ -268,6 +308,18 @@ var light = map[pair]bool{
 	{"docker", "ps"}: true, {"docker", "images"}: true, {"docker", "version"}: true,
 	{"cargo", "version"}: true, {"xcrun", "--find"}: true,
 	{"uv", "version"}: true, {"uv", "python"}: true,
+
+	// docker compose's control plane, measured in the heavySub note above. `exec` is absent
+	// on purpose: it is classified by the command it executes, like a runner, so `exec db
+	// psql` is free and `exec app pytest` is pytest. `restart` is stop then start.
+	{composeBin, ""}: true, {composeBin, "ps"}: true, {composeBin, "logs"}: true,
+	{composeBin, "down"}: true, {composeBin, "stop"}: true, {composeBin, "start"}: true,
+	{composeBin, "restart"}: true, {composeBin, "config"}: true, {composeBin, "ls"}: true,
+	{composeBin, "top"}: true, {composeBin, "port"}: true, {composeBin, "images"}: true,
+	{composeBin, "kill"}: true, {composeBin, "rm"}: true, {composeBin, "pause"}: true,
+	{composeBin, "unpause"}: true, {composeBin, "version"}: true, {composeBin, "events"}: true,
+	{composeBin, "cp"}: true, {composeBin, "wait"}: true, {composeBin, "attach"}: true,
+	{composeBin, "stats"}: true,
 }
 
 // runner is a command that executes another command. The cost belongs to what it runs, not to
@@ -320,50 +372,151 @@ type invocation struct{ bin, sub string }
 func invocations(cmd string) []invocation {
 	var out []invocation
 	forEachSegment(cmd, func(seg string) {
-		ws := fields(seg)
-		i := 0
-		// Skip env assignments and command prefixes: `LC_ALL=C time go test ...`.
-		for i < len(ws) && (isAssign(ws[i]) || prefixWord[ws[i]]) {
-			i++
-		}
-		if i >= len(ws) {
-			return
-		}
-		bin := base(ws[i])
-		if bin == "" || keyword[bin] || isRedir(bin) || strings.HasPrefix(bin, "-") || strings.HasPrefix(bin, "$") {
-			return
-		}
-		rest := ws[i+1:]
-		sub := firstOperand(rest)
-
-		// `python -m pytest` is pytest.
-		if isPython(bin) && sub != "" && pyModule[sub] && hasFlag(rest, "-m") {
-			out = append(out, invocation{sub, ""})
-			return
-		}
-		// `xcrun swiftc x.swift` is swiftc.
-		if dispatcher[bin] && sub != "" {
-			out = append(out, invocation{base(sub), firstOperandAfter(rest, sub)})
-			return
-		}
-		// `uv run pytest -q` is pytest. Only for the run/exec form: `uv sync` is uv's own work.
-		if runner[bin] && runSub(sub) {
-			if w := firstOperandAfter(rest, sub); w != "" {
-				inner := base(w)
-				if isPython(inner) {
-					// `uv run python -m pytest` — look one level deeper.
-					if m := firstOperandAfter(rest, w); m != "" && pyModule[base(m)] {
-						out = append(out, invocation{base(m), ""})
-						return
-					}
-				}
-				out = append(out, invocation{inner, firstOperandAfter(rest, w)})
-				return
-			}
-		}
-		out = append(out, invocation{bin, sub})
+		out = appendCommand(out, fields(seg))
 	})
 	return out
+}
+
+// appendCommand appends the invocations of one simple command, given as its words.
+//
+// It is split out of invocations so that a command which executes ANOTHER command inside a
+// container — `docker compose exec app pytest` — can classify the inner one by the same rules.
+// The inner word list is strictly shorter than the outer, so the recursion terminates.
+func appendCommand(out []invocation, ws []string) []invocation {
+	i := 0
+	// Skip env assignments and command prefixes: `LC_ALL=C time go test ...`.
+	for i < len(ws) && (isAssign(ws[i]) || prefixWord[ws[i]]) {
+		i++
+	}
+	if i >= len(ws) {
+		return out
+	}
+	bin := base(ws[i])
+	if bin == "" || keyword[bin] || isRedir(bin) || strings.HasPrefix(bin, "-") || strings.HasPrefix(bin, "$") {
+		return out
+	}
+	rest := ws[i+1:]
+
+	// `docker compose …` and the standalone `docker-compose …` are classified by compose's
+	// own subcommand, which is past compose's global flags (GOV-B30). docker's global flags
+	// are skipped first for the same reason: `docker --context prod compose ps`.
+	if bin == "docker-compose" {
+		return appendCompose(out, rest)
+	}
+	if bin == "docker" {
+		if j := skipFlags(rest, dockerGlobalValued); j < len(rest) && rest[j] == "compose" {
+			return appendCompose(out, rest[j+1:])
+		}
+	}
+
+	sub := firstOperand(rest)
+
+	// `python -m pytest` is pytest.
+	if isPython(bin) && sub != "" && pyModule[sub] && hasFlag(rest, "-m") {
+		return append(out, invocation{sub, ""})
+	}
+	// `xcrun swiftc x.swift` is swiftc.
+	if dispatcher[bin] && sub != "" {
+		return append(out, invocation{base(sub), firstOperandAfter(rest, sub)})
+	}
+	// `uv run pytest -q` is pytest. Only for the run/exec form: `uv sync` is uv's own work.
+	if runner[bin] && runSub(sub) {
+		if w := firstOperandAfter(rest, sub); w != "" {
+			inner := base(w)
+			if isPython(inner) {
+				// `uv run python -m pytest` — look one level deeper.
+				if m := firstOperandAfter(rest, w); m != "" && pyModule[base(m)] {
+					return append(out, invocation{base(m), ""})
+				}
+			}
+			return append(out, invocation{inner, firstOperandAfter(rest, w)})
+		}
+	}
+	return append(out, invocation{bin, sub})
+}
+
+// composeBin is the pseudo-binary every compose invocation is recorded under, whichever of
+// `docker compose` or `docker-compose` was typed. It is two tokens on purpose: the trace
+// shape is "bin sub", so this renders as `docker compose up`, never as a bare `docker`.
+const composeBin = "docker compose"
+
+// appendCompose classifies the words after `docker compose` / `docker-compose`.
+//
+// `exec` and `run` carry a command to run inside a container, and the cost of that command
+// is the cost that matters — the same rule as runner. `exec` adds nothing of its own (it was
+// measured at 0.1-0.2 cores); `run` creates and removes a container, measured at about two
+// core-seconds with a trivial command, so it is gated itself AND by what it runs.
+func appendCompose(out []invocation, ws []string) []invocation {
+	i := skipFlags(ws, composeGlobalValued)
+	if i >= len(ws) {
+		return append(out, invocation{composeBin, ""})
+	}
+	sub, rest := ws[i], ws[i+1:]
+	if sub == "exec" || sub == "run" {
+		svc := skipFlags(rest, composeCmdValued)
+		if sub == "run" {
+			out = append(out, invocation{composeBin, "run"})
+			if hasFlag(rest[:svc], "--build") {
+				out = append(out, invocation{composeBin, "build"})
+			}
+		}
+		if svc+1 < len(rest) {
+			out = appendCommand(out, rest[svc+1:])
+		}
+		return out
+	}
+	// `up --build` builds and then starts: two invocations, so the class is the build's and
+	// the trace says both happened.
+	if sub != "build" && hasFlag(rest, "--build") {
+		out = append(out, invocation{composeBin, "build"})
+	}
+	return append(out, invocation{composeBin, sub})
+}
+
+// skipFlags returns the index of the first operand in ws, treating each flag named in valued
+// as consuming the word after it. `--file=x.yml` is one word and needs no entry.
+//
+// This is the difference between reading `docker compose -f x.yml exec` as exec and reading
+// it as `x.yml`; firstOperand alone cannot tell a flag's value from a subcommand.
+func skipFlags(ws []string, valued map[string]bool) int {
+	for i := 0; i < len(ws); i++ {
+		w := ws[i]
+		if w == "" || isRedir(w) {
+			continue
+		}
+		if strings.HasPrefix(w, "-") {
+			if valued[w] {
+				i++
+			}
+			continue
+		}
+		return i
+	}
+	return len(ws)
+}
+
+// dockerGlobalValued are docker's global flags that take a separate value.
+var dockerGlobalValued = map[string]bool{
+	"-c": true, "--context": true, "-H": true, "--host": true, "--config": true,
+	"-l": true, "--log-level": true, "--tlscacert": true, "--tlscert": true, "--tlskey": true,
+}
+
+// composeGlobalValued are compose's global flags that take a separate value, from
+// `docker compose --help`.
+var composeGlobalValued = map[string]bool{
+	"-f": true, "--file": true, "-p": true, "--project-name": true, "--profile": true,
+	"--env-file": true, "--project-directory": true, "--ansi": true, "--progress": true,
+	"--parallel": true,
+}
+
+// composeCmdValued are the value-taking flags of `exec` and `run` together, which stand
+// between the subcommand and the service. One set serves both: no flag of one takes a value
+// where the same flag of the other does not.
+var composeCmdValued = map[string]bool{
+	"-e": true, "--env": true, "--env-from-file": true, "-u": true, "--user": true,
+	"-w": true, "--workdir": true, "--index": true, "--entrypoint": true, "-l": true,
+	"--label": true, "--name": true, "-p": true, "--publish": true, "-v": true,
+	"--volume": true, "--cap-add": true, "--cap-drop": true, "--pull": true,
 }
 
 // prefixWord introduces a command without being one.

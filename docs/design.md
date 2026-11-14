@@ -1423,9 +1423,10 @@ out all three and identifies a fourth:
   ```
 
 - *The actual cause: the request's own weight, which the refusal never named.* `docker compose`
-  classifies `Heavy`; `Heavy.ExpectedPeakCores()` is 4.5; `budget.SlotsFor(4.5)` is 3.75 slots.
-  The admission rule is `t.weight + weight > limit`, so `1.00 + 3.75 = 4.75 > 4` refused —
-  correctly, by its own arithmetic. **On a four-slot ceiling a Heavy build cannot be admitted
+  classified `Heavy` then (GOV-B30 has since classed compose by subcommand);
+  `Heavy.ExpectedPeakCores()` is 4.5; `budget.SlotsFor(4.5)` is 3.75 slots. The admission
+  rule is `t.weight + weight > limit`, so `1.00 + 3.75 = 4.75 > 4` refused — correctly,
+  by its own arithmetic. **On a four-slot ceiling a Heavy build cannot be admitted
   beside any other lease at all, however small**, and the work-conserving escape only fired on a
   completely *empty* table. The other session held its one slot for ten minutes, so the blocked
   session was not waiting for a queue, it was waiting for a condition that `maxParkedWait` could
