@@ -1393,6 +1393,12 @@ func leaseRequestFor(req request) lease.Request {
 	return r
 }
 
+// nestedSpawn reports whether the depth rule (design.md section 6.3) refuses this request:
+// a spawn from deeper than maxFanOutDepth. Builds are never subject to it (GOV-B35).
+func nestedSpawn(req request) bool {
+	return req.Depth > maxFanOutDepth && req.Kind != "build"
+}
+
 // acquire takes a tentative lease if the budget has room, and decides what to do when it
 // does not: refuse the caller outright, refuse it for capacity, or park it.
 func (d *daemon) acquire(req request) any {
@@ -1407,7 +1413,13 @@ func (d *daemon) acquire(req request) any {
 	// The depth limit comes first, and deliberately never waits. A nested spawn is not
 	// short of a slot, it is not allowed one, and parking it for twenty seconds before
 	// saying so would stall a session to reach an answer that was already known.
-	if req.Depth > maxFanOutDepth {
+	//
+	// SPAWNS ONLY (GOV-B35). A build holds its lease and finishes, so it cannot cause the
+	// nested deadlock this rule prevents, and a subagent's build is rationed by capacity
+	// like any other. Keyed here on kind, not only in the gate, because an older gate still
+	// sends depth 1 with a subagent's build. A kindless request is an older gate's agent
+	// (see leaseRequestFor), so it stays subject to the rule.
+	if nestedSpawn(req) {
 		d.event("deny session=%s reason=depth", req.Session)
 		r := refuseReply{
 			V: d.speaks, Reason: "depth",
@@ -1558,7 +1570,7 @@ func (d *daemon) advise(req request) adviseReply {
 	reply := adviseReply{V: d.speaks, Budget: limit, InUse: d.table.InUse(), Slots: d.table.Slots()}
 	reply.BuildSlots, reply.Agents = d.split()
 
-	if req.Depth > maxFanOutDepth {
+	if nestedSpawn(req) {
 		reply.Reason = "depth"
 		return reply
 	}

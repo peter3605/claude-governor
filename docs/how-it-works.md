@@ -79,7 +79,7 @@ JSON, one request per connection, and every message carries a version
 | room in this session's share | exits 0 with empty stdout, and the call proceeds |
 | no room, but likely soon | the daemon says it is parking the request, the gate waits, then the call proceeds |
 | still no room at the deadline | denies, with a reason naming the numbers, the cause and one instruction |
-| the caller is itself a subagent | denies at once, because nested fan-out is not allowed ([§6.3](design.md#63-depth)) |
+| the caller is itself a subagent and is spawning | denies at once, because nested fan-out is not allowed ([§6.3](design.md#63-depth)); a subagent's build is rationed by capacity like any other |
 
 The grant path is **silent**. The gate never answers `allow`, because that would suppress the
 user's own permission prompts ([§3](design.md#3-invariants), invariant 3). A refusal must not

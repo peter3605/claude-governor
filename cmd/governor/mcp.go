@@ -102,7 +102,12 @@ Returns granted=true (run it now), or granted=false with wait_hint_ms (do not ru
 // the one invariant 8 settles for the gate and it is no different here: during an upgrade
 // there will be a daemon of one version and clients of another, and an ungoverned build is
 // acceptable where a wrong refusal is not.
-var advisoryRefusalsHonoured = map[string]bool{"capacity": true, "depth": true}
+//
+// "depth" is deliberately absent (GOV-B35). This tool only ever asks about builds, and the
+// depth rule (design.md section 6.3) covers spawns only: a subagent's build is rationed by
+// capacity like any other. A depth answer to a build is therefore a daemon getting the rule
+// wrong, and it is read the way any unrecognised answer is: not governing this command.
+var advisoryRefusalsHonoured = map[string]bool{"capacity": true}
 
 // requestBuildArgs is the tool's input. `command` is the whole point; `why` is accepted
 // because design.md section 8 specifies it and because a one-line reason is what makes the
@@ -357,10 +362,6 @@ func adviseOn(args requestBuildArgs, diag io.Writer, dialer transport.Dialer, bu
 		fmt.Fprintf(diag, "governor mcp: daemon refused for reason %q, which this binary does "+
 			"not recognise: not governing this command\n", resp.Reason)
 		return advice{Granted: true, Reason: "governor unavailable: not governing this command"}
-	}
-	if resp.Reason == "depth" {
-		return advice{Granted: false, Reason: "nested subagent spawns do not get build slots; " +
-			"run this in the main session"}
 	}
 	return advice{
 		Granted:    false,
