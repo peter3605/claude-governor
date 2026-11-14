@@ -41,6 +41,46 @@ func writeEntry(t *testing.T, dir string, pid int, e map[string]any) {
 	}
 }
 
+// distractorPIDs returns one registry file name (as a PID) per entry of want, each different
+// from this test process's own PID and from every other value returned.
+//
+// The real session's file is <self>.json. A distractor written under a hardcoded name would
+// silently OVERWRITE it whenever the test binary happened to be given that PID, and the test
+// would then fail with "none of them readable" for a reason that has nothing to do with
+// LiveSessions. A busy CI runner cycles through the PID range fast enough for that to happen.
+// So the preferred names stay readable in the test, but a clash with self (or with an earlier
+// distractor) steps to the next free number. Only the file NAME is steered: the "pid" inside a
+// distractor is whatever the case needs, including self.
+func distractorPIDs(t *testing.T, want ...int) []int {
+	t.Helper()
+	self := os.Getpid()
+	used := map[int]bool{self: true}
+	out := make([]int, len(want))
+	for i, pid := range want {
+		for used[pid] {
+			pid++
+		}
+		used[pid] = true
+		out[i] = pid
+	}
+	return out
+}
+
+func TestDistractorPIDsNeverNameTheTestsOwnFile(t *testing.T) {
+	self := os.Getpid()
+	got := distractorPIDs(t, self, self, self+1, 4242)
+	seen := map[int]bool{}
+	for _, pid := range got {
+		if pid == self {
+			t.Fatalf("distractorPIDs(%d, ...) = %v: returned the test's own PID", self, got)
+		}
+		if seen[pid] {
+			t.Fatalf("distractorPIDs = %v: returned %d twice", got, pid)
+		}
+		seen[pid] = true
+	}
+}
+
 func TestLiveSessionsReadsTheHarnessRegistry(t *testing.T) {
 	dir := t.TempDir()
 	self := os.Getpid()
@@ -110,6 +150,8 @@ func TestLiveSessionsSkipsWhatIsNotALiveSession(t *testing.T) {
 	dir := t.TempDir()
 	self := os.Getpid()
 	now := time.Now()
+	names := distractorPIDs(t, 4242, 4243, 9999)
+	recycled, noID, badJSON := names[0], names[1], names[2]
 
 	// The one real session, which must survive every distractor below.
 	writeEntry(t, dir, self, map[string]any{
@@ -125,28 +167,31 @@ func TestLiveSessionsSkipsWhatIsNotALiveSession(t *testing.T) {
 
 	// Our own PID, but recorded as having started at a different time: a stale file whose
 	// PID the kernel has since handed to something else.
-	writeEntry(t, dir, 4242, map[string]any{
+	writeEntry(t, dir, recycled, map[string]any{
 		"pid": self, "sessionId": "recycled", "startedAt": now.UnixMilli(),
 		"procStart": now.UTC().Add(-72 * time.Hour).Format(procStartLayout),
 	})
 
 	// An entry with no session id is not a session anyone can act on.
-	writeEntry(t, dir, 4243, map[string]any{"pid": self, "procStart": selfProcStart(t)})
+	writeEntry(t, dir, noID, map[string]any{"pid": self, "procStart": selfProcStart(t)})
 
 	// Files this must not read: the sibling auth token, and unparseable JSON.
 	if err := os.WriteFile(filepath.Join(dir, "5364.abc123.key"), []byte("secret"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(dir, "9999.json"), []byte("{not json"), 0o600); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, strconv.Itoa(badJSON)+".json"), []byte("{not json"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 
+	// The PID is in the message so a failure here can be told apart from a name clash after
+	// the fact: if it ever recurs with self outside the distractor names, look at the
+	// start-time tolerance instead.
 	live, err := LiveSessions(dir)
 	if err != nil {
-		t.Fatalf("LiveSessions: %v", err)
+		t.Fatalf("LiveSessions (test pid %d, distractors %v): %v", self, names, err)
 	}
 	if len(live) != 1 {
-		t.Fatalf("got %d sessions, want 1: %+v", len(live), live)
+		t.Fatalf("got %d sessions, want 1 (test pid %d, distractors %v): %+v", len(live), self, names, live)
 	}
 	if live[0].ID != "real" {
 		t.Errorf("ID = %q, want %q", live[0].ID, "real")
@@ -302,7 +347,7 @@ func TestLiveSessionsWillNotCallAnUnreadableRegistryEmpty(t *testing.T) {
 			"pid": os.Getpid(), "sessionId": "real", "startedAt": time.Now().UnixMilli(),
 			"procStart": selfProcStart(t),
 		})
-		writeEntry(t, dir, 999, map[string]any{"nothing": "useful"})
+		writeEntry(t, dir, distractorPIDs(t, 999)[0], map[string]any{"nothing": "useful"})
 		live, err := LiveSessions(dir)
 		if err != nil {
 			t.Fatalf("LiveSessions: %v", err)
@@ -318,7 +363,7 @@ func TestLiveSessionsWillNotCallAnUnreadableRegistryEmpty(t *testing.T) {
 // the budget for the whole machine with it.
 func TestLiveSessionsWillNotReadWhatIsNotARegularFile(t *testing.T) {
 	dir := t.TempDir()
-	if err := os.Symlink(os.DevNull, filepath.Join(dir, "700.json")); err != nil {
+	if err := os.Symlink(os.DevNull, filepath.Join(dir, strconv.Itoa(distractorPIDs(t, 700)[0])+".json")); err != nil {
 		t.Skipf("cannot symlink here: %v", err)
 	}
 	writeEntry(t, dir, os.Getpid(), map[string]any{
