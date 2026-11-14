@@ -65,7 +65,7 @@ var commands = []command{
 	{"plugin-path", "print the installed plugin tree, for the marketplace entry", runPluginPath},
 	{"doctor", "diagnose a broken install and name each fix", runDoctor},
 	{"calibrate", "measure this host and write its defaults", runCalibrate},
-	{"version", "print binary, protocol and config schema versions", runVersion},
+	{"version", "print binary, protocol and config schema versions (also --version)", runVersion},
 }
 
 func main() {
@@ -76,6 +76,11 @@ func run(args []string, stdout, stderr io.Writer) int {
 	if len(args) == 0 || args[0] == "help" || args[0] == "-h" || args[0] == "--help" {
 		usage(stdout)
 		return 0
+	}
+	// --version is the spelling a stranger tries first (GOV-B28). It is an alias, not a
+	// table row, so the usage list names the command once.
+	if args[0] == "--version" {
+		args = append([]string{"version"}, args[1:]...)
 	}
 	for _, c := range commands {
 		if c.name == args[0] {

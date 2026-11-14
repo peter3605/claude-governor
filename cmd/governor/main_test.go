@@ -145,6 +145,31 @@ func TestVersionReportsAllThreeVersions(t *testing.T) {
 	}
 }
 
+// A stranger's first command is `governor --version` (GOV-B28). It runs the shipped binary,
+// not the dispatch table, because what has to hold is what a person sees at a shell: the
+// same stdout as `governor version`, and exit 0.
+func TestDashDashVersionIsVersion(t *testing.T) {
+	p := stagedHome(t)
+	bin := realGovernor(t)
+	wantCode, want, _ := execGovernor(t, bin, p, "version")
+	gotCode, got, stderr := execGovernor(t, bin, p, "--version")
+	if wantCode != 0 || gotCode != 0 {
+		t.Fatalf("exit codes: version %d, --version %d, want 0 and 0 (stderr: %s)", wantCode, gotCode, stderr)
+	}
+	if got != want || got == "" {
+		t.Errorf("governor --version printed %q, want what governor version prints: %q", got, want)
+	}
+}
+
+// --version is an alias, so the usage text names it once and does not list it as a command.
+func TestUsageNamesDashDashVersionOnce(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	run([]string{"--help"}, &stdout, &stderr)
+	if n := strings.Count(stdout.String(), "--version"); n != 1 {
+		t.Errorf("usage mentions --version %d times, want 1:\n%s", n, stdout.String())
+	}
+}
+
 // The thermal state has to reach a human through the status operation, or the one signal
 // that matters most on a fanless chassis is unobservable.
 //
