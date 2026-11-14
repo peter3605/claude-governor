@@ -157,8 +157,9 @@ const noBuildKey = "__no_build__"
 // the code was wrong.
 //
 // THE CEILING IS NOT WHAT WAS RELAXED, AND THE BUDGET IS NOT WHAT WAS RAISED. statuslineCeiling
-// stays at 70 ms and every caller is still held to it, which is what GOV-B08 and GOV-B10 paid
-// for; the 50 ms product promise is untouched and is still exercised where it belongs — by
+// stays at 70 ms, which is what GOV-B08 and GOV-B10 paid for (since GOV-B36 it is asserted by
+// the dedicated latency tests rather than by every content test, see runStatuslineFor); the
+// 50 ms product promise is untouched and is still exercised where it belongs — by
 // TestStatuslineWhenTheDaemonIsUnreachable, whose "accepts and never answers" case can only
 // produce its line by letting that budget expire, and by
 // TestStatuslineSurvivesAStdinThatNeverCloses. Against a generous budget the ceiling in fact
@@ -178,22 +179,53 @@ const noBuildKey = "__no_build__"
 // since a machine that cannot grant 50 ms of wall clock will not reliably grant 500 either.
 const statuslineContentBudget = 5 * time.Second
 
-// runStatusline drives the command end to end and holds it to the contract every case
-// shares: a non-empty single line, inside the ceiling.
+// runStatuslineFor drives the command end to end for a test whose subject is WHAT IT DID —
+// the line it rendered, or how often it asked the daemon — and holds it to the shape every
+// case shares: a non-empty single line. It does NOT assert statuslineCeiling.
+//
+// GOV-B36. Until then this helper also failed any run slower than the ceiling, so every
+// content and caching test was in fact a latency test too. On PR #94 an ubuntu -race runner
+// took 494 ms over TestStatuslineCaches/a_stale_cache_is_not_used, a test about cache
+// freshness whose call counts were exactly right. timed discounts only the single worst late
+// wakeup, so a run descheduled several times, each for under the ceiling, is neither
+// discounted nor inconclusive, and fails; summing the wakeups was measured and rejected in
+// GOV-B19. This is GOV-B17's separation finished: GOV-B17 took the 50 ms budget off content
+// tests and left the ceiling on them. Latency is now asserted where it is the subject — by
+// runStatuslineWithin, which TestStatuslineAnswersALiveDaemonInsideTheCeiling and the failure
+// mode tests use, and by TestStatuslineSurvivesAStdinThatNeverCloses. The ceiling itself has
+// not moved.
 //
 // It drives statuslineCommand rather than statusline because since GOV-33 the cache is
 // written by the command and not by the renderer. Calling the inner function here would
 // leave every caching test asserting against a cache nothing ever writes — passing, and
-// measuring nothing. The ceiling still covers the write, which is where it was before.
+// measuring nothing.
 func runStatuslineFor(t *testing.T, endpoint, payload string, width int) string {
 	t.Helper()
-	return runStatuslineWithin(t, endpoint, payload, width, statuslineContentBudget)
+	line, _, _ := driveStatusline(t, endpoint, payload, width, statuslineContentBudget)
+	return line
 }
 
-// runStatuslineWithin is runStatuslineFor with the budget named, for the cases whose subject
-// IS the budget — an unreachable daemon that must be given up on, and a stdin that never
-// closes. Those must run under the real statuslineBudget or they stop testing it.
+// runStatuslineWithin drives the command under the named budget and ALSO holds it to
+// statuslineCeiling. It is for the tests whose subject is latency: a live daemon that must
+// still be answered inside the ceiling, an unreachable daemon that must be given up on, and
+// the like. The failure-mode cases pass the real statuslineBudget, or they stop testing it.
 func runStatuslineWithin(t *testing.T, endpoint, payload string, width int, budget time.Duration) string {
+	t.Helper()
+	line, took, stderr := driveStatusline(t, endpoint, payload, width, budget)
+	switch {
+	case took.inconclusive(statuslineCeiling):
+		// Logged, not failed, and the content checks still ran (GOV-B19).
+		t.Logf("latency not judged: took %v, and a runner late by more than the whole %v "+
+			"ceiling cannot measure anything under it", took, statuslineCeiling)
+	case took.exceeds(statuslineCeiling):
+		t.Errorf("took %v, want under %v (stderr: %s)", took, statuslineCeiling, stderr)
+	}
+	return line
+}
+
+// driveStatusline is the run both helpers share: one statuslineCommand, timed, with the
+// shape every line must have checked. Whether the time is judged is the caller's choice.
+func driveStatusline(t *testing.T, endpoint, payload string, width int, budget time.Duration) (string, latency, string) {
 	t.Helper()
 	t.Setenv(transport.EndpointEnv, endpoint)
 
@@ -203,21 +235,34 @@ func runStatuslineWithin(t *testing.T, endpoint, payload string, width int, budg
 	})
 	line := strings.TrimSuffix(stdout.String(), "\n")
 
-	switch {
-	case took.inconclusive(statuslineCeiling):
-		// Logged, not failed, and the content checks below still run (GOV-B19).
-		t.Logf("latency not judged: took %v, and a runner late by more than the whole %v "+
-			"ceiling cannot measure anything under it", took, statuslineCeiling)
-	case took.exceeds(statuslineCeiling):
-		t.Errorf("took %v, want under %v (stderr: %s)", took, statuslineCeiling, stderr.String())
-	}
 	if line == "" {
 		t.Errorf("rendered an empty line; every failure must still say something")
 	}
 	if strings.Contains(line, "\n") {
 		t.Errorf("rendered %q, want a single line", line)
 	}
-	return line
+	return line, took, stderr.String()
+}
+
+// TestStatuslineAnswersALiveDaemonInsideTheCeiling is the happy path's latency guard, kept
+// when GOV-B36 took the ceiling off the content tests: against a live daemon, both the
+// render that dials and writes the cache and the render served from it must finish inside
+// statuslineCeiling. It runs under statuslineContentBudget on purpose (GOV-B17): allowed
+// five seconds, the command must still answer in 70 ms, so a path that starts waiting on the
+// daemon where it used to short-circuit fails here even though its budget would let it.
+func TestStatuslineAnswersALiveDaemonInsideTheCeiling(t *testing.T) {
+	isolateState(t)
+	endpoint, calls, _ := statusDaemon(t, statusReply{V: protocolVersion, Budget: 4, InUse: 1, Slots: 1, Thermal: "nominal"})
+
+	for _, render := range []string{"cold: dials the daemon and writes the cache", "warm: served from the cache"} {
+		if got, want := runStatuslineWithin(t, endpoint, sampleStatusLinePayload, 0, statuslineContentBudget), "1/4 slots - thermal ok"; got != want {
+			t.Errorf("%s: line = %q, want %q", render, got, want)
+		}
+	}
+	// Both paths are named above, so both must have been the ones measured.
+	if got := calls.Load(); got != 1 {
+		t.Errorf("daemon was asked %d times, want 1: the second render must be the cache hit", got)
+	}
 }
 
 func f64(v float64) *float64 { return &v }

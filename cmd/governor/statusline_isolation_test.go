@@ -13,6 +13,7 @@ var statuslineDrivers = map[string]bool{
 	"statuslineCommand":   true,
 	"runStatuslineFor":    true,
 	"runStatuslineWithin": true,
+	"driveStatusline":     true,
 }
 
 // unisolatedStatuslineExceptions are the functions allowed to drive the statusline without
@@ -21,6 +22,7 @@ var unisolatedStatuslineExceptions = map[string]string{
 	// The helpers themselves: they are the drivers, and every caller is audited instead.
 	"runStatuslineFor":    "the driver helper; its callers are what this audits",
 	"runStatuslineWithin": "the driver helper; its callers are what this audits",
+	"driveStatusline":     "the run both driver helpers share (GOV-B36); their callers are what this audits",
 
 	// The state directory IS this test's subject. It points GOVERNOR_STATE_DIR at a path that
 	// must not exist and asserts the command never creates it. isolateState would create that
