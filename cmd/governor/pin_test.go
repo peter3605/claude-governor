@@ -65,6 +65,9 @@ func TestPinningDownHoldsAParkedWaiterBack(t *testing.T) {
 	d.table.StartSession(lease.Session{ID: "s1", Weight: 1})
 	ctl(d, "limit", 1, time.Hour)
 	holdBuild(t, d, "s1")
+	// Before GOV-B34 this park never held: acquire pumps right after enqueueing, and that
+	// pump admitted the waiter against the source's 8 — a grant at 2 slots in use under a
+	// budget of 1.
 	p := parkOne(t, d, "s1")
 	defer p.cancel()
 
