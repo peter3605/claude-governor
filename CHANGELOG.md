@@ -49,6 +49,64 @@ config schema 1      the "schema" key in ~/.claude/governor/config.json
 Releases are fixed by a new patch version and never by moving a tag. [0.1.1](#011---2026-10-29)
 is the first example.
 
+## [0.1.6] - 2026-11-14
+
+Protocol and config schema are unchanged (`protocol 1`, `config schema 1`). Upgrading takes
+no extra step beyond the usual one: rerun the install one-liner, or `brew upgrade governor`
+followed by `$(brew --prefix)/opt/governor/bin/governor install`. That install registers a
+seventh hook (below), so until you run it, a failed build keeps its slot the old way. Restart
+open Claude Code sessions afterwards; a session binds its hooks when it starts.
+
+### Added
+
+- **`governor --version`** prints the same three lines as `governor version`. Before, it
+  answered `unknown command "--version"`.
+  ([#89](https://github.com/peter3605/claude-governor/pull/89))
+- **The daemon log records what the budget did and why.** Every cut, climb and restore is
+  a line naming its cause and the reading against its threshold, for example
+  `budget cut 4->1 cause=run-queue rq=7.10 cut=6.59`. Every released slot is a line saying
+  which session held it, for how long, and what released it. Every line now starts with a
+  timestamp. `~/.claude/governor/daemon.log` rotates at 4 MiB to `daemon.log.1` and keeps
+  that one older file. `governor uninstall` removes both.
+  ([#90](https://github.com/peter3605/claude-governor/pull/90))
+
+### Changed
+
+- **Slot counts are whole numbers, and agents are counted beside them.** The status line,
+  `governor status`, refusals and the `request_build` tool used to show figures like `3.8/4`.
+  They now show `4/4 slots · 1 agent`: a build's share rounds up, and subagents are listed
+  separately rather than rounded up to a slot each. Admission itself is unchanged; only the
+  display rounds. ([#93](https://github.com/peter3605/claude-governor/pull/93))
+- **`docker compose` is classified by its subcommand.** Before, every `docker compose`
+  call was gated as a heavy build, including `docker compose exec app psql`, `logs` and `ps`.
+  Now `build`, `watch` and anything with `--build` stay heavy, `up`, `run` and `create` are
+  medium, and the control-plane subcommands are not gated at all. `exec` and `run` are
+  classified by the command they run, so `docker compose exec app pytest` is still a test run.
+  ([#91](https://github.com/peter3605/claude-governor/pull/91))
+
+### Fixed
+
+- **A failed build releases its slot at once.** A command that exits non-zero raises a
+  different hook event from one that succeeds, and the governor was not listening for it. So
+  every failed build kept its slot for five minutes, and the retry from the same session was
+  refused as if another session held it. The new hook releases it immediately, and a refusal
+  that is caused by the session's own earlier build now says so.
+  ([#88](https://github.com/peter3605/claude-governor/pull/88))
+- **A subagent can run builds and tests.** A `go test` or `make` from inside a subagent was
+  refused with the message meant for a subagent spawning further subagents. A subagent's
+  builds now wait for a slot like any other build. Subagents still cannot spawn subagents.
+  ([#95](https://github.com/peter3605/claude-governor/pull/95))
+- **A waiting build is no longer refused while there is room for it**, and no refusal has an
+  empty cause any more. A build that had waited its full time was refused even when the
+  budget had room by then, and the log line said `cause=` with nothing after it. It now gets
+  one last look before it is refused, and every refusal names its reason.
+  ([#92](https://github.com/peter3605/claude-governor/pull/92))
+- **`governor limit` and `governor pause` hold for waiting requests.** A pin set with
+  `governor limit` applied to new requests but not to ones already waiting, nor to the
+  `request_build` tool's advice. Both now use the pinned budget, and requests already waiting
+  when you `pause` are let through, the same as new ones.
+  ([#94](https://github.com/peter3605/claude-governor/pull/94))
+
 ## [0.1.5] - 2026-11-02
 
 Protocol and config schema are unchanged (`protocol 1`, `config schema 1`). From 0.1.3 or
