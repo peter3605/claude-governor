@@ -880,8 +880,9 @@ rounded up if anything. Two ways to get there were open: round the *display*, or
   weighed at 4 on a four-slot ceiling is exclusive: the 3.8 the owner saw was a spawn at
   0.08 beside a Heavy at 3.75, which fits (3.83 ≤ 4); at weights 1 + 4 it would not. An agent rounded to 1 would let four subagents
   fill the machine, which is the error GOV-15 exists to correct.
-- **The slot scale may yet move.** GOV-B33 revisits what one slot means; doing accounting
-  changes here would mean doing them twice.
+- **The slot scale was re-checked and kept.** GOV-B33 measured slot-time by class and Heavy's
+  real cost, and left the scale unchanged (§5.6b), so these display fields sit on a scale that
+  has now been measured rather than assumed.
 
 So the daemon sends two additive display fields beside `slots`: `build_slots`, the sum held
 by builds, which every surface rounds **up** (a Heavy at 3.75 reads as 4, three Mediums as
@@ -1328,6 +1329,66 @@ behind one of those is refused rather than served, whatever order the queue is i
 Reproduced by `TestClassDurations` in `internal/classify`, which is skipped unless
 `GOVERNOR_CORPUS` points at a corpus; the checked-in fixture carries no runtimes, so these rows
 cannot be re-derived in CI and are recorded here instead.
+
+### 5.6b Is the slot scale right? (GOV-B33, decided 2026-11-20: unchanged)
+
+**The question.** During GOV-38 the owner saw `3.8/4` so often that it read as a Heavy build
+taking most of the machine most of the time, and asked whether the scale should change. That
+scale is one slot per 1.2 cores, Heavy at 4.5 expected peak cores = 3.75 slots, a ceiling of 4.
+Before GOV-49 and GOV-B30 that impression was plausible: Heavy was 35% of gated builds over
+11-03 to 11-09, half of those were `docker compose` calls such as `exec … psql` that GOV-B30
+has since stopped classing as Heavy, and failed builds held their slot for 300 s.
+
+**Slot-time by class, measured (clause 1).** Every lease's release is logged with its weight
+and hold time (GOV-B29). From 2026-11-14 21:33, when the released 0.1.6 daemon began logging,
+to 2026-11-20, which includes the five working days the story asked for:
+
+| Class | Leases | Slot-seconds | Share | p50 hold | p90 hold | Reaper-expired |
+|---|---:|---:|---:|---:|---:|---:|
+| Medium | 171 | 10,383 | 55.0% | 6.3 s | 300.6 s | 25 |
+| Agent | 223 | 7,544 | 39.9% | 298.9 s | 910.8 s | 4 |
+| **Heavy** | **9** | **963** | **5.1%** | 2.5 s | 61.1 s | 0 |
+
+Some lease was held for 22.7 h of the window, and some build lease for 2.81 h. **A Heavy lease
+was held for 4.3 minutes: 2.5% of build-held time, 0.31% of any-held time.** On this data, the
+owner's observation doesn't recur.
+
+Two things limit how far that number travels:
+
+- **The week had no Docker builds.** All 14 Heavy requests (9 granted) were Xcode
+  (`xcodebuild test`, `xcodebuild`, `swiftc`). The week before had over 30 Docker-shaped Heavy
+  requests. So 5% measures this week's work, not a property of the scale.
+- **Medium's slot-time is mostly backgrounded builds.** 7,528 of the 11,346 build slot-seconds
+  (66%) are leases the reaper expired at 300 s: `pytest` runs that Claude Code moved to the
+  background, which `buildFinish` holds deliberately and nothing ends early. That is GOV-B41,
+  and it inflates Medium, not Heavy.
+
+**What Heavy costs while held (clause 2).** docs/bash-corpus.md §12 re-measured the shapes
+that make up Heavy here, using the instrument behind 4.5 alongside one that sees the Docker VM
+and the iOS Simulator. Measured whole, `docker build`, `docker compose build` and `xcodebuild
+test` all peak around **6 cores** on this 8-core host (VM 5.2-5.8, Simulator 5.4-5.9, cold
+compile 6.0-6.2) and average about 3 or more. The child-tree instrument scores the Docker shapes
+at 0.08-0.11 and a warm `xcodebuild test` at 0.8, because their work runs outside the command's
+process tree. 4.5 is not too high for these shapes. If anything it is low.
+
+**Decision: unchanged.** No re-weight, no split, and no new slot unit or ceiling:
+
+- **Lowering Heavy's weight is ruled out by clause 2.** The weight prices cores held, and
+  measured whole, Heavy holds more than 4.5, not less.
+- **Raising it isn't supported either.** Nothing in this window shows the machine
+  oversubscribed while a Heavy lease was held, and a higher weight on a four-slot ceiling makes
+  Heavy exclusive, which the 3.75 + 0.08 case above deliberately avoids.
+- **Splitting Heavy into container and compile has no basis.** Measured, the two sides peak
+  within a core of each other.
+- **What does waste slot-time is hold time, not weight.** That is GOV-B41's to fix, and a
+  scale change would hide it.
+
+A week dominated by Docker builds would raise Heavy's share. That would be real CPU, correctly
+priced, so it would not reopen this decision. What would reopen it is evidence that a Heavy
+lease's weight disagrees with what the machine measures while it's held.
+
+**No constant changed (clause 4).** The magnitudes above are one laptop's and are not shipped
+as anyone's default.
 
 ---
 
