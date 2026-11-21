@@ -691,3 +691,106 @@ changed class. The gated share of the corpus falls from 676 to 649 calls (15.0% 
 interleaved with `main` five times at `-count 2`: median 2,618 ns/op against 2,582, inside the
 run-to-run spread (2,483-3,012 for `main` alone), and allocations unchanged at 43/op. The new
 parsing runs only for commands whose binary is `docker` or `docker-compose`.
+
+## 12. Heavy's 4.5 cores, re-checked where Heavy's work runs (GOV-B33 clause 2, measured 2026-11-15)
+
+Heavy's `ExpectedPeakCores()` of 4.5 is the p90 peak of **child-tree** cores at 1 Hz (§5),
+mostly from 9 `xcodebuild` calls. On this machine the shapes that make up Heavy are `docker
+compose`/`docker build` and `xcodebuild test`. GOV-B33's notes count, among 78 Heavy calls
+over 11-03 to 11-09, `docker compose` in 39, `xcodebuild test` in 22 and `docker build` in 13
+(one command can name more than one shape). Clause 2 asks whether 4.5 holds for them, measured with the tool that
+produced it, and whether that tool can see Docker's VM at all.
+
+**It can't see the Docker VM, and on a warm run it can barely see `xcodebuild test` either.**
+On macOS both shapes do most of their work in processes the command is not an ancestor of:
+Docker in Docker Desktop's VM (§11), and the test host in the iOS Simulator, under
+`launchd_sim`, which CoreSimulator starts. A child-tree instrument scores both as nearly free.
+
+### Method: `tools/shapecost`
+
+`tools/shapecost` runs one command and measures it two ways at once:
+
+- **child**: the command's process tree at a 1 s tick, through `internal/childcpu`, the same
+  walk and the same delta arithmetic the §5 figure came from. This is the original instrument,
+  not a re-implementation. It loses whatever a process burns between its last tick and its
+  exit, which is why the means below read slightly low; the corpus had the same loss.
+- **outside the tree**, every 250 ms with a 4 s idle baseline subtracted before each rep, so
+  only what the command added is counted: the **VM** group (`com.apple.Virtualization.
+  VirtualMachine`, `com.docker.*`), the **Simulator** group (`launchd_sim` and every
+  descendant), and **host** (every non-idle core). Peaks are taken over 1 s windows so they
+  compare with the 1 Hz child peak.
+
+Before each rep it waits for the host to stay under 3 busy cores for 10 s. This desktop idles
+at 2-3 with Docker Desktop and six Claude sessions open. After each rep it flags any other
+session's build lease in `daemon.log` that overlapped the rep.
+
+**Calibrated before use.** Two busy loops for 8 s read child peak 2.04-2.10, VM 0, Simulator
+0. The same two loops inside `docker run` read **child 0.00**, VM mean 1.91-2.02. The noise
+floor outside the tree is about 0.5 cores at peak. **Host peaks are not usable:** on darwin,
+gopsutil's host CPU times refresh about once a second, so a refresh landing inside a single
+250 ms sample produces spikes of 7-12 cores. Host *means* are fine and are the only host
+figure used below.
+
+Host: this laptop, 8 cores (4P+4E), 16 GiB, Docker Desktop 29.4.3 (8 vCPU), Xcode 26.6,
+iOS 26.5 Simulator. The Docker workload is §11's (`go build -a std` in `golang:1.26`, image
+cached, `--no-cache` build). The Xcode workload is Muncheez's own unit suite, the project all
+21 `xcodebuild test` calls on this machine came from, run the way its sessions run it:
+`xcodebuild test -scheme MuncheezUnitTests -skip-testing:MuncheezTests/RankingPerformanceTests
+CODE_SIGNING_ALLOWED=NO`, on a dedicated simulator created for the run and then deleted.
+**Cold** clears `-derivedDataPath` before each rep (the most common invocation used a fresh
+scratchpad path). **Warm** reuses it, as a re-run after a small edit does. Muncheez's working
+tree was untouched.
+
+### Results
+
+All ten reps exited 0. Cores, idle baseline subtracted outside the tree:
+
+| Shape | Rep | Wall | Child mean | **Child peak** | VM mean | VM peak | Sim mean | Sim peak | Host mean |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| `docker build --no-cache` | 1 | 28 s | 0.00 | **0.08** | 2.75 | 5.17 | - | - | 3.22 |
+| | 2 | 27 s | 0.00 | **0.08** | 3.08 | 5.79 | - | - | 4.21 |
+| | 3 | 26 s | 0.01 | **0.08** | 2.77 | 5.76 | - | - | 5.38 |
+| `docker compose build --no-cache` | 1 | 22 s | 0.01 | **0.11** | 3.34 | 5.84 | - | - | 4.71 |
+| | 2 ¹ | 23 s | 0.01 | **0.11** | 3.11 | 5.81 | - | - | 4.28 |
+| `xcodebuild test`, cold | 1 ² | 69 s | 1.61 | **5.95** | - | - | 0.45 | 2.99 | 4.77 |
+| | 2 | 80 s | 1.31 | **6.19** | - | - | 2.20 | 5.71 | 5.70 |
+| `xcodebuild test`, warm | 1 | 97 s | 0.05 | **0.80** | - | - | 2.16 | 5.42 | 5.44 |
+| | 2 | 63 s | 0.08 | **0.74** | - | - | 3.07 | 5.60 | 6.24 |
+| | 3 | 49 s | 0.09 | **0.75** | - | - | 3.63 | 5.89 | 4.86 |
+
+A dash is a group the shape doesn't use, where readings stayed at or near the noise floor
+(Simulator noise during the Docker runs came from another session's booted simulators).
+¹ Overlapped two of another session's Medium leases (3 s and 5 s, a `docker run` in
+concertFinder); its VM figures match rep 1. ² Did not settle in 5 minutes and ran anyway.
+
+**Host mean exceeds child + Simulator by about 2 cores on `xcodebuild test`.** A `top`
+sample taken during an extra warm rep attributes most of the gap to host services the test
+run itself causes: `diskimagesiod` (≈0.33 cores, the Simulator runtime's disk image),
+`diagnosticd` (≈0.33, log streaming out of the Simulator) and part of `kernel_task` (≈0.6).
+The rest is ambient (WindowServer, Terminal, `STExtractionService`). So for `xcodebuild test`,
+child + Simulator is a lower bound and host is an upper bound.
+
+### What this says about 4.5
+
+- **The tool that produced 4.5 cannot see Docker's VM.** It scores `docker build` and
+  `compose build` at 0.08-0.11 peak cores while they hold 2.8-3.3 cores on average and peak
+  at 5.2-5.8. It can't have produced 4.5 for these shapes, and it didn't: Docker reached
+  Heavy by analogy (§5) and was never in the measured set.
+- **It sees half of a cold `xcodebuild test` and almost none of a warm one.** Cold, the
+  compile is in the tree and peaks at 6.0-6.2, above 4.55. Warm, there's almost nothing to
+  compile, the tree peaks at 0.8, and the 2.2-3.6 cores of the test run go to the Simulator.
+  §5's 9 `xcodebuild` calls mixed both kinds, which is part of why their p90 read 4.55 while
+  their median read 1.57.
+- **Measured whole, all three shapes peak around 6 cores and average about 3 or more.** VM
+  peaks are 5.2-5.8, Simulator peaks 5.4-5.9 with host services on top, and cold compile
+  peaks 6.2. By what Heavy's work actually uses, **4.5 is low for these shapes, not high**:
+  each one alone saturates most of this 8-core machine for its peak seconds. That doesn't
+  support lowering Heavy's per-call weight. If the slot scale is wrong here, the measurement
+  points at how long a Heavy holds its slots, not at what it weighs while holding them.
+  Clause 1 measures exactly that.
+
+**What this section does NOT say.** It doesn't decide the scale. That decision is design.md
+§5.6b, made on 2026-11-20 with clause 1's slot-time data, and it is *unchanged*. It doesn't produce a new constant: these are one laptop's
+magnitudes, and clause 4 rules out shipping them. It doesn't measure Linux, where containers
+are host processes but still not the client's children (§11), and the iOS Simulator doesn't
+exist.
