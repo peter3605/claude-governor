@@ -117,6 +117,15 @@ type request struct {
 	// reused, so a field's meaning does not depend on which side of the hook it was read.
 	HookEvent string `json:"hook_event,omitempty"`
 
+	// background, settle (GOV-B41)
+	//
+	// TaskID is the harness's backgroundTaskId, sent by `background` with the tool_use_id and
+	// agent_id the command ran under. Ended is `settle`'s list of the tool_use_ids that task
+	// notifications reported finished. Both keys were checked against every other message on
+	// this connection, and none of them uses either.
+	TaskID string   `json:"task_id,omitempty"`
+	Ended  []string `json:"ended,omitempty"`
+
 	// confirm / release
 	Lease        string `json:"lease"`
 	AgentID      string `json:"agent_id"`
@@ -249,6 +258,12 @@ type refuseReply struct {
 	// Own equals Slots, no other session is involved, and the only true instruction is about
 	// this session's own earlier command. Additive like Asking: an older gate ignores it.
 	Own float64 `json:"own,omitempty"`
+	// OwnBackground names the background tasks the refused session's own build leases are
+	// held by (GOV-B41). When Own equals Slots and this is not empty, the earlier command that
+	// is holding the slots is a background task, and the refusal can say which one, so the
+	// model can wait for it or stop it rather than retry blind. Additive: an older gate
+	// ignores it.
+	OwnBackground []string `json:"own_background,omitempty"`
 }
 
 // waitingReply is the interim answer to an acquire the daemon has decided to park
@@ -1328,6 +1343,11 @@ func (d *daemon) dispatch(req request) any {
 	case "finish":
 		reply, gone := d.finish(req)
 		return d.thenLog(reply, finishedBy(req.HookEvent), gone)
+	case "background":
+		return d.background(req)
+	case "settle":
+		reply, gone := d.settle(req)
+		return d.thenLog(reply, releasedByNotification, gone)
 	case "session":
 		reply, gone := d.session(req)
 		return d.thenLog(reply, releasedBySessionEnd, gone)
@@ -1621,7 +1641,8 @@ func (d *daemon) refuseForCapacity(req request, limit int, src string) refuseRep
 		Cause:   refusalCause(d.table.Refusal(leaseRequestFor(req), limit)),
 		Asking:  lease.WeightOf(leaseRequestFor(req)),
 		Ceiling: ceiling, Cut: cut,
-		Own: d.table.Held(req.Session),
+		Own:           d.table.Held(req.Session),
+		OwnBackground: d.table.BackgroundTasks(req.Session),
 	}
 	r.BuildSlots, r.Agents = d.split()
 	// Logged here rather than at each call site so that a refusal added later cannot be one
@@ -1756,16 +1777,86 @@ func (d *daemon) release(req request) (ackReply, []lease.Released) {
 	// SubagentStop fires more than once for the same agent, so "held nothing" is a normal
 	// answer rather than a failure.
 	gone, ok := d.table.Release(req.Session, req.AgentID)
-	if ok {
+	// The agent's own backgrounded builds go with it (GOV-B41). Claude Code kills a
+	// subagent's background tasks when the subagent stops, so their CPU is already gone.
+	// Done whether or not the agent held a lease of its own: a subagent resumed by
+	// SendMessage reaches the CPU with no lease (section 4.3), yet its builds took leases
+	// like any other.
+	bg := d.table.ReleaseBackgroundOf(req.Session, req.AgentID)
+	if ok || len(bg) > 0 {
 		// The slot that just came free belongs to whoever has waited longest for it.
 		d.pump()
 	}
 	r := ackReply{V: d.speaks, OK: ok, InUse: d.table.InUse()}
+	var released []lease.Released
+	if ok {
+		released = append(released, gone)
+	} else {
+		r.Reason = "no_lease"
+	}
+	return r, append(released, bg...)
+}
+
+// background records that a build's command was moved to the background and is still
+// running (GOV-B41, hook-surface.md section 26).
+//
+// It releases nothing. The PostToolUse that sends it is a launch receipt, so releasing here
+// would hand a slot back to a command that is still using the CPU, which is the decision
+// GOV-15 made on purpose and buildFinish's comment records. What it does is name the lease,
+// so that the events which DO mark the task's end can find it.
+//
+// "Held nothing" is ordinary here, as it is for finish: most backgrounded commands are not
+// build-shaped and never took a lease.
+func (d *daemon) background(req request) ackReply {
+	if !taskIDShaped(req.TaskID) {
+		return ackReply{V: d.speaks, Reason: "bad_task_id", InUse: d.table.InUse()}
+	}
+	ok := d.table.MarkBackground(req.Session, req.ToolUseID, req.TaskID, req.AgentID)
+	r := ackReply{V: d.speaks, OK: ok, InUse: d.table.InUse()}
 	if !ok {
 		r.Reason = "no_lease"
-		return r, nil
 	}
-	return r, []lease.Released{gone}
+	return r
+}
+
+// taskIDShaped reports whether id looks like a harness task ID: 1 to 32 lowercase letters and
+// digits, as every one measured in hook-surface.md section 26 was ("b1njo6u3q"). It is checked
+// because the ID comes off the wire and is written into the release log, which `doctor
+// --report` pastes into public issues. Refusing a stranger shape costs only the mark, and the
+// lease then ends by its TTL as it did before GOV-B41.
+func taskIDShaped(id string) bool {
+	if id == "" || len(id) > 32 {
+		return false
+	}
+	for _, c := range id {
+		if (c < 'a' || c > 'z') && (c < '0' || c > '9') {
+			return false
+		}
+	}
+	return true
+}
+
+// settle returns backgrounded build leases whose task notification has arrived (GOV-B41).
+//
+// UserPromptSubmit sends it with Ended: the tool_use_ids that task notifications reported
+// finished, completed or failed. Each is released exactly, by the key finish uses, because
+// the notification carries the original tool_use_id. It is a separate op from finish only
+// because one prompt may carry more than one notification.
+func (d *daemon) settle(req request) (ackReply, []lease.Released) {
+	var gone []lease.Released
+	for _, id := range req.Ended {
+		if l, ok := d.table.ReleaseBuild(req.Session, id); ok {
+			gone = append(gone, l)
+		}
+	}
+	if len(gone) > 0 {
+		d.pump()
+	}
+	r := ackReply{V: d.speaks, OK: len(gone) > 0, InUse: d.table.InUse()}
+	if len(gone) == 0 {
+		r.Reason = "no_lease"
+	}
+	return r, gone
 }
 
 // finish returns a Build lease at PostToolUse (GOV-15, hook-surface.md section 19).

@@ -2367,3 +2367,179 @@ Verbatim apart from the scratch paths, which are shortened to `…/work`.
 - An interactive permission decline (assumed to behave like consequence 3).
 - `is_interrupt: true`: is an interrupted command killed, and so safe to release?
 - Linux.
+
+---
+
+## 26. The end of a background `Bash` task (GOV-B41)
+
+§19 found nothing that fires when a backgrounded command ends. Its catch-all registered
+`PreToolUse` and `PostToolUse` in three probes and all eight events then known in probe H.
+GOV-B33's data then showed that 66% of build slot-seconds over 2026-11-14 to 11-20 were
+backgrounded builds held to the 300 s TTL. This section re-measures with every event the
+binary names registered, and finds two end signals §19 was not listening for.
+
+**The headline: a background task's end IS reported, on two paths and not on a third.**
+
+- **Main thread, task exits (any exit code):** Claude Code submits a `<task-notification>`
+  as a prompt, so `UserPromptSubmit` fires carrying it. The notification includes the
+  **original `tool_use_id`**, the one the gate keyed the lease on.
+- **Subagent stops:** its background tasks are **killed** within half a second.
+- **Not reported anywhere a hook sees:** a subagent's task that ends while the subagent is
+  still working (its notification goes into the subagent's context with no hook), and a
+  main-thread task killed by `TaskStop` (no notification). Both leave a status line at the end
+  of the task's output file (consequence 4), and the reaper reads that.
+
+### 26.0 Provenance
+
+| | |
+|---|---|
+| Claude Code | **2.1.327** |
+| Host | macOS 25.4.0, darwin/arm64 |
+| Date | 2026-11-20 |
+| Model | `sonnet`, `claude -p`, `--settings <probe>/settings.json`, `--setting-sources ""`, `--permission-mode bypassPermissions` |
+
+### 26.1 Method
+
+The §0 capture hook, unchanged. Seven probes, each a separate headless `claude -p` in a
+throwaway directory. P1 to P5 register a catch-all for **every** event whose name the 2.1.327
+binary carries that could plausibly concern a task: `PreToolUse`, `PostToolUse`,
+`PostToolUseFailure` (all `matcher: "*"`), `Notification`, `UserPromptSubmit`, `SessionStart`,
+`SessionEnd`, `Stop`, `StopFailure`, `SubagentStart`, `SubagentStop`, `PreCompact`,
+`PostCompact`, `TaskCreated`, `TaskCompleted`, `TeammateIdle`, `PermissionDenied`,
+`FileChanged`, `CwdChanged`. P6 and P7 register the first thirteen of those.
+
+| Probe | Question | Shape |
+|---|---|---|
+| P1 | `run_in_background`, task exits 0 | bg `sleep 8`, then four foreground `sleep 4` |
+| P2 | a foreground command passes its `timeout` | `timeout: 5000` on `sleep 15`, then four `sleep 4` |
+| P3 | a background task exits non-zero; is a read of its output an end signal | bg `sleep 12; exit 3`, read output, `sleep 14`, read again |
+| P4 | a background task killed by `TaskStop` | bg `sleep 60`, `sleep 2`, `TaskStop`, `sleep 3` |
+| P5 | what `Stop` and `SubagentStop` list in `background_tasks` | a subagent backgrounds `sleep 30` and returns; the main thread backgrounds `sleep 40` and ends its turn |
+| P6 | a SUBAGENT's timed-out command that ends while the subagent works on | subagent: `timeout: 4000` on `sleep 9`, then four `sleep 4` |
+| P7 | is a subagent's background task killed when the subagent stops, and when | subagent backgrounds a loop appending a timestamp to a file every 0.5 s, then returns; main thread `sleep 5` |
+
+Each background command wrote its own PID to a file (`echo $$ > bgpid`) so that whether the
+process was still alive could be checked afterwards with `ps`, independently of anything the
+harness said.
+
+### 26.2 The answers
+
+| Case | What fires when the task ends | Delay after the task really ended |
+|---|---|---|
+| main thread, bg task exits 0 (P1) | `UserPromptSubmit`, `<status>completed</status>` | +1.7 s (mid-turn, at the next tool boundary) |
+| main thread, timed-out task exits 0 (P2) | `UserPromptSubmit`, `completed` | +0.2 s (turn had ended; arrived as a new turn) |
+| main thread, bg task exits 3 (P3) | `UserPromptSubmit`, `<status>failed</status>`, "failed with exit code 3" | +4.7 s (held until the foreground `sleep 14` returned) |
+| main thread, bg task exits 0 after the turn ended (P5) | `UserPromptSubmit`, `completed` | +0.3 s |
+| main thread, bg task killed by `TaskStop` (P4) | **nothing.** No notification. `PostToolUse` on `TaskStop` carries `task_id`, and the next `Stop` lists no running task | — |
+| subagent, task ends while subagent still running (P6) | **nothing.** The notification is in the subagent's transcript as a `<system-reminder>` attachment; no `UserPromptSubmit`, no other event | — |
+| subagent stops with a bg task running (P5, P7) | `SubagentStop`, listing the task as `running`; the task is then **killed** | P7: last heartbeat +4.727 s, `SubagentStop` +4.860 s, no later beat; output file ends `[killed]`; PID gone |
+
+Events registered and **never** fired in any probe: `TaskCreated`, `TaskCompleted`,
+`Notification`, `StopFailure`, `PreCompact`, `PostCompact`, `TeammateIdle`, `FileChanged`,
+`CwdChanged`, `PermissionDenied`. The names `TaskCreated` and `TaskCompleted` belong to the
+task-list tools (`TaskCreate`, `TaskUpdate`), not to background shells.
+
+Six consequences.
+
+1. **The notification's `<tool-use-id>` equals the `PreToolUse` `tool_use_id`, 4 of 4** (P1,
+   P2, P3, P5). The lease can be released by the exact key `finish` already uses, with no
+   correlation.
+2. **A failed background task is reported too**, as `failed`. Exit status does not matter to
+   the release: the process has ended either way.
+3. **The notification is delivered at the next turn boundary, not at exit.** While the main
+   thread is running a foreground tool, the notification waits for it (P3: 4.7 s). So a
+   release on this signal can be *late* by up to the length of one foreground tool call,
+   never early.
+4. **A read of the output is not an end signal** (P3, settling the trap in
+   `bash-corpus.md` §2). The 2.1.327 model reads it with `Read` on the task's output file, so
+   there is no `BashOutput` event to key on at all. The output file does end with a status line
+   (`[exited with code 0]`, `[killed]`) once the task is over, but its path is not in any hook
+   payload before the notification.
+5. **`Stop.background_tasks` lists the main thread's live shell tasks**, with `id` equal to
+   the `backgroundTaskId`, `type: "shell"` and `status: "running"` (P2, P5). After a
+   `TaskStop` it is empty (P4). It does not list a subagent's tasks once the subagent has
+   stopped (P5), and nothing was measured about a subagent still running at `Stop`.
+6. **A subagent's background tasks do not outlive it.** In P5 and P7, `SubagentStop` listed the
+   task as running, and it was killed within 0.13 s of that event. In P6, where the task had
+   already finished, `SubagentStop` listed nothing. So `SubagentStop` is an end signal for
+   every background task the subagent started.
+
+### 26.3 The payloads
+
+Verbatim apart from paths, shortened to `…`.
+
+A timed-out command's `Stop` while it is still running (P2), then its notification:
+
+```json
+{"session_id":"9490f484-244b-4182-a6e3-656bf9a66307","transcript_path":"…","cwd":"…/work","prompt_id":"2ea2c52b-2813-47e1-ba5b-0f391e15d331","permission_mode":"bypassPermissions","effort":{"level":"medium"},"hook_event_name":"Stop","stop_hook_active":false,"last_assistant_message":"finished","background_tasks":[{"id":"bqodkcz89","type":"shell","status":"running","description":"echo $$ > fgpid; sleep 15; echo late-done","command":"echo $$ > fgpid; sleep 15; echo late-done"}],"session_crons":[]}
+{"session_id":"9490f484-244b-4182-a6e3-656bf9a66307","transcript_path":"…","cwd":"…/work","prompt_id":"d73a981a-a811-49bf-abc3-406cf20193c7","permission_mode":"bypassPermissions","hook_event_name":"UserPromptSubmit","prompt":"<task-notification>\n<task-id>bqodkcz89</task-id>\n<tool-use-id>toolu_01ChpvvobAJBYANa8GBPsDdC</tool-use-id>\n<output-file>…/tasks/bqodkcz89.output</output-file>\n<status>completed</status>\n<summary>Background command \"echo $$ &gt; fgpid; sleep 15; echo late-done\" completed (exit code 0)</summary>\n</task-notification>"}
+```
+
+A failed background task (P3):
+
+```json
+{"session_id":"6fdb11a5-ee02-4555-a24f-99708a8d923d","transcript_path":"…","cwd":"…/work","prompt_id":"30437f51-56fc-4373-94d7-1186f8534145","permission_mode":"bypassPermissions","hook_event_name":"UserPromptSubmit","prompt":"<task-notification>\n<task-id>b1njo6u3q</task-id>\n<tool-use-id>toolu_01ThrFVc36knsD5dGJ4LbdM8</tool-use-id>\n<output-file>…/tasks/b1njo6u3q.output</output-file>\n<status>failed</status>\n<summary>Background command \"Run background sleep task\" failed with exit code 3</summary>\n</task-notification>"}
+```
+
+`TaskStop`, and the `Stop` after it (P4). No `UserPromptSubmit` appears anywhere in P4 after
+the kill:
+
+```json
+{"session_id":"1cc229e6-ab43-4bbe-8505-3cc9918dc4de","transcript_path":"…","cwd":"…/work","prompt_id":"e34cbe70-ef21-4b72-ab7b-f782137452f7","permission_mode":"bypassPermissions","effort":{"level":"medium"},"hook_event_name":"PostToolUse","tool_name":"TaskStop","tool_input":{"task_id":"b0ta4swmo"},"tool_response":{"message":"Successfully stopped task: b0ta4swmo (echo $$ > bgpid; sleep 60; echo never)","task_id":"b0ta4swmo","task_type":"local_bash","command":"echo $$ > bgpid; sleep 60; echo never"},"tool_use_id":"toolu_01GQoyp9v1EYh1VrgZ26sUQT","duration_ms":6}
+{"session_id":"1cc229e6-ab43-4bbe-8505-3cc9918dc4de","transcript_path":"…","cwd":"…/work","prompt_id":"e34cbe70-ef21-4b72-ab7b-f782137452f7","permission_mode":"bypassPermissions","effort":{"level":"medium"},"hook_event_name":"Stop","stop_hook_active":false,"last_assistant_message":"finished","background_tasks":[],"session_crons":[]}
+```
+
+A subagent stopping with a background task running (P7). The loop it names wrote its last
+timestamp 0.13 s before this event and none after:
+
+```json
+{"session_id":"e8453043-aff1-46f9-ad86-ca2657d52b71","transcript_path":"…","cwd":"…/work","prompt_id":"786c0ec6-3a8f-47ff-80d3-ab9b98dd9012","permission_mode":"bypassPermissions","agent_id":"a077b680a6481e488","agent_type":"general-purpose","effort":{"level":"medium"},"hook_event_name":"SubagentStop","stop_hook_active":false,"agent_transcript_path":"…","last_assistant_message":"launched","background_tasks":[{"id":"b4ms9mpju","type":"shell","status":"running","description":"Run background heartbeat loop","command":"echo $$ > subpid; while true; do date +%s.%N >> beats; sleep 0.5; done"}],"session_crons":[]}
+```
+
+P6's event log in full, the earbrief shape. The subagent's timed-out command ends near +13.2 s
+and nothing at all fires for it:
+
+```
++  3.379 PreToolUse    Agent
++  3.424 SubagentStart agent_id=ad08ea6c22cc50ff3
++  4.232 PreToolUse    Bash  sleep 9, timeout 4000        (agent_id=ad08ea6c…)
++  8.405 PostToolUse   Bash  backgroundTaskId=b0kn8kly4, timedOutAfterMs=4000
++  9.115 PreToolUse    Bash  s1                          ~+13.2  task actually ends
++ 13.204 PostToolUse   Bash  s1                                  (no event)
++ 13.860 PreToolUse    Bash  s2
++ 17.951 PostToolUse   Bash  s2
++ 18.603 PreToolUse    Bash  s3
++ 22.675 PostToolUse   Bash  s3
++ 23.329 PreToolUse    Bash  s4
++ 27.387 PostToolUse   Bash  s4
++ 27.899 SubagentStop  background_tasks=[]
++ 27.967 PostToolUse   Agent
++ 28.384 Stop          background_tasks=[]
++ 28.430 SessionEnd
+```
+
+### 26.4 Folded into design.md
+
+§4.1 registers `governor settle` on `UserPromptSubmit`, the eighth hook. §4.3's `Bash` lifecycle
+gains a `background` mark and three releases: the notification, `SubagentStop`, and the reaper's
+task-file check through `lease.PIDLiveness`. §5.6's release table moves the backgrounded rows off
+the TTL. §5.6c records the hold policy, what each alternative costs, and why `Stop`'s
+`background_tasks` list (consequence 5) is measured here but not used. §7 gains the `background`
+and `settle` operations and the refusal's `own_background`. §10 and §10.3 are updated, and §13.3
+counts the eighth hook.
+
+### 26.5 Still unmeasured
+
+- **An interactive session idle at the prompt.** In headless mode a notification for a task
+  that ended after the turn starts a new turn, and `UserPromptSubmit` fires (P2, P5). In an
+  interactive session the notification was seen to arrive mid-session (GOV-B41's own
+  background test run, delivered into the session's context), but whether `UserPromptSubmit`
+  fired for it was not captured, and the idle-at-prompt case was not driven.
+- **Whether a subagent's tasks also appear in the main thread's `Stop` while the subagent is
+  still running**, for example a background `Agent` still working when the main turn ends.
+  `settle` does not rely on it: subagent leases are left to `SubagentStop`.
+- **Whether `SubagentStop` kills a background task for an agent that will later be resumed with
+  `SendMessage`.** P7 measured an agent that was never resumed.
+- **Several notifications in one prompt.** Every notification observed arrived alone.
+  `settle` reads every `<tool-use-id>` in the prompt regardless.
+- Linux.

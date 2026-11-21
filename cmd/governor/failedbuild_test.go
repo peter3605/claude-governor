@@ -51,7 +51,8 @@ func harnessFires(t *testing.T, event, tool, payload string) (ran bool) {
 	if err := json.Unmarshal(raw, &file); err != nil {
 		t.Fatalf("hooks.json does not parse: %v", err)
 	}
-	builders := map[string]builder{"finish": buildFinish, "release": buildRelease, "confirm": buildConfirm}
+	builders := map[string]builder{"finish": buildFinish, "release": buildRelease, "confirm": buildConfirm,
+		"settle": buildSettle}
 	for _, entry := range file.Hooks[event] {
 		if entry.Matcher != "" && !regexp.MustCompile("^(?:"+entry.Matcher+")$").MatchString(tool) {
 			continue

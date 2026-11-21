@@ -641,6 +641,83 @@ func (t *Table) ReleaseBuild(session, toolUseID string) (Released, bool) {
 	return t.dropLocked(l, ""), true
 }
 
+// MarkBackground records that a Build lease's command is still running, now as background
+// task taskID, and reports whether there was such a lease (GOV-B41).
+//
+// IT RELEASES NOTHING, and that is the point of it. The PostToolUse that carries a
+// backgroundTaskId is a launch receipt, not a completion (hook-surface.md section 19). What
+// changes is that the lease now has names the end of the task can be matched against:
+// SubagentStop by agentID, and the reaper's Liveness by session and taskID. A task
+// notification needs neither, because it carries the original tool_use_id, which
+// ReleaseBuild already keys on.
+//
+// agentID is the subagent that ran the command, empty on the main thread. The session is
+// checked for ReleaseBuild's reason.
+func (t *Table) MarkBackground(session, toolUseID, taskID, agentID string) bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	id, ok := t.byTool[toolUseID]
+	if !ok {
+		return false
+	}
+	l, ok := t.byID[id]
+	if !ok || l.Kind != Build {
+		return false
+	}
+	if session != "" && l.Session != session {
+		return false
+	}
+	l.BackgroundTask = taskID
+	l.BackgroundAgent = agentID
+	return true
+}
+
+// ReleaseBackgroundOf drops every backgrounded Build lease that subagent agentID started
+// (GOV-B41).
+//
+// It is SubagentStop's second job, and it rests on a measured fact rather than an
+// assumption: a subagent's background shell tasks are killed when the subagent stops. In
+// hook-surface.md section 26 a heartbeat loop started in the background by a subagent wrote
+// its last beat 0.13 s before SubagentStop fired and never wrote another, and its output file
+// ends in "[killed]". The CPU is gone, so the slot is free.
+//
+// A foreground build cannot be running at SubagentStop, because a subagent does not stop
+// while one of its own tool calls is still in progress. That is why only BACKGROUNDED leases
+// are dropped here: a foreground lease with this agent's name would be one whose PostToolUse
+// is still on its way.
+func (t *Table) ReleaseBackgroundOf(session, agentID string) []Released {
+	if agentID == "" {
+		return nil
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	var out []Released
+	for _, l := range t.leasesForLocked(session) {
+		if l.Kind == Build && l.BackgroundTask != "" && l.BackgroundAgent == agentID {
+			out = append(out, t.dropLocked(l, ""))
+		}
+	}
+	return out
+}
+
+// BackgroundTasks names the background tasks session's Build leases are held by, sorted, so a
+// refusal can say which of the session's own commands is holding the slots (GOV-B41).
+func (t *Table) BackgroundTasks(session string) []string {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	var out []string
+	for _, l := range t.leasesForLocked(session) {
+		if l.Kind == Build && l.BackgroundTask != "" {
+			out = append(out, l.BackgroundTask)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
 // Confirm binds a tentative lease to a live agent at SubagentStart.
 //
 // Three behaviours here are measured facts about the hook surface (design.md section 4.3),
@@ -864,6 +941,11 @@ func (t *Table) Reap() []Released {
 			why = "session-dead"
 		case l.State == Confirmed && t.opt.Liveness != nil && !t.opt.Liveness.Alive(*l):
 			why = "owner-dead"
+			if l.Kind == Build && l.BackgroundTask != "" {
+				// Its holder is a background task, not a process (GOV-B41). Named apart so
+				// the release log tells a finished background build from a dead session.
+				why = "task-ended"
+			}
 		default:
 			continue
 		}

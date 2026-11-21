@@ -981,6 +981,11 @@ var wantedHooks = []wantedHook{
 	// Claude Code that does not know the event ignores it and runs the other hooks, which was
 	// measured in the same section, so registering it cannot break the gate.
 	{event: "PostToolUseFailure", args: "finish", covers: []string{buildToolName}},
+	// GOV-B41: the end of a background task. A main-thread task that exits is reported as a
+	// <task-notification> prompt, so UserPromptSubmit carries it with the original
+	// tool_use_id (docs/hook-surface.md section 26). No matcher: the event has no tool. An
+	// ordinary prompt costs a process start and no socket round trip.
+	{event: "UserPromptSubmit", args: "settle"},
 	{event: "SubagentStart", args: "confirm"},
 	{event: "SubagentStop", args: "release"},
 	{event: "SessionStart", args: "session start"},
@@ -1104,7 +1109,7 @@ func gateHooksInstalledAt() time.Time {
 	return newest
 }
 
-// checkHooks reports whether all seven hooks are registered and point at a binary that runs.
+// checkHooks reports whether all eight hooks are registered and point at a binary that runs.
 func (d *diagnosis) checkHooks() {
 	sources, err := hookSources()
 	if err != nil {
@@ -1523,7 +1528,7 @@ func (d *diagnosis) checkProtocol() {
 // doctor is invoked. That case says so in its own detail line rather than claiming more than
 // it checked. See section 13.4.
 func (d *diagnosis) checkBinary() {
-	// Only the binaries behind the seven hooks of section 4.1. A governor command wired to
+	// Only the binaries behind the eight hooks of section 4.1. A governor command wired to
 	// some other event by hand is the user's business and not evidence about the gate's
 	// build; counting it would report "the hooks point at 2 different binaries" for a
 	// perfectly good install with one extra hook in it.

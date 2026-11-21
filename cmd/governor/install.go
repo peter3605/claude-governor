@@ -48,7 +48,7 @@ import (
 // All three were verified end to end before a line of this file was written; the write-up
 // is hook-surface.md section 15 and design.md sections 9 and 13.3 are corrected to match.
 //
-// The consequence for this file is the good one: the seven hooks live in a file we own
+// The consequence for this file is the good one: the eight hooks live in a file we own
 // entirely, so the only thing merged into the user's settings.json is the statusLine key.
 // Everything else is a directory that either exists or does not.
 
@@ -190,7 +190,7 @@ func pluginManifest() ([]byte, error) {
 	})
 }
 
-// pluginHooks is hooks/hooks.json: the seven hooks of design.md section 4.1.
+// pluginHooks is hooks/hooks.json: the eight hooks of design.md section 4.1.
 //
 // Generated from wantedHooks rather than written out, so that install and doctor cannot
 // disagree about what a correct install looks like. doctor's whole job is to tell you

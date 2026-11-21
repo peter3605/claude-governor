@@ -147,6 +147,8 @@ a test.
     "PostToolUseFailure": [{ "matcher": "Bash",
                         "hooks": [{ "type": "command",
                                     "command": "${CLAUDE_PLUGIN_ROOT}/bin/governor finish" }] }],
+    "UserPromptSubmit": [{ "hooks": [{ "type": "command",
+                                    "command": "${CLAUDE_PLUGIN_ROOT}/bin/governor settle" }] }],
     "SubagentStart": [{ "hooks": [{ "type": "command",
                                     "command": "${CLAUDE_PLUGIN_ROOT}/bin/governor confirm" }] }],
     "SubagentStop":  [{ "hooks": [{ "type": "command",
@@ -197,6 +199,19 @@ five minutes: Day 7 of [dogfooding.md](dogfooding.md) has two refusals that end 
 seconds of the TTL. An unknown event name is ignored by Claude Code without disturbing the
 other hooks (same section), so a version that predates the event loses only this release
 path, never the gate.
+
+**`UserPromptSubmit` is the eighth hook, and it ends backgrounded builds (GOV-B41).** It runs
+`governor settle` and takes no matcher. A `Bash` build moved to the background, by
+`run_in_background` or by passing its timeout, is still running when its `PostToolUse` fires,
+so that event cannot release it, and before GOV-B41 nothing did until the 300 s TTL. GOV-B33
+found that this was 66% of all build slot-seconds in a week. [hook-surface.md](hook-surface.md)
+§26 measured what does mark the end. When a main-thread task exits, Claude Code submits a
+`<task-notification>` *prompt*, which `UserPromptSubmit` carries along with the original
+`tool_use_id`. An ordinary prompt is dropped before any I/O, so the hook costs a process start
+and nothing more. It is one of three release paths for a backgrounded build, and the only one
+that needs a registration of its own. The other two are `SubagentStop` and the reaper's
+task-file check (§4.3, §5.6c). A subagent's background tasks need neither, because Claude Code kills
+them at `SubagentStop`, which `release` already handles (§4.3).
 
 `timeout` is set explicitly rather than inherited: the default was measured at over 150 s with
 no established ceiling (§10.1), which is not a number to build a wait window on. 30 s gives the
@@ -323,10 +338,15 @@ reaper (2s)   → drop leases past ttl, whose SESSION is gone, or whose owning p
 trusted (§5.6, `hook-surface.md` §19):
 
 ```
-PreToolUse    → acquire CONFIRMED lease   keyed by tool_use_id, ttl 300s
-PostToolUse   → release, IFF tool_response.backgroundTaskId is ABSENT
-SessionEnd    → release all for session
-reaper (2s)   → drop leases past ttl, or whose SESSION is gone
+PreToolUse         → acquire CONFIRMED lease   keyed by tool_use_id, ttl 300s
+PostToolUse        → release, IFF tool_response.backgroundTaskId is ABSENT
+                     otherwise MARK it background: task id + the subagent's agent_id, if any
+PostToolUseFailure → release
+UserPromptSubmit   → release, for each <task-notification> naming its tool_use_id   (GOV-B41)
+SubagentStop       → release background leases that subagent started                (GOV-B41)
+SessionEnd         → release all for session
+reaper (2s)        → drop leases past ttl, or whose SESSION is gone, or (background
+                     leases) whose task's output file ends in its status line        (GOV-B41)
 ```
 
 Three differences from the agent path, all of them measured rather than chosen:
@@ -342,6 +362,16 @@ Three differences from the agent path, all of them measured rather than chosen:
   first within ~50 ms of launch, the second at the timeout, after which the command is
   backgrounded rather than killed. Releasing on those would hand back a slot to a build that
   is still burning CPU, which is the precise failure this governor exists to prevent.
+- **A backgrounded build is released by its real end, and each end has its own event
+  (GOV-B41, `hook-surface.md` §26).** A main-thread task that exits is announced by a
+  `<task-notification>` prompt carrying the original `tool_use_id`, so the release is as exact
+  as `PostToolUse`'s. A subagent's tasks are killed when it stops, so `SubagentStop` ends them.
+  A subagent task that ends while the subagent works on, and a task killed by `TaskStop`, are
+  announced by no hook at all. Both leave `[exited with code N]` or `[killed]` as the last line
+  of the task's output file, and the reaper reads that through the existing
+  `lease.PIDLiveness`. For a backgrounded build the holder *is* the task, so this is the
+  Liveness question, asked of the one implementation. Every way of not finding the file
+  answers "alive", so a Claude Code that moves it costs the TTL and nothing more.
 
 > **This lifecycle was briefly believed to be broken in interactive use, and is not.** GOV-09
 > read a trace showing 62 `SubagentStop` records against zero `SubagentStart` across 25
@@ -1248,14 +1278,17 @@ a posture. It is the measured behaviour.
 | non-zero exit the harness interprets (`grep`, no match) | `PostToolUse` | its real runtime |
 | **command errors** — non-zero exit, failed compile, missing binary | `PostToolUseFailure` (GOV-49; hook-surface.md §25) | its real runtime |
 | **permission refused** — the call needed approval and did not get it | **the reaper, at TTL** — `PreToolUse` fired and took the lease, then neither post event did (§25) | the full TTL |
-| **`run_in_background: true`** | **the reaper, at TTL** | the full TTL |
-| **`timeout` exceeded** (backgrounded, not killed) | **the reaper, at TTL** | the full TTL |
+| **`run_in_background: true`** or **`timeout` exceeded**, on the main thread | the `<task-notification>` on `UserPromptSubmit` (GOV-B41; hook-surface.md §26), or the reaper's task-file check, whichever is first | its real runtime, plus at most one foreground tool call or one 2 s reaper tick |
+| the same, in a **subagent** | the reaper's task-file check, or `SubagentStop`, which kills the task (GOV-B41) | its real runtime, plus at most one 2 s reaper tick |
+| the same, task output file **not found** (e.g. `CLAUDE_CODE_TMPDIR` set) | notification or `SubagentStop` if one comes; otherwise **the reaper, at TTL** | up to the full TTL |
+| a backgrounded build **still running at 300 s** | **the reaper, at TTL** — released while still running | 300 s, then ungoverned |
 | session dies | `SessionEnd`, or the reaper's session check | — |
 
-Three of seven rows are the reaper. Until GOV-49 there were three of six, and the third was
-the failing build, the *normal* state of a build under development. `PostToolUseFailure`
-moved that row to an exact release. What remains on the reaper are commands that are still
-running (background, timeout) and the permission-refused call, which leaks.
+Until GOV-49 three of six rows were the reaper's TTL, and the third was the failing build, the
+*normal* state of a build under development. `PostToolUseFailure` moved that row to an exact
+release. Until GOV-B41 the backgrounded build was the next one, and §5.6c is that decision. What
+remains at the TTL is the permission-refused call, which leaks, a backgrounded build whose task
+file cannot be found, and a backgrounded build that outlives the TTL, which is released early.
 
 **The TTL is therefore a control constant, not a safety margin, and it is set from
 measurement.** Over the corpus `tools/bashcorpus` collects — 20,614 `Bash` calls from 498
@@ -1391,6 +1424,76 @@ lease's weight disagrees with what the machine measures while it's held.
 as anyone's default.
 
 ---
+
+### 5.6c How long a backgrounded build is held (GOV-B41, decided 2026-11-21)
+
+**The question.** A build moved to the background is still running when its `PostToolUse`
+fires, so `finish` cannot release it (§4.3). Before GOV-B41 nothing did until the 300 s TTL.
+GOV-B33's week of `daemon.log` (2026-11-14 to 11-20) had 25 Medium build leases released by the
+reaper at about 301 s, holding 7,528 of 11,346 build slot-seconds (66%). 24 came from one
+earbrief session, and that session took 29 bare "Not enough free build slots" refusals.
+
+**What the transcripts say about those builds.** The session's transcripts hold 31
+build-shaped `Bash` calls backgrounded in that window: 17 that passed their timeout and 14 run
+with `run_in_background`. **All 31 were in subagents; none was on the main thread.** Their
+subagents ran for 434 to 1,302 s, so every one outlived the TTL. Their real runtimes, measured
+from the call to the task notification in the subagent's own transcript, were 19 to 362 s (one
+unknown). 28 of the 30 known ran longer than 120 s, and 4 ran longer than 300 s.
+
+**What ends a backgrounded build, measured on 2.1.327 (hook-surface.md §26):** a
+`<task-notification>` prompt on the main thread only, `SubagentStop` (which kills the
+subagent's tasks), and the status line Claude Code appends to the task's output file when the
+task ends, by any route. A subagent's task that ends while the subagent works on raises **no
+hook at all**: its notification goes into the subagent's context. That is the earbrief case
+exactly, and only the output file sees it.
+
+**The options, costed in both directions over those 31 builds.** "Early" is a lease released
+while its build is still running: the machine oversubscribes and the governor is silently not
+governing. "Late" is slot-seconds held after the build ended: work that would fit is refused.
+Held time is capped by the 300 s TTL in every row, because the TTL stays.
+
+| Option | Released early | Held, slot-seconds | Of which held after the build ended |
+|---|---|---|---|
+| keep the TTL alone (before GOV-B41) | 4 of 31 | 9,300 | 2,341 (25%) |
+| a shorter bounded hold, 120 s | **28 of 30** | — | — |
+| release on the notification and `SubagentStop` only | 4 of 31 | 9,244 | 2,285 |
+| **notification + `SubagentStop` + the task-file check through `lease.Liveness`** | 4 of 31 | ~6,959 | ~0 (one reaper tick, ≤ 2 s) |
+
+**Chosen: the last row.** A shorter bounded hold is the wrong side of the asymmetry §5.6 already
+settled: it would release 28 of 30 of these builds while they were still running. The hook
+signals alone are exact but do not reach this case: the subagents lived past the TTL, so
+`SubagentStop` came too late for all but one. The task file is the only signal that does. `Stop`'s
+`background_tasks` list was measured too (hook-surface.md §26, consequence 5) and is not used:
+the task file already sees a `TaskStop` kill, which was the list's only unique case, and
+reading the list would have cost a hook on every turn plus a rule about subagents' tasks that
+nothing measured. It
+goes through `lease.PIDLiveness`, the existing and only implementation of the seam. For a
+backgrounded build the holder is the task, and "is the holder still running" is the question
+the seam already asks. No second implementation was written.
+
+**What it rests on, and how it fails.** The file is
+`/tmp/claude-<uid>/<cwd slug>/<session>/tasks/<task>.output`. Its last line is
+`[exited with code N]` or `[killed]` once the task has ended. That was measured on 8 of 8 probe
+tasks and 96 of 99 task files on disk, and the 3 without it were held open by a running
+process. It is Claude Code's internal layout, not a hook surface, so every way of not finding
+or not recognising the file answers "alive": a file that is missing, ambiguous, or moved by
+`CLAUDE_CODE_TMPDIR` costs the old TTL and nothing more. A build whose own output's last line
+is literally `[killed]` while it is still running would be released early. No build observed
+does that. The notification path stays, even though the file covers the main thread too,
+because it is a surface Claude Code presents to hooks and does not depend on the file layout.
+
+**What it does not fix: the 4 of 31 that ran past 300 s are still released early by the TTL.**
+The TTL is unchanged. Letting a lease whose task file is found and still running outlive the
+TTL would fix that direction too. It is a change to the reaper's ordering, and it is filed
+as its own story so that the week of `daemon.log` this change produces can size it first.
+Every reaper release of a backgrounded build now carries `bg=<task>` in its log line, so
+`by=reaper:expired bg=…` counts exactly that case, and `by=reaper:task-ended bg=…` counts this
+section's release.
+
+**The refusal names the task.** When a session's own backgrounded build is holding slots, the
+capacity refusal now says which task (`own_background`, §7), under every head, not only the
+all-own one. The earbrief session's 29 refusals were true, but they named nothing, and the
+model had no way to know the cause was itself.
 
 ## 6. Allocation
 
@@ -1656,6 +1759,13 @@ per connection. Deliberately boring — this is a hot path.
 {"v":1,"ok":false,"reason":"capacity","budget":4,"in_use":1,"slots":1,"asking":3.75,
  "cpu":null,"thermal":"nominal","source":"local","denials":1,"cause":"capacity",
  "ceiling":6,"cut":"run queue"}
+// <- refused, and some of what is held is this session's own backgrounded build (GOV-B41).
+//    `own` (GOV-49) is how much of `slots` the session holds; `own_background` names its
+//    background tasks, so the refusal can say which earlier command is holding the slots.
+//    Both additive: an older gate ignores them.
+{"v":1,"ok":false,"reason":"capacity","budget":1,"in_use":1,"slots":1,"asking":1,
+ "cpu":null,"thermal":"nominal","source":"local","denials":1,"cause":"capacity",
+ "own":1,"own_background":["bqodkcz89"]}
 // <- refused, nested fan-out (§6.3); never preceded by a "waiting" line
 {"v":1,"ok":false,"reason":"depth","budget":6,"in_use":4,"cpu":null,
  "thermal":"nominal","source":"local"}
@@ -1673,6 +1783,18 @@ per connection. Deliberately boring — this is a hot path.
 //    PostToolUse. Additive; no protocol bump. It is not `hook_event_name`, the PAYLOAD's key,
 //    so that one name does not mean two things on either side of the hook.
 {"v":1,"op":"finish","session":"abc123","tool_use_id":"toolu_01...","hook_event":"PostToolUseFailure"}
+// -> background (GOV-B41). Sent by `finish` INSTEAD of releasing, when PostToolUse carries
+//    tool_response.backgroundTaskId: the command is still running. It releases nothing; it
+//    names the lease so its real end can find it. `agent_id` is the subagent that ran the
+//    command, absent on the main thread. `task_id` must be 1-32 lowercase letters and digits,
+//    because it is written into the release log; anything else is answered "bad_task_id" and
+//    the lease simply keeps its TTL. An older daemon answers "unknown_op", with the same result.
+{"v":1,"op":"background","session":"abc123","tool_use_id":"toolu_01...","task_id":"bqodkcz89",
+ "agent_id":"ad08ea6c22cc50ff3"}
+// -> settle (GOV-B41). Sent by `settle` on UserPromptSubmit when the prompt is a
+//    <task-notification>. `ended` is every <tool-use-id> in it; each is released exactly as
+//    finish would. A list because one prompt may carry more than one notification.
+{"v":1,"op":"settle","session":"abc123","hook_event":"UserPromptSubmit","ended":["toolu_01..."]}
 // -> session
 {"v":1,"op":"session","action":"start","session":"abc123","pid":48001,"weight":1}
 // -> status (statusline, doctor, /governor)
@@ -1932,7 +2054,7 @@ claude-governor/                  the repo
 
 ~/.claude/skills/build-governor/ the installed plugin, written by `governor install`
 ├── .claude-plugin/plugin.json    name, version, description
-├── hooks/hooks.json              the seven hooks in section 4.1
+├── hooks/hooks.json              the eight hooks in section 4.1
 ├── .mcp.json                     the advisory server in section 8
 ├── skills/heavy-build/SKILL.md   the bundled skill (section 8)
 ├── commands/governor.md          the slash command (section 9.1)
@@ -2364,7 +2486,29 @@ Named so they are not mistaken for settled:
 - What `PostToolUseFailure` does for a command the user **interrupts** (`is_interrupt: true`).
   `finish` releases on it, which is correct only if an interrupted command is also killed.
 - Whether the `backgroundTaskId` discriminator of §19.3 holds for tools other than `Bash`.
+- Whether `SubagentStop` kills the background tasks of an agent that is later resumed with
+  `SendMessage` (§26 measured only agents that were never resumed). If it does not, a resumed
+  agent's backgrounded build is released at its first stop while still running. The task-file
+  check would not catch that, because it only ever releases.
+- Several `<task-notification>`s in one prompt. Every one observed arrived alone; `settle`
+  reads every `<tool-use-id>` regardless.
+- A background task's output-file layout anywhere but `/tmp/claude-<uid>`, and on Linux at all.
+  The task-file check reads "not found" as "alive", so the cost of being wrong is the TTL.
 - Linux: every measurement above is macOS. Re-run the probe on Linux before trusting §10 there.
+
+**No longer on this list, measured 2026-11-20 on 2.1.327 for GOV-B41** (`hook-surface.md` §26):
+§19's "a background task's completion raises no event of any kind" was true only of the events
+§19 registered. A main-thread background task that exits, completed or failed, is announced by a
+`<task-notification>` submitted as a prompt, so `UserPromptSubmit` fires carrying the original
+`tool_use_id`. The notification is delivered at the next turn boundary, so it can be late by one
+foreground tool call, never early. A subagent's background task that ends while the subagent
+runs is announced to the subagent's context and fires no hook. A subagent's background tasks
+are killed when it stops. A task killed by `TaskStop` is announced by nothing. `TaskCompleted`
+and `TaskCreated` belong to the task-list tools and never fired for a shell task. Every ended
+task's output file ends in `[exited with code N]` or `[killed]`. `Stop` and `SubagentStop` list
+live tasks in `background_tasks`, and nothing here relies on that list. A notification also
+arrived in an *interactive* session (this story's own background test run), though whether
+`UserPromptSubmit` fired for it there was not captured.
 
 **No longer on this list, measured 2026-11-10 on 2.1.316 and 2.1.321 for GOV-49**
 (`hook-surface.md` §25): a `Bash` call that errors (`exit 7`, a failed `go build`, a missing
@@ -2385,7 +2529,7 @@ table is the consequence.
 when the command errors; it fires as a launch receipt within ~50 ms for `run_in_background`; a
 command that exceeds its `timeout` is backgrounded rather than killed and its `PostToolUse`
 carries `timedOutAfterMs` beside `backgroundTaskId`; and a background task's completion raises
-no event of any kind.
+none of the events that probe registered. GOV-B41 (above) found the ones it had not.
 
 ### 10.4 The surface is re-confirmed continuously, not re-asserted
 
@@ -2764,7 +2908,7 @@ Uninstall is only verifiable if this list is exhaustive, so it is normative.
 | Path | Written by | Removed by |
 |---|---|---|
 | `~/.claude/skills/build-governor/.claude-plugin/plugin.json` | install | uninstall |
-| `~/.claude/skills/build-governor/hooks/hooks.json` (the seven hooks) | install | uninstall |
+| `~/.claude/skills/build-governor/hooks/hooks.json` (the eight hooks) | install | uninstall |
 | `~/.claude/skills/build-governor/.mcp.json` (the advisory server, section 8) | install | uninstall |
 | `~/.claude/skills/build-governor/commands/governor.md` (the slash command, section 9.1) | install | uninstall |
 | `~/.claude/skills/build-governor/skills/heavy-build/SKILL.md` (the advice's detail, section 8) | install | uninstall |
