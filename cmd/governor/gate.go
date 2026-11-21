@@ -189,6 +189,8 @@ type acquireResponse struct {
 	// Own is how much of Slots the asking session holds itself. See refuseReply.Own. Zero
 	// from a daemon too old to send it, which prints the sentences it always printed.
 	Own float64 `json:"own"`
+	// OwnBackground names the session's own background tasks holding build leases (GOV-B41).
+	OwnBackground []string `json:"own_background"`
 }
 
 // hookPayload is the PreToolUse payload, measured in GOV-01 and recorded in
@@ -698,6 +700,7 @@ func denyReason(resp acquireResponse, in intent) string {
 	}
 	b.WriteString("). ")
 	if in.kind == "build" {
+		b.WriteString(ownBackgroundClause(resp.OwnBackground))
 		b.WriteString(buildEscalation(resp.Denials, why))
 	} else {
 		b.WriteString(escalation(resp.Denials))
@@ -734,6 +737,28 @@ const (
 	// same room (GOV-B31). The strict FIFO of design.md section 6.2 serves them first.
 	refusedQueued
 )
+
+// ownBackgroundClause names this session's own background tasks that are holding build
+// slots, or returns "" when the daemon named none (GOV-B41).
+//
+// It is printed under every head, not only the all-own one. The earbrief session of
+// 2026-11-14 to 11-20 took 29 refusals reading "Not enough free build slots" while its own
+// backgrounded test runs held most of those slots. That was true, and it left the model no way
+// to know the cause was itself. The task ID is what it needs to wait for the task's
+// notification or stop it, rather than retry blind.
+func ownBackgroundClause(tasks []string) string {
+	switch len(tasks) {
+	case 0:
+		return ""
+	case 1:
+		return "This session's own background task " + tasks[0] + " is still running and " +
+			"holding build slots; they come back when it finishes or is stopped. "
+	default:
+		return "This session's own background tasks " + strings.Join(tasks, ", ") + " are " +
+			"still running and holding build slots; they come back when those finish or are " +
+			"stopped. "
+	}
+}
 
 // ownsEverything reports whether the asking session holds every held slot. The tolerance is
 // for float sums of 3.75 and 0.08, not a policy: a session holding 3.83 of 3.83 owns all of

@@ -64,12 +64,24 @@ type Lease struct {
 	Class string
 	// ToolUseID is the PreToolUse key a Build lease is released by. Empty on an Agent
 	// lease, whose SubagentStart carries no such key and must be correlated FIFO instead.
-	ToolUseID    string
-	GrantedAt    time.Time
-	ExpiresAt    time.Time
-	AgentID      string
-	OwnerPID     int
-	OwnerStarted time.Time
+	ToolUseID string
+	// BackgroundTask is the harness's task ID for a Build lease whose command was moved to
+	// the background, either by run_in_background or by passing its timeout (GOV-B41). It is
+	// set by MarkBackground from the PostToolUse that carried tool_response.backgroundTaskId,
+	// and it is what the reaper's Liveness and a refusal find the lease by. Empty while the
+	// command runs in the foreground, and on every Agent lease.
+	BackgroundTask string
+	// BackgroundAgent is the subagent that backgrounded the command, or empty when the main
+	// thread did. It is NOT AgentID: that field indexes an Agent lease for SubagentStop's
+	// release, and a build is not an agent. It is kept apart because the two end differently.
+	// A subagent's background tasks are killed when the subagent stops (hook-surface.md
+	// section 26), and the main thread's are reported by a task notification.
+	BackgroundAgent string
+	GrantedAt       time.Time
+	ExpiresAt       time.Time
+	AgentID         string
+	OwnerPID        int
+	OwnerStarted    time.Time
 }
 
 // Liveness answers whether the holder of a lease is still running.

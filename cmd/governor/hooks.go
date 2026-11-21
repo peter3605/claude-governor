@@ -10,6 +10,7 @@ import (
 	"net"
 	"os"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -63,10 +64,14 @@ type hookRequest struct {
 	// (GOV-B29, request.HookEvent).
 	HookEvent string `json:"hook_event,omitempty"`
 
+	// background, settle (GOV-B41): see the daemon's request struct for what each means.
+	TaskID string   `json:"task_id,omitempty"`
+	Ended  []string `json:"ended,omitempty"`
+
 	// confirm
 	Lease string `json:"lease,omitempty"`
 
-	// confirm, release
+	// confirm, release, background
 	AgentID string `json:"agent_id,omitempty"`
 
 	// confirm, session start
@@ -114,6 +119,10 @@ type lifecyclePayload struct {
 	// HookEventName is the fallback for which session action this is, when the subcommand
 	// was invoked without one.
 	HookEventName string `json:"hook_event_name"`
+	// Prompt is UserPromptSubmit's text. It is read for one shape only: the
+	// <task-notification> Claude Code submits when a main-thread background task ends
+	// (hook-surface.md section 26).
+	Prompt string `json:"prompt"`
 }
 
 func runConfirm(_ []string, _ io.Writer, stderr io.Writer) int {
@@ -126,6 +135,10 @@ func runRelease(_ []string, _ io.Writer, stderr io.Writer) int {
 
 func runFinish(_ []string, _ io.Writer, stderr io.Writer) int {
 	return lifecycleHook(os.Stdin, stderr, transport.Dial{}, hookBudget, buildFinish)
+}
+
+func runSettle(_ []string, _ io.Writer, stderr io.Writer) int {
+	return lifecycleHook(os.Stdin, stderr, transport.Dial{}, hookBudget, buildSettle)
 }
 
 func runSession(args []string, stdout io.Writer, stderr io.Writer) int {
@@ -203,13 +216,17 @@ func buildRelease(p lifecyclePayload, _ io.Writer) (hookRequest, bool) {
 //     has ended, so there is no backgroundTaskId to hold it for.
 //   - PRESENT WHILE THE COMMAND IS STILL RUNNING when it was backgrounded (a launch receipt
 //     ~50 ms in) or when it exceeded its timeout, after which the harness backgrounds it
-//     rather than killing it. Both carry a backgroundTaskId, and nothing whatsoever fires
-//     when the work behind one actually ends.
+//     rather than killing it. Both carry a backgroundTaskId. Section 19 found nothing that
+//     fires when the work behind one ends. Section 26 (GOV-B41) re-measured with every
+//     event registered and found what that probe had not listened for: a
+//     <task-notification> prompt on the main thread, and SubagentStop killing a subagent's
+//     tasks. buildSettle and the daemon's release handle those.
 //
 // So releasing on every PostToolUse would hand a slot back to a build that is still burning
 // CPU, which is precisely the failure this governor exists to prevent. A lease held too long
 // costs throughput and expires on its own; one released too early is the governor silently
-// not governing. Those are not the same size of mistake.
+// not governing. Those are not the same size of mistake. A backgrounded build is therefore
+// only MARKED here (the `background` op), and released by its real end.
 func buildFinish(p lifecyclePayload, diag io.Writer) (hookRequest, bool) {
 	if p.ToolName != buildToolName {
 		// The matcher should have kept these out, but a matcher is configuration and
@@ -226,9 +243,18 @@ func buildFinish(p lifecyclePayload, diag io.Writer) (hookRequest, bool) {
 		return hookRequest{}, false
 	}
 	if id := p.ToolResponse.BackgroundTaskID; id != "" {
+		// Still running, so still held. What changes since GOV-B41 is that the lease is told
+		// its task's name, so the end of that task can find it: see buildSettle.
 		fmt.Fprintf(diag, "governor finish: %s is still running as background task %s; holding the lease\n",
 			p.ToolUseID, id)
-		return hookRequest{}, false
+		return hookRequest{
+			V: protocolVersion, Op: "background",
+			Principal: localPrincipal(),
+			Session:   p.SessionID,
+			ToolUseID: p.ToolUseID,
+			TaskID:    id,
+			AgentID:   p.AgentID,
+		}, true
 	}
 	return hookRequest{
 		V: protocolVersion, Op: "finish",
@@ -237,6 +263,80 @@ func buildFinish(p lifecyclePayload, diag io.Writer) (hookRequest, bool) {
 		ToolUseID: p.ToolUseID,
 		HookEvent: p.HookEventName,
 	}, true
+}
+
+// notificationTag opens the prompt Claude Code submits when a background task ends.
+const notificationTag = "<task-notification>"
+
+// maxEndedPerPrompt bounds how many tool_use_ids one prompt can release. Every notification
+// measured arrived alone. The bound is there so that a pasted wall of text cannot become a
+// request larger than the daemon's read limit.
+const maxEndedPerPrompt = 32
+
+// buildSettle reports main-thread background tasks that have ended, from UserPromptSubmit
+// (GOV-B41, hook-surface.md section 26).
+//
+// When a main-thread background task exits, completed or failed, Claude Code submits a
+// <task-notification> as a prompt, and UserPromptSubmit fires with it. The notification
+// carries the ORIGINAL tool_use_id, which keys the lease exactly as PostToolUse does, so the
+// release needs no correlation.
+//
+// It is one of three ways a backgrounded build ends, and the only one that needs a hook of
+// its own. A subagent's tasks are killed at SubagentStop, which `release` already handles. Any
+// task that has ended, by any route, also leaves a status line in its output file, which the
+// reaper reads through lease.PIDLiveness. That file is the only signal for a subagent task
+// that ends while the subagent works on, because its notification fires no hook. This hook
+// remains because the notification is a surface Claude Code presents to hooks, and the file
+// layout is not: the hook still works when CLAUDE_CODE_TMPDIR moves the files.
+//
+// Every other prompt is the common case and costs no socket round trip. A prompt is only a
+// notification if it STARTS with the tag: a person quoting one in the middle of a message
+// is not a task ending, and the daemon checks the session either way.
+func buildSettle(p lifecyclePayload, diag io.Writer) (hookRequest, bool) {
+	ended := notifiedToolUseIDs(p.Prompt)
+	if len(ended) == 0 {
+		return hookRequest{}, false
+	}
+	fmt.Fprintf(diag, "governor settle: task notification for %s\n", strings.Join(ended, ","))
+	return hookRequest{
+		V: protocolVersion, Op: "settle",
+		Principal: localPrincipal(),
+		Session:   p.SessionID,
+		HookEvent: "UserPromptSubmit",
+		Ended:     ended,
+	}, true
+}
+
+// notifiedToolUseIDs returns the <tool-use-id> of every task notification in prompt, or nil
+// when the prompt is not one. The format is hook-surface.md section 26.2's, verbatim:
+//
+//	<task-notification>
+//	<task-id>bu0tx3h7t</task-id>
+//	<tool-use-id>toolu_012EoxuPWZFQrYGYxjfBjMAH</tool-use-id>
+//	...
+func notifiedToolUseIDs(prompt string) []string {
+	if !strings.HasPrefix(strings.TrimSpace(prompt), notificationTag) {
+		return nil
+	}
+	const open, closing = "<tool-use-id>", "</tool-use-id>"
+	var ids []string
+	rest := prompt
+	for len(ids) < maxEndedPerPrompt {
+		i := strings.Index(rest, open)
+		if i < 0 {
+			break
+		}
+		rest = rest[i+len(open):]
+		j := strings.Index(rest, closing)
+		if j < 0 {
+			break
+		}
+		if id := strings.TrimSpace(rest[:j]); id != "" && len(id) <= 128 {
+			ids = append(ids, id)
+		}
+		rest = rest[j+len(closing):]
+	}
+	return ids
 }
 
 // buildSession registers or drops a whole session.

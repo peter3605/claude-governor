@@ -51,6 +51,7 @@ var commands = []command{
 	{"confirm", "SubagentStart hook: bind a granted lease to a live agent", runConfirm},
 	{"release", "SubagentStop hook: return a lease to the pool", runRelease},
 	{"finish", "PostToolUse hook: return a build lease when its command completes", runFinish},
+	{"settle", "UserPromptSubmit hook: return build leases whose background task ended", runSettle},
 	{"session", "SessionStart/SessionEnd hook: register or drop a session", runSession},
 	{"status", "print the current budget and its holders", runStatus},
 	{"limit", "pin the budget until it expires or is released", runLimit},

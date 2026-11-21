@@ -349,27 +349,41 @@ func TestTheFinishHookFailsOpenToo(t *testing.T) {
 		}},
 	}
 
-	payload := `{"session_id":"s","hook_event_name":"PostToolUse","tool_name":"Bash",` +
-		`"tool_use_id":"toolu_x","tool_response":{"stdout":"","stderr":""}}`
+	// GOV-B41 added two more requests on these paths: the background mark `finish` sends for a
+	// backgrounded command, and `settle` on a task-notification prompt. Each opens a socket,
+	// so each is held to the same contract.
+	hooks := []struct {
+		name    string
+		payload string
+		build   builder
+	}{
+		{"finish", `{"session_id":"s","hook_event_name":"PostToolUse","tool_name":"Bash",` +
+			`"tool_use_id":"toolu_x","tool_response":{"stdout":"","stderr":""}}`, buildFinish},
+		{"finish, backgrounded", `{"session_id":"s","hook_event_name":"PostToolUse","tool_name":"Bash",` +
+			`"tool_use_id":"toolu_x","tool_response":{"stdout":"","backgroundTaskId":"bqodkcz89"}}`, buildFinish},
+		{"settle", notificationPayload("s", "toolu_x", "bqodkcz89", "completed"), buildSettle},
+	}
 
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			t.Setenv(transport.EndpointEnv, tc.endpoint(t))
+	for _, h := range hooks {
+		for _, tc := range cases {
+			t.Run(h.name+"/"+tc.name, func(t *testing.T) {
+				t.Setenv(transport.EndpointEnv, tc.endpoint(t))
 
-			var stderr strings.Builder
-			var code int
-			took := timed(func() {
-				code = lifecycleHook(strings.NewReader(payload), &stderr,
-					transport.Dial{}, hookBudget, buildFinish)
+				var stderr strings.Builder
+				var code int
+				took := timed(func() {
+					code = lifecycleHook(strings.NewReader(h.payload), &stderr,
+						transport.Dial{}, hookBudget, h.build)
+				})
+				if code != 0 {
+					t.Errorf("exit code = %d, want 0", code)
+				}
+				if took.exceeds(failOpenCeiling) {
+					t.Errorf("took %v, want under %v: this hook runs on every Bash call or prompt",
+						took, failOpenCeiling)
+				}
 			})
-			if code != 0 {
-				t.Errorf("exit code = %d, want 0", code)
-			}
-			if took.exceeds(failOpenCeiling) {
-				t.Errorf("took %v, want under %v: this hook runs on every Bash call",
-					took, failOpenCeiling)
-			}
-		})
+		}
 	}
 }
 
@@ -408,9 +422,11 @@ func TestAStillRunningCommandKeepsItsLease(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			dialed := make(chan struct{}, 1)
-			endpoint := listenerFunc(t, func(c net.Conn, _ []byte) {
-				dialed <- struct{}{}
+			// GOV-B41: the hook now TELLS the daemon the command was backgrounded, so that the
+			// task's real end can find the lease. What it must never send is a release.
+			sent := make(chan []byte, 1)
+			endpoint := listenerFunc(t, func(c net.Conn, line []byte) {
+				sent <- line
 				c.Write([]byte(`{"v":1,"ok":true}` + "\n"))
 			})
 			t.Setenv(transport.EndpointEnv, endpoint)
@@ -421,10 +437,25 @@ func TestAStillRunningCommandKeepsItsLease(t *testing.T) {
 			lifecycleHook(strings.NewReader(payload), &stderr, transport.Dial{}, hookBudget, buildFinish)
 
 			select {
-			case <-dialed:
-				t.Error("the lease was returned while the command was still running; " +
-					"a backgroundTaskId means the work carries on after PostToolUse")
+			case line := <-sent:
+				var req struct {
+					Op     string `json:"op"`
+					TaskID string `json:"task_id"`
+				}
+				if err := json.Unmarshal(line, &req); err != nil {
+					t.Fatalf("the hook sent %q: %v", line, err)
+				}
+				if req.Op != "background" {
+					t.Errorf("the hook sent op %q while the command was still running; a "+
+						"backgroundTaskId means the work carries on after PostToolUse, so the only "+
+						"thing to send is the background mark", req.Op)
+				}
+				if req.TaskID == "" {
+					t.Errorf("the background mark carries no task_id: %s", line)
+				}
 			case <-time.After(50 * time.Millisecond):
+				t.Error("the hook did not mark the lease as backgrounded, so nothing can release " +
+					"it when the task really ends")
 			}
 			if !strings.Contains(stderr.String(), "still running") {
 				t.Errorf("stderr = %q, want it to say the lease was held", stderr.String())

@@ -229,6 +229,8 @@ const (
 	releasedBySessionEnd  = "SessionEnd"
 	releasedByReaper      = "reaper"
 	releasedByHandback    = "handback"
+	// GOV-B41: a task notification, which arrives as a UserPromptSubmit.
+	releasedByNotification = "task-notification"
 )
 
 // releaseLine describes one released lease.
@@ -247,8 +249,16 @@ func releaseLine(r lease.Released, by string) string {
 	if r.Why != "" {
 		by += ":" + r.Why
 	}
-	return fmt.Sprintf("release session=%s kind=%s class=%s weight=%.2f held=%s by=%s",
+	line := fmt.Sprintf("release session=%s kind=%s class=%s weight=%.2f held=%s by=%s",
 		r.Session, r.Kind, class, r.Weight, r.Held().Round(time.Millisecond), by)
+	// bg= is what lets a week of this log answer GOV-B41's question: of the builds the reaper
+	// expired, which had been moved to the background. It is appended last and only when
+	// set, so every field before it keeps its position and tools/shapecost reads it
+	// unchanged.
+	if r.BackgroundTask != "" {
+		line += " bg=" + r.BackgroundTask
+	}
+	return line
 }
 
 // finishedBy names the hook that finished a build, from what the hook sent.
