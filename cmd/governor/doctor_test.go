@@ -540,6 +540,42 @@ func TestDoctorNamesTheHooksThatAreNotRegistered(t *testing.T) {
 	}
 }
 
+// TestDoctorNamesTheFileTheHooksAreIn is GOV-B47. Between `brew upgrade` and `governor
+// install`, the plugin's hooks.json held seven of eight hooks and doctor said the eighth was
+// "not registered in ~/.claude/settings.json" — a file install has not written hooks into
+// since the plugin route, while the pass line of the same check named hooks.json. Someone who
+// followed it and added the hook to settings.json by hand would have registered it twice.
+func TestDoctorNamesTheFileTheHooksAreIn(t *testing.T) {
+	t.Run("plugin hooks.json missing one", func(t *testing.T) {
+		w := newWorld(t)
+		// The tree install writes today, not the world's legacy pluginRoot.
+		root := filepath.Join(w.home, ".claude", "skills", pluginName)
+		copyOfSelf(t, mkdir(t, filepath.Join(root, "bin")), "governor")
+		hooksJSON := filepath.Join(root, "hooks", "hooks.json")
+		w.writeHooks(hooksJSON, "${CLAUDE_PLUGIN_ROOT}/bin/governor", goodHooks()[:len(wantedHooks)-1])
+
+		_, found, out := doctor(t)
+		got := want(t, found, "hooks", "FAIL", out)
+		if !strings.Contains(got.detail, short(hooksJSON)) {
+			t.Errorf("the finding does not name the hooks.json the hooks are in (%s): %q", short(hooksJSON), got.detail)
+		}
+		if strings.Contains(got.detail, "settings.json") {
+			t.Errorf("the finding sends the reader to settings.json, which install does not write hooks into: %q", got.detail)
+		}
+	})
+	t.Run("nothing registered anywhere", func(t *testing.T) {
+		w := newWorld(t)
+		_, found, out := doctor(t)
+		got := want(t, found, "hooks", "FAIL", out)
+		if hooksJSON := filepath.Join(w.home, ".claude", "skills", pluginName, "hooks", "hooks.json"); !strings.Contains(got.detail, short(hooksJSON)) {
+			t.Errorf("with no hooks anywhere, the finding does not name the file install writes (%s): %q", short(hooksJSON), got.detail)
+		}
+		if got.fix != governorCommand("install") {
+			t.Errorf("the fix is %q, want %q", got.fix, governorCommand("install"))
+		}
+	})
+}
+
 // TestDoctorNamesAHookWiredToTheWrongSubcommand separates two failures that read identically
 // from the outside.
 //
