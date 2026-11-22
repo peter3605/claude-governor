@@ -1223,11 +1223,14 @@ func TestNoDaemonStartsNothing(t *testing.T) {
 func TestDoctorPassesEveryCheckAfterAnInstall(t *testing.T) {
 	p := stagedHome(t)
 
+	// Before the install, not after it succeeds (GOV-B44): an install that fails can do so
+	// after it has already started the daemon, and a cleanup registered only on success
+	// leaves that daemon to sockDir's backstop.
+	t.Cleanup(func() { runReal(t, p, "uninstall", "--purge") })
 	code, stdout, stderr := runReal(t, p, "install")
 	if code != 0 {
 		t.Fatalf("governor install: exit %d\nstdout: %s\nstderr: %s", code, stdout, stderr)
 	}
-	t.Cleanup(func() { runReal(t, p, "uninstall", "--purge") })
 
 	code, out, _ := runReal(t, p, "doctor")
 	// Zero, or GOV-30's "could not verify". A freshly installed machine has not spawned
