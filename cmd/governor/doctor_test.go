@@ -1218,28 +1218,32 @@ func TestDoctorIsQuietWhenNothingIsCuttingTheBudget(t *testing.T) {
 // calibrate` or `governor doctor` in one must go through governorCommand instead.
 func TestEveryDoctorFixLineNamesABinaryThatWorks(t *testing.T) {
 	fset := token.NewFileSet()
-	f, err := parser.ParseFile(fset, "doctor.go", nil, 0)
-	if err != nil {
-		t.Fatalf("parse doctor.go: %v", err)
-	}
-	bare := regexp.MustCompile(`(^|[^-:\w/])governor (install|calibrate|doctor|uninstall)\b`)
-	// Not commands a person is told to type: the flag set's own name, and the sentence for a
-	// check that forgot its fix.
-	allowed := map[string]bool{
-		`"governor doctor"`: true,
-		`"no fix recorded for this check — that is a bug in governor doctor"`: true,
-	}
-	ast.Inspect(f, func(n ast.Node) bool {
-		lit, ok := n.(*ast.BasicLit)
-		if !ok || lit.Kind != token.STRING || allowed[lit.Value] {
+	// staletrace.go is GOV-B42's check, and its fix lines name `trace install` and `trace
+	// uninstall`: the same rule applies to every file a doctor check lives in.
+	for _, file := range []string{"doctor.go", "staletrace.go"} {
+		f, err := parser.ParseFile(fset, file, nil, 0)
+		if err != nil {
+			t.Fatalf("parse %s: %v", file, err)
+		}
+		bare := regexp.MustCompile(`(^|[^-:\w/])governor (trace )?(install|calibrate|doctor|uninstall)\b`)
+		// Not commands a person is told to type: the flag set's own name, and the sentence for a
+		// check that forgot its fix.
+		allowed := map[string]bool{
+			`"governor doctor"`: true,
+			`"no fix recorded for this check — that is a bug in governor doctor"`: true,
+		}
+		ast.Inspect(f, func(n ast.Node) bool {
+			lit, ok := n.(*ast.BasicLit)
+			if !ok || lit.Kind != token.STRING || allowed[lit.Value] {
+				return true
+			}
+			if bare.MatchString(lit.Value) {
+				t.Errorf("%s: %s names bare `governor`, which may resolve to another copy on PATH; "+
+					"spell it with governorCommand", fset.Position(lit.Pos()), lit.Value)
+			}
 			return true
-		}
-		if bare.MatchString(lit.Value) {
-			t.Errorf("%s: %s names bare `governor`, which may resolve to another copy on PATH; "+
-				"spell it with governorCommand", fset.Position(lit.Pos()), lit.Value)
-		}
-		return true
-	})
+		})
+	}
 }
 
 // governorCommand is what makes those lines work, and its rule is a property rather than a

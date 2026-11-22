@@ -2859,6 +2859,61 @@ state directory after an uninstall. It writes nothing and adds no row to §13.3.
   on the dev machine were in, and exactly the case worth reporting.
 - It writes nothing, and adds no row to §13.3.
 
+GOV-B42 added `trace`, for Phase 0 instrumentation that has outlived the build it came from.
+On 2026-11-20 this machine's `settings.json` still registered the five trace hooks a
+September install had written, all naming that September binary at
+`~/.local/share/claude-governor/bin/governor`, while the governor's own hooks ran the 0.1.6
+plugin copy. The sampler the old `trace ensure` kept restarting predated GOV-B26's log
+rotation, so once the 0.1.6 gate rotated `samples.jsonl`, it went on writing to the replaced
+inode: 1.17 GB nothing could read, and the 1 Hz samples that would have explained three nights
+of load averages of 40 to 70. Doctor passed 18 of 18 throughout. Fixing the sampler could not
+reach that machine, because its hooks named a different binary.
+
+- **What it compares.** Every trace hook in `settings.json` (read, never written), and every
+  running `governor trace sample` that holds a log in this install's state directory, against
+  the binary the governor hooks run. "Same build" means the same file or byte-identical
+  contents, not the same `version` output, because every development build reports
+  `0.0.0-dev` and two of those are exactly the case that went unseen. A Homebrew `governor`
+  beside the plugin's copy of it is the same build and passes.
+- **What it reads on each sampler** is the descriptor, not the name. A descriptor reports its
+  file's *current* name, so a rotated-away log shows as `samples.jsonl.1` and an unlinked one
+  keeps its last name with a link count of 0 (measured with `lsof +L` on darwin, 2026-11-21).
+  The check takes every `samples.jsonl*` descriptor in the live log's directory and fails it
+  if its link count is 0 or its inode is not the live path's. Linux reads `/proc/<pid>/fd`;
+  darwin runs `lsof` on the user's own process, as `strays` does, without sudo.
+- **A dead descriptor is a `FAIL`; a different build is a `warn`.** A sampler writing to a file
+  no longer on disk is losing data and growing an invisible file now. A trace hook or sampler
+  from another build is the condition that produces that at the next rotation. That is worth
+  acting on, but nothing is broken yet, and it must not fail `governor install`'s own
+  verification.
+- **Samplers are scoped to this state directory.** A sampler writing another
+  `GOVERNOR_STATE_DIR`'s log is another install's business, and comparing its inode with this
+  install's live log would call a healthy file "replaced". The first draft did exactly that and
+  the install tests caught it: their doctor runs as a subprocess against a temporary state
+  directory, on a machine whose real sampler writes `~/.claude/governor`.
+
+**The way out is `trace install` from the current binary, or `trace uninstall`, and nothing
+does it unprompted.** Since GOV-B42, `trace install` *re-points*: it removes any trace hook
+that names another binary, then adds what is missing, through the same backup-first, atomic,
+surgical write as before. Before that it added an entry only when its exact command was
+missing, so running it from a new binary put five hooks **beside** the five stale ones. Both
+sets then fired, which made "re-install" a trap rather than a fix. The sampler the old build
+started still holds `sampler.lock`, so the next `trace ensure` defers to it rather than
+starting the new one, and the fix line therefore ends with the PID to stop.
+
+Neither `install` nor an upgrade touches trace hooks on its own, and that is decided rather than
+left out:
+
+- `governor install` promises that the only key it touches in `settings.json` is `statusLine`
+  (§13.3, and the README says so to every user). Trace hooks are a separate family with their
+  own installer and uninstaller, and reaching into them from `install` would break that promise
+  to fix a state only Phase 0 users can be in.
+- Trace is opt-in measurement. Re-pointing it changes which binary observes every session, and
+  removing it stops a data collection the person chose to run. Either is that person's call,
+  and doctor's job is to put it in front of them with the command to type, not to make it.
+
+It writes nothing, and adds no row to §13.3.
+
 "Stranded" is also a precise thing rather than a feeling. The reaper collects a lease three
 ways — its TTL expires, its session's process is gone, or `Liveness` says its owner is gone —
 and the last two need an owning PID, bound at `session start` and at `confirm`. A lease held
@@ -3115,12 +3170,23 @@ listed is a path uninstall silently stops covering. All of them go when Phase 1 
 | `~/.claude/governor/sampler.log` | `trace sample` | by hand |
 | `bin/governor` in the repo, staged by hand in Phase 0 | by hand | by hand — GOV-21's `governor install` supersedes it, and installs into the plugin instead |
 
+`~/.local/share/claude-governor/bin/governor` is **not** a row, and that is decided (GOV-B42).
+Phase 0 staged a binary there by hand (`hook-surface.md` §13 records the `cp`); this table
+listed it until GOV-21 retired the row, and no shipped command has written it since. Only a
+machine that ran Phase 0 from source has one, and the trace hooks are what name it. Removing
+those with `trace uninstall` (or re-pointing them with `trace install`) is what makes the file
+inert. Teaching `uninstall` to delete a file it never wrote, at a path a person chose by hand,
+would be the blind removal this section exists to prevent. Doctor's `trace` finding names it
+while anything still runs it.
+
 The five hooks are `SubagentStart`, `SubagentStop`, `SessionStart`, and — added by GOV-27 to
 settle whether either fires interactively — `PostToolUse` and `Stop`. `PostToolUse` is
 registered with an `Agent|Task` matcher and that matcher is load-bearing rather than tidy:
 unmatched, it would run this binary on every tool call in every session.
 
-`trace uninstall` removes our hook entries **surgically** rather than restoring the backup
+`trace install` **re-points** rather than adds (GOV-B42): a trace hook naming another binary is
+removed in the same write that adds this binary's, so a second install from a newer build
+leaves five hooks, not ten. `trace uninstall` removes our hook entries **surgically** rather than restoring the backup
 wholesale, because a wholesale restore would destroy anything the user added to
 `settings.json` in the meantime. It then compares the result against the backup and, when
 nothing else changed, writes the backup's original bytes — so the ordinary case is
