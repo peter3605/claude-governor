@@ -49,6 +49,45 @@ config schema 1      the "schema" key in ~/.claude/governor/config.json
 Releases are fixed by a new patch version and never by moving a tag. [0.1.1](#011---2026-10-29)
 is the first example.
 
+## [0.1.7] - 2026-11-22
+
+Protocol and config schema are unchanged (`protocol 1`, `config schema 1`). Upgrading takes
+no extra step beyond the usual one: rerun the install one-liner, or `brew upgrade governor`
+followed by `$(brew --prefix)/opt/governor/bin/governor install`. That install registers an
+eighth hook (below), and until you run it, a backgrounded build keeps its slot the old way.
+Restart open Claude Code sessions afterwards, because a session binds its hooks when it starts.
+
+### Added
+
+- **`governor doctor` has a `trace` check.** It finds Phase 0 instrumentation left behind
+  by an older binary: `governor trace` hooks in `~/.claude/settings.json` that run a
+  different build from your governor hooks, and a `governor trace sample` process from
+  another build or one still writing to a log file that was rotated or deleted. A sampler
+  writing to a deleted file grows without limit and nothing else would show it, so that
+  case is a failure. The fix line names the command to run.
+  ([#103](https://github.com/peter3605/claude-governor/pull/103))
+
+### Changed
+
+- **`governor trace install` replaces trace hooks from another binary.** Before, it added
+  its own hooks next to the old ones. Now it removes any trace hooks that name a different
+  binary in the same backed-up write. `governor install` and `brew upgrade` still never
+  touch trace hooks, because tracing is opt-in.
+  ([#103](https://github.com/peter3605/claude-governor/pull/103))
+
+### Fixed
+
+- **A build Claude Code moves to the background gives its slot back when it really ends.**
+  This covers a build that passes its Bash timeout and a build run with
+  `run_in_background`. Before, such a build held its slot for the full five-minute limit,
+  however soon it finished, and the same session's next build was refused with the bare
+  "Not enough free build slots". The slot is now released when Claude Code announces that
+  the task ended, when the subagent that started it stops, or when the task's output file
+  shows it exited. Until then, a refusal caused by it names the background task. A
+  backgrounded build still running at five minutes is released at that point, as before.
+  The new hook is a `UserPromptSubmit` registration.
+  ([#102](https://github.com/peter3605/claude-governor/pull/102))
+
 ## [0.1.6] - 2026-11-14
 
 Protocol and config schema are unchanged (`protocol 1`, `config schema 1`). Upgrading takes
