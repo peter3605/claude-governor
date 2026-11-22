@@ -1118,9 +1118,11 @@ func (d *diagnosis) checkHooks() {
 			"set HOME, then: "+governorCommand("install"))
 		return
 	}
-	// The first source is the settings file, and it is the one a report names: it is where
-	// install merges the hooks and the only one of the two a user edits by hand.
-	settings := sources[0].path
+	// The file install writes the hooks into: the plugin tree's hooks.json. settings.json is
+	// sources[0] and is still read (an install from before the plugin route left hooks there),
+	// but install merges only a statusLine key into it (design.md section 13.3), so a report
+	// must never send someone there to add a hook by hand. GOV-B47.
+	installed := sources[1].path
 
 	var unreadable []string
 	seen := map[string]bool{}
@@ -1181,8 +1183,14 @@ func (d *diagnosis) checkHooks() {
 	// second round after fixing it.
 	var problems []string
 	if len(missing) > 0 {
+		// Name the files the other hooks were found in, which is what the pass line names, so
+		// the two agree. With none found anywhere, name the file install writes.
+		where := shortList(sortedKeys(seen))
+		if len(seen) == 0 {
+			where = short(installed)
+		}
 		problems = append(problems, fmt.Sprintf("%d of %d not registered in %s: %s",
-			len(missing), len(wantedHooks), short(settings), strings.Join(missing, ", ")))
+			len(missing), len(wantedHooks), where, strings.Join(missing, ", ")))
 	}
 	problems = append(problems, broken...)
 	// The gate in more than one file is not redundancy. Each loaded registration runs, so
