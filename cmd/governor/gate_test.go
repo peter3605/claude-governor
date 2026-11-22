@@ -90,12 +90,25 @@ func sockDir(t *testing.T) string {
 	if err != nil {
 		t.Fatalf("temp dir: %v", err)
 	}
-	// GOV-B11: registered before the removal is queued, so that if a test points a daemon at
-	// this directory and fails before it can reap it, TestMain still has a pid file to find.
-	// Removing the tree with a daemon still listening inside it is what turns a leaked
-	// process into an undiscoverable one.
 	registerStateDir(dir)
-	t.Cleanup(func() { os.RemoveAll(dir) })
+	// Kill, THEN remove (GOV-B44). Removing the tree with a daemon still listening inside it
+	// is what turns a leaked process into an undiscoverable one, and the registration above
+	// cannot prevent that on its own: this cleanup runs when the test ends, before TestMain's
+	// sweep, so by the time the sweep walked here the pid file was already gone. The comment
+	// that stood here claimed the opposite, and a failing install left daemons running for it.
+	//
+	// Registered first, so it runs LAST of the test's cleanups: a test's own uninstall or
+	// stop has had its turn, and anything still running here really was leaked. That is
+	// reported as a failure, not mopped up quietly — a backstop that hides the bug it
+	// compensates for is how four daemons sat on the dev machine for 28 days (GOV-B11).
+	t.Cleanup(func() {
+		if killed := reapDaemonsUnder(dir); len(killed) > 0 {
+			t.Errorf("reaped %d daemon(s) this test left running under %s:\n  %s\n"+
+				"That is a reaping bug in this test, not a clean run.",
+				len(killed), dir, strings.Join(killed, "\n  "))
+		}
+		os.RemoveAll(dir)
+	})
 	return dir
 }
 

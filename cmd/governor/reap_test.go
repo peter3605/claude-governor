@@ -56,8 +56,10 @@ func registerStateDir(dir string) {
 // reapStrayDaemons kills every daemon still running under a registered state directory.
 //
 // It runs from TestMain after m.Run() returns, which covers every way a test can end that
-// leaves the process alive — a pass, a t.Fatal, a t.Skip, a failed assertion — and is the
-// last point at which the pid files still exist. It does NOT cover a panic that aborts the
+// leaves the process alive — a pass, a t.Fatal, a t.Skip, a failed assertion. For a sockDir
+// directory it is the SECOND line: sockDir's cleanup has already reaped and removed it, so
+// what is left for this to find is TestMain's own directory and any pid file written after
+// that cleanup ran (the asynchronous window described above). It does NOT cover a panic that aborts the
 // test binary, because nothing in the process runs after that; that case is caught by
 // tools/leakcheck.sh on the next run instead.
 //
@@ -70,18 +72,32 @@ func reapStrayDaemons() []string {
 
 	var killed []string
 	for _, dir := range dirs {
-		// Walk rather than reading dir/daemon.pid directly: stagedHome nests its state one
-		// level down (sockDir(t)/gov), and install may have staged more than one.
-		_ = filepath.WalkDir(dir, func(path string, d os.DirEntry, err error) error {
-			if err != nil || d.IsDir() || d.Name() != daemonPIDFile {
-				return nil //nolint:nilerr // an unreadable tree is nothing to reap
-			}
-			if pid, ok := readPIDFileAt(path); ok && killDaemon(pid) {
-				killed = append(killed, strconv.Itoa(pid)+" ("+path+")")
-			}
-			return nil
-		})
+		killed = append(killed, reapDaemonsUnder(dir)...)
 	}
+	return killed
+}
+
+// reapDaemonsUnder kills every daemon whose pid file lies anywhere under dir, and returns
+// what it killed.
+//
+// sockDir calls it from its own cleanup, BEFORE removing the directory (GOV-B44). That
+// ordering is the whole point: t.Cleanup runs when the test ends, which is before m.Run()
+// returns, so a sockDir that removed its tree first left reapStrayDaemons walking a
+// directory that no longer existed — and a failed install's daemon ran on, unreachable,
+// with TestMain reporting nothing.
+func reapDaemonsUnder(dir string) []string {
+	var killed []string
+	// Walk rather than reading dir/daemon.pid directly: stagedHome nests its state one
+	// level down (sockDir(t)/gov), and install may have staged more than one.
+	_ = filepath.WalkDir(dir, func(path string, d os.DirEntry, err error) error {
+		if err != nil || d.IsDir() || d.Name() != daemonPIDFile {
+			return nil //nolint:nilerr // an unreadable tree is nothing to reap
+		}
+		if pid, ok := readPIDFileAt(path); ok && killDaemon(pid) {
+			killed = append(killed, strconv.Itoa(pid)+" ("+path+")")
+		}
+		return nil
+	})
 	return killed
 }
 
