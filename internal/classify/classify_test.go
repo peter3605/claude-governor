@@ -4,9 +4,13 @@ import (
 	"bufio"
 	"encoding/json"
 	"os"
+	"runtime"
 	"slices"
 	"strings"
 	"testing"
+	"time"
+
+	"golang.org/x/sys/unix"
 )
 
 // record is one line of testdata/commands.jsonl: a REAL command from this machine's
@@ -245,21 +249,65 @@ func TestErrorRatesDoNotRegress(t *testing.T) {
 // daemon disappears.
 //
 // A generous ceiling rather than a tight one: this asserts the right ORDER OF MAGNITUDE, not a
-// benchmark. Wall-clock assertions that measure the runner's spare capacity are how GOV-B04,
-// GOV-B08 and GOV-B10 all went, and a per-call ceiling of 50µs is far enough above the real
-// figure (single-digit µs) that a loaded CI box does not trip it.
+// benchmark. Real cost is low single-digit µs; 50µs catches a 10x-plus regression.
+//
+// What is measured is the CPU time of this goroutine's own OS thread, not wall clock. A wall-
+// clock figure is Classify's cost multiplied by how long the thread waited for a core, so it
+// measures the runner's spare capacity — the GOV-B04/B08/B10 pattern. GOV-B45 reproduced it
+// here: at load ~114 on 8 cores the old testing.Benchmark mean read 77,460 ns/op for a function
+// that costs ~3,000. Time spent runnable-but-descheduled is not charged to the thread's CPU
+// clock, so this figure does not move with load. The minimum over several full passes then
+// discards what contention does still charge (cold caches after a context switch), which only
+// ever adds. A real regression is in every pass, so the minimum cannot hide it.
+//
+// Do not t.Skip under load and do not raise the ceiling to make a loaded run pass: GOV-B45's
+// Done-when requires this to still fail on an injected ~100µs per-call cost.
 func TestClassifyIsCheapEnoughToRunOnEveryCall(t *testing.T) {
 	recs := load(t)
-	res := testing.Benchmark(func(b *testing.B) {
-		for i := 0; i < b.N; i++ {
-			Classify(recs[i%len(recs)].Cmd)
+	const rounds = 15
+	const ceiling = 50 * time.Microsecond
+
+	// Pin the goroutine so the thread clock read before and after a pass is the same thread's,
+	// and nothing else is scheduled onto it in between.
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+
+	pass := func() {
+		for _, r := range recs {
+			Classify(r.Cmd)
 		}
-	})
-	per := res.T.Nanoseconds() / int64(res.N)
-	t.Logf("%d ns/op over %d real commands", per, len(recs))
-	if per > 50_000 {
-		t.Errorf("Classify costs %d ns/op; it runs on every Bash call and must stay cheap", per)
 	}
+	pass() // warm-up: first-use initialisation is not the steady-state cost
+
+	best := time.Duration(1<<63 - 1)
+	wallStart := time.Now()
+	for range rounds {
+		before := threadCPU(t)
+		pass()
+		if d := threadCPU(t) - before; d < best {
+			best = d
+		}
+	}
+	wall := time.Since(wallStart) / time.Duration(rounds*len(recs))
+	per := best / time.Duration(len(recs))
+
+	t.Logf("%d ns/op thread CPU (min of %d passes over %d real commands); %d ns/op wall clock, for comparison",
+		per.Nanoseconds(), rounds, len(recs), wall.Nanoseconds())
+	if per > ceiling {
+		t.Errorf("Classify costs %d ns/op of CPU; it runs on every Bash call and must stay under %v",
+			per.Nanoseconds(), ceiling)
+	}
+}
+
+// threadCPU is the CPU time consumed so far by the calling OS thread. CLOCK_THREAD_CPUTIME_ID
+// exists on both darwin and linux, so one implementation covers every target this ships for.
+func threadCPU(t *testing.T) time.Duration {
+	t.Helper()
+	var ts unix.Timespec
+	if err := unix.ClockGettime(unix.CLOCK_THREAD_CPUTIME_ID, &ts); err != nil {
+		t.Fatalf("clock_gettime(CLOCK_THREAD_CPUTIME_ID): %v", err)
+	}
+	return time.Duration(ts.Nano())
 }
 
 func BenchmarkClassify(b *testing.B) {
