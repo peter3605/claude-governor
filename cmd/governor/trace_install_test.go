@@ -425,18 +425,52 @@ func TestMergeIsDefensiveAboutOddShapes(t *testing.T) {
 
 func TestMergeTraceHooksReportsWhatItAdded(t *testing.T) {
 	settings := map[string]any{}
-	added, merged := mergeTraceHooks(settings, "/opt/bin/governor")
+	added, _, merged := mergeTraceHooks(settings, "/opt/bin/governor")
 	if added != len(traceEvents) {
 		t.Errorf("added = %d, want %d", added, len(traceEvents))
 	}
-	again, _ := mergeTraceHooks(merged, "/opt/bin/governor")
-	if again != 0 {
-		t.Errorf("second merge added %d, want 0", again)
+	again, repointed, _ := mergeTraceHooks(merged, "/opt/bin/governor")
+	if again != 0 || repointed != 0 {
+		t.Errorf("second merge added %d and replaced %d, want 0 and 0", again, repointed)
 	}
-	// A different install location is a different hook and must be added.
-	moved, _ := mergeTraceHooks(merged, "/usr/local/bin/governor")
-	if moved != len(traceEvents) {
-		t.Errorf("relocated binary added %d hooks, want %d", moved, len(traceEvents))
+	// A different install location REPLACES the old hooks rather than joining them (GOV-B42).
+	// Adding beside them was the defect: both sets fired, and the old `trace ensure` kept
+	// restarting a sampler from a binary that predated log rotation.
+	moved, repointed, merged := mergeTraceHooks(merged, "/usr/local/bin/governor")
+	if moved != len(traceEvents) || repointed != len(traceEvents) {
+		t.Errorf("relocated binary added %d and replaced %d hooks, want %d and %d",
+			moved, repointed, len(traceEvents), len(traceEvents))
+	}
+	raw, _ := json.Marshal(merged)
+	if strings.Contains(string(raw), "/opt/bin/governor") {
+		t.Errorf("a hook from the old binary survived the re-install: %s", raw)
+	}
+}
+
+// Re-pointing must reach only trace hooks. The governor's own gate hook, and anything else in
+// the same event's list, stays exactly where it was.
+func TestMergeTraceHooksLeavesOtherHooksAlone(t *testing.T) {
+	settings := map[string]any{"hooks": map[string]any{
+		"SessionStart": []any{
+			map[string]any{"hooks": []any{
+				map[string]any{"type": "command", "command": "/old/governor trace ensure"},
+				map[string]any{"type": "command", "command": "/old/governor session start"},
+				map[string]any{"type": "command", "command": "my-own-tool --hello"},
+			}},
+		},
+	}}
+	_, repointed, merged := mergeTraceHooks(settings, "/new/governor")
+	if repointed != 1 {
+		t.Errorf("replaced %d hooks, want only the one trace hook", repointed)
+	}
+	raw, _ := json.Marshal(merged)
+	for _, keep := range []string{"/old/governor session start", "my-own-tool --hello", "/new/governor trace ensure"} {
+		if !strings.Contains(string(raw), keep) {
+			t.Errorf("%q is missing after the merge: %s", keep, raw)
+		}
+	}
+	if strings.Contains(string(raw), "/old/governor trace ensure") {
+		t.Errorf("the stale trace hook survived: %s", raw)
 	}
 }
 

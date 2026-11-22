@@ -234,6 +234,7 @@ func (d *diagnosis) run() {
 	d.checkSessions()
 	d.checkLeases()
 	d.checkTraceLog()
+	d.checkStaleTrace()
 	d.checkStrayDaemons()
 }
 

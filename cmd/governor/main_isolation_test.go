@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -57,6 +58,9 @@ func TestMain(m *testing.M) {
 	// any machine with a governor daemon running on it — including the machine this story was
 	// filed from. strays_test.go puts the real scan back for the tests that are about it.
 	scanForStrays = noStrays
+	// The trace-sampler scan reads the process table for the same reason, and this machine runs
+	// a sampler (GOV-B42). staletrace_test.go supplies fakes for the tests about it.
+	scanForSamplers = func(context.Context) []traceSampler { return nil }
 
 	// Hash this test binary once, up front (GOV-43). The statusline digests its own executable
 	// on a cache miss, and the test binary is large enough that doing it first inside some

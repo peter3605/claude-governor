@@ -128,7 +128,7 @@ func runTraceInstall(args []string, stdout, stderr io.Writer) int {
 		}
 	}
 
-	added, merged := mergeTraceHooks(settings, self)
+	added, repointed, merged := mergeTraceHooks(settings, self)
 
 	out, err := marshalSettings(merged)
 	if err != nil {
@@ -139,12 +139,15 @@ func runTraceInstall(args []string, stdout, stderr io.Writer) int {
 	if dryRun {
 		fmt.Fprintf(stdout, "would write %s\n", path)
 		fmt.Fprintf(stdout, "hooks to add: %d\n", added)
+		if repointed > 0 {
+			fmt.Fprintf(stdout, "hooks from another binary to replace: %d\n", repointed)
+		}
 		fmt.Fprintln(stdout, "---")
 		stdout.Write(out)
 		return 0
 	}
 
-	if added == 0 {
+	if added == 0 && repointed == 0 {
 		fmt.Fprintf(stdout, "already installed, nothing to do (%s)\n", path)
 		return 0
 	}
@@ -166,6 +169,12 @@ func runTraceInstall(args []string, stdout, stderr io.Writer) int {
 		return 1
 	}
 
+	if repointed > 0 {
+		// The running sampler is still the old binary: it holds sampler.lock, so the next
+		// session's `trace ensure` defers to it rather than starting this one (GOV-B42).
+		fmt.Fprintf(stdout, "replaced %d hook(s) that ran another governor binary; a sampler that "+
+			"binary started keeps running until it is stopped (governor doctor names it)\n", repointed)
+	}
 	fmt.Fprintf(stdout, "installed %d hook(s) into %s\n", added, path)
 	for _, e := range traceEvents {
 		fmt.Fprintf(stdout, "  %-14s %s\n", e.event, hookCommand(self, e.args))
@@ -174,18 +183,34 @@ func runTraceInstall(args []string, stdout, stderr io.Writer) int {
 	return 0
 }
 
-// mergeTraceHooks adds any missing Phase 0 hook to settings and reports how many it added.
+// mergeTraceHooks points the Phase 0 hooks at self: it removes any trace hook that runs a
+// different binary, adds any that is missing, and reports how many of each.
+//
+// RE-POINTING IS WHAT MAKES "RE-INSTALL FROM THE CURRENT BINARY" A WAY OUT (GOV-B42). Before
+// it, an entry was added only when its exact command was missing, so running this from a new
+// binary added five hooks BESIDE the five an older install had left. Both sets fired on every
+// event, and the old `trace ensure` kept restarting the old sampler, which kept writing to a
+// samples.jsonl the current gate had rotated away: 1.17 GB nothing could read, on the machine
+// that found it. A trace hook is ours whatever binary it names (isTraceCommand), so one that
+// names another binary is replaced, not kept.
 //
 // It navigates the settings structure defensively: any node that is not the shape it
 // expects is replaced rather than reached into, because a panic here happens while holding
 // the user's only copy of their configuration.
-func mergeTraceHooks(settings map[string]any, self string) (int, map[string]any) {
+func mergeTraceHooks(settings map[string]any, self string) (added, repointed int, merged map[string]any) {
+	current := map[string]bool{}
+	for _, e := range traceEvents {
+		current[hookCommand(self, e.args)] = true
+	}
+	repointed = removeTraceHooksWhere(settings, func(cmd string) bool {
+		return isTraceCommand(cmd) && !current[strings.TrimSpace(cmd)]
+	})
+
 	hooks, _ := settings["hooks"].(map[string]any)
 	if hooks == nil {
 		hooks = map[string]any{}
 	}
 
-	added := 0
 	for _, e := range traceEvents {
 		want := hookCommand(self, e.args)
 
@@ -212,7 +237,7 @@ func mergeTraceHooks(settings map[string]any, self string) (int, map[string]any)
 	}
 
 	settings["hooks"] = hooks
-	return added, settings
+	return added, repointed, settings
 }
 
 // hasHookCommand reports whether any hook under these matcher entries runs cmd.
@@ -317,6 +342,13 @@ func runTraceUninstall(args []string, stdout, stderr io.Writer) int {
 // many it removed. An event left with no entries is deleted entirely, and a hooks object
 // left empty is deleted too, so uninstall does not leave an empty scaffold behind.
 func removeTraceHooks(settings map[string]any) int {
+	return removeTraceHooksWhere(settings, isTraceCommand)
+}
+
+// removeTraceHooksWhere is removeTraceHooks for the trace commands drop selects. It only
+// ever looks at the trace events, so drop cannot reach a hook this installer did not write
+// unless drop itself is wider than isTraceCommand, and no caller's is.
+func removeTraceHooksWhere(settings map[string]any, drop func(cmd string) bool) int {
 	hooks, _ := settings["hooks"].(map[string]any)
 	if hooks == nil {
 		return 0
@@ -330,7 +362,7 @@ func removeTraceHooks(settings map[string]any) int {
 		}
 		kept := make([]any, 0, len(entries))
 		for _, entry := range entries {
-			if n := stripOurHooks(entry); n > 0 {
+			if n := stripHooksWhere(entry, drop); n > 0 {
 				removed += n
 				if entryIsEmpty(entry) {
 					continue
@@ -351,9 +383,9 @@ func removeTraceHooks(settings map[string]any) int {
 	return removed
 }
 
-// stripOurHooks removes our commands from one matcher entry, in place, and reports how many
-// it removed.
-func stripOurHooks(entry any) int {
+// stripHooksWhere removes the commands drop selects from one matcher entry, in place, and
+// reports how many it removed.
+func stripHooksWhere(entry any, drop func(cmd string) bool) int {
 	m, _ := entry.(map[string]any)
 	if m == nil {
 		return 0
@@ -367,7 +399,7 @@ func stripOurHooks(entry any) int {
 	for _, h := range inner {
 		hm, _ := h.(map[string]any)
 		if hm != nil {
-			if s, _ := hm["command"].(string); isTraceCommand(s) {
+			if s, _ := hm["command"].(string); drop(s) {
 				removed++
 				continue
 			}
