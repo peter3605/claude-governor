@@ -81,6 +81,11 @@ type statusRequest struct {
 	V         int       `json:"v"`
 	Op        string    `json:"op"`
 	Principal principal `json:"principal"`
+	// Client says which command is asking (GOV-B49): "statusline", "doctor" or "install".
+	// The status line, doctor and install send otherwise identical requests, so without it
+	// a reply the daemon could not deliver cannot be traced to its sender. It goes in the
+	// daemon's log only. Additive: an older daemon ignores it.
+	Client string `json:"client,omitempty"`
 }
 
 // statusResponse is the status reply of design.md section 7.
@@ -386,7 +391,7 @@ func query(diag io.Writer, dialer transport.Dialer, deadline time.Time) cachedSt
 	c := cachedStatus{At: time.Now()}
 	var resp statusResponse
 	if !exchange(diag, dialer, deadline, statusRequest{
-		V: protocolVersion, Op: "status", Principal: localPrincipal(),
+		V: protocolVersion, Op: "status", Principal: localPrincipal(), Client: "statusline",
 	}, &resp) {
 		c.Down = true
 		return c

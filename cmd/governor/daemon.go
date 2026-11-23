@@ -16,6 +16,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -106,6 +107,14 @@ type request struct {
 	Kind  string  `json:"kind"`
 	Class string  `json:"class"`
 	Slots float64 `json:"slots"`
+
+	// Every op (GOV-B49). DeadlineMS is the Unix-millisecond instant at which the client's
+	// socket gives up (encodeRequest), and Client names the sender of a status request. They
+	// exist so that a reply the daemon could not deliver can be traced to its sender and
+	// classified (undelivered). Both are recorded, never acted on, and both are additive: an
+	// older client sends neither, and its hang-ups are logged with deadline=unknown.
+	DeadlineMS int64  `json:"deadline_ms,omitempty"`
+	Client     string `json:"client,omitempty"`
 
 	// finish
 	//
@@ -515,6 +524,10 @@ const maxRequest = 64 << 10
 // daemon is the broker. Everything it owns is either immutable or internally synchronised,
 // so a handler needs no lock of its own.
 type daemon struct {
+	// lastWake is when step last saw the machine wake, as Unix nanoseconds, zero if never
+	// (GOV-B49). A reply cut off just after a wake is logged as such, not as an error.
+	lastWake atomic.Int64
+
 	// speaks is the protocol version this daemon serves: the "v" it stamps on every reply
 	// and the only "v" it accepts on a request (design.md section 7).
 	//
@@ -1205,6 +1218,7 @@ func (d *daemon) step(s signals.Sample, demand, inUse bool, away time.Duration) 
 	rq, fresh := d.wake.Observe(s.RunQueue, away)
 	if away > 0 {
 		slept = sleptLine(away, d.wake.Before(), d.wake.Waking())
+		d.lastWake.Store(time.Now().UnixNano())
 	}
 	d.latest, d.latestOK = s, true
 	if d.cpuAvg == nil {
@@ -1286,6 +1300,7 @@ func (d *daemon) reap(ctx context.Context) {
 // recover is what makes it true of a panic as well as of a parse error. One bad client must
 // never take down the broker, because every other session on the machine is behind it.
 func (d *daemon) handle(conn net.Conn) {
+	start := time.Now()
 	defer conn.Close()
 	defer func() {
 		if r := recover(); r != nil {
@@ -1313,13 +1328,15 @@ func (d *daemon) handle(conn net.Conn) {
 	}
 
 	reply := d.dispatch(req)
+	ex := exchangeOf(req, start)
 
 	// A parked acquire is answered twice: once immediately to say it has been parked, and
 	// once when it resolves. The interim line must reach the client BEFORE the wait starts,
 	// because it is the client's only evidence that waiting is safe — sending it afterwards
 	// would be sending it too late to be worth anything.
 	if p, ok := reply.(*parkedAcquire); ok {
-		if !d.write(conn, p.interim) {
+		ex.part = "interim"
+		if !d.write(conn, p.interim, ex) {
 			p.cancel()
 			return
 		}
@@ -1328,28 +1345,33 @@ func (d *daemon) handle(conn net.Conn) {
 			p.cancel()
 			return
 		}
+		// Having read the interim line, the gate extends its own deadline to the wait it
+		// will give plus waitGrace (awaitParked), so the deadline the request carried no
+		// longer applies to the second line.
+		ex.part, ex.givesUp = "final", time.Now().Add(min(p.wait, gateWaitMax)+waitGrace)
 		reply = p.resolve()
 	}
 
 	if l, ok := reply.(loggedReply); ok {
 		// Logged whether or not the write succeeds. The lease left the table either way,
 		// and a release missing from the log is exactly what this log exists to prevent.
-		d.write(conn, l.reply)
+		d.write(conn, l.reply, ex)
 		l.after()
 		return
 	}
-	d.write(conn, reply)
+	d.write(conn, reply, ex)
 }
 
-// write marshals one reply and sends it, reporting whether the client got it.
-func (d *daemon) write(conn net.Conn, reply any) bool {
+// write marshals one reply and sends it, reporting whether the client got it. ex describes
+// the exchange, so that a reply the client never received can be logged with who it was for.
+func (d *daemon) write(conn net.Conn, reply any, ex exchangeInfo) bool {
 	out, err := json.Marshal(reply)
 	if err != nil {
 		fmt.Fprintf(d.diag, "governor daemon: encode reply: %v\n", err)
 		return false
 	}
 	if _, err := conn.Write(append(out, '\n')); err != nil {
-		fmt.Fprintf(d.diag, "governor daemon: write reply: %v\n", err)
+		d.undelivered(ex, err, time.Now())
 		return false
 	}
 	return true

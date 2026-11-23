@@ -1919,8 +1919,9 @@ per connection. Deliberately boring — this is a hot path.
 {"v":1,"op":"settle","session":"abc123","hook_event":"UserPromptSubmit","ended":["toolu_01..."]}
 // -> session
 {"v":1,"op":"session","action":"start","session":"abc123","pid":48001,"weight":1}
-// -> status (statusline, doctor, /governor)
-{"v":1,"op":"status"}
+// -> status (statusline, doctor, /governor). `client` (GOV-B49) is "statusline", "doctor" or
+//    "install": the three send otherwise identical requests. For the daemon's log only.
+{"v":1,"op":"status","client":"statusline","deadline_ms":1795408010811}
 {"v":1,"budget":6,"in_use":4,"waiting":1,"cpu":0.61,"thermal":"nominal",
  "binary_version":"1.2.0","build":"9f2c…","sources":[{"name":"local","budget":6}],"sessions":[...],
  "pinned":false,"paused":false}
@@ -1973,6 +1974,22 @@ lazily after an upgrade would describe the new binary and report the stale daemo
 `"unknown"` means the daemon could not read itself, and every reader treats that as no evidence.
 **Absent** means a daemon older than the field, which is older than any binary able to ask, and
 every reader treats that as stale. Additive; no protocol bump.
+
+`deadline_ms` (GOV-B49) is on **every** request that goes through `dialAndSend`: the gate, every
+hook, the status line, doctor, control and the MCP server. It is the wall-clock instant, in Unix
+milliseconds, at which the sender's socket gives up. It is spliced into the encoded object
+(`encodeRequest`) rather than declared on each request type, so no client can leave it out. The
+daemon reads it only when a reply cannot be written. A sender past its own deadline has already
+failed open (or rendered from cache), so that hang-up is an ordinary `reply undelivered ...
+cause=deadline` line, not an error. The daemon cannot tell this from its own clock, because a
+client's budget starts at process start, and on a loaded machine start-up alone can use most of
+the status line's 50 ms. An absolute instant is sent rather than a remaining duration because
+both ends share one host clock, while a duration would be stretched by however long the request
+sat unread. A reply cut off across a sleep (the wall clock more than 1 s ahead of the monotonic
+clock over the exchange, or a wake seen in the last 2 s) is `cause=sleep`. Anything else is
+still the `write reply:` error line, with the same `op=`, `client=`, `reply=`, `took=` and
+`left=` fields. Additive in both directions: an older daemon ignores both keys, and an older
+client's hang-up is logged with `deadline=unknown`. Neither key is acted on.
 
 The `waiting` line is the one message that is not the end of an exchange, and it is
 **compatible in both directions** — which is what let it be added without a version bump. A

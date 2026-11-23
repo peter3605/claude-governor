@@ -798,7 +798,7 @@ func (d *diagnosis) checkDaemon() {
 	var why strings.Builder
 	var resp doctorStatus
 	if !exchange(&why, transport.Dial{}, time.Now().Add(doctorDialBudget), statusRequest{
-		V: protocolVersion, Op: "status", Principal: localPrincipal(),
+		V: protocolVersion, Op: "status", Principal: localPrincipal(), Client: "doctor",
 	}, &resp) {
 		// The endpoint is already in the sentence; the dial's own restatement of it is not
 		// worth a second forty characters on a line a person has to read.

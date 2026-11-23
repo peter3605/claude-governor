@@ -614,7 +614,7 @@ func dialAndSend(dialer transport.Dialer, deadline time.Time, req any) (net.Conn
 		return nil, nil, fmt.Errorf("set deadline: %w", err)
 	}
 
-	line, err := json.Marshal(req)
+	line, err := encodeRequest(req, ioDeadline)
 	if err != nil {
 		conn.Close()
 		return nil, nil, fmt.Errorf("encode request: %w", err)
@@ -624,6 +624,38 @@ func dialAndSend(dialer transport.Dialer, deadline time.Time, req any) (net.Conn
 		return nil, nil, fmt.Errorf("write request: %w", err)
 	}
 	return conn, bufio.NewReaderSize(io.LimitReader(conn, maxResponse), 4096), nil
+}
+
+// encodeRequest marshals one request and stamps it with deadline_ms, the wall-clock instant
+// (Unix milliseconds) at which this client's socket gives up (GOV-B49).
+//
+// It exists for the daemon's log and nothing else. When a reply cannot be written because the
+// client has hung up, the daemon can say whether the client had already passed its own
+// deadline. If it had, the client has already failed open and the hang-up is expected. If it
+// had not, the line is unexplained. The daemon cannot work this out from its own clock: a
+// client's budget starts when its process starts, and on a loaded machine process start-up
+// alone can spend most of the status line's 50 ms before the connection exists. An absolute
+// instant is sent rather than a remaining duration because the two ends share one host clock
+// (the endpoint is a local socket), and a duration would be stretched by however long the
+// request sat unread.
+//
+// It is spliced into the marshalled object rather than declared on every request struct, so
+// every client that goes through dialAndSend carries it and a new request type cannot forget
+// it. Additive: an older daemon ignores the key, and nothing in a decision reads it.
+func encodeRequest(req any, deadline time.Time) ([]byte, error) {
+	line, err := json.Marshal(req)
+	if err != nil {
+		return nil, err
+	}
+	n := len(line)
+	if n < 2 || line[0] != '{' || line[n-1] != '}' {
+		return line, nil
+	}
+	stamp := fmt.Sprintf(`"deadline_ms":%d}`, deadline.UnixMilli())
+	if n == 2 {
+		return append(line[:1], stamp...), nil
+	}
+	return append(append(line[:n-1], ','), stamp...), nil
 }
 
 // errNoDaemon reports that nothing was listening on the endpoint.
