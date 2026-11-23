@@ -14,6 +14,17 @@ import (
 // loop that oscillates is very hard to debug after the fact.
 const DefaultCPUWindow = 5 * time.Second
 
+// DefaultSwapInWindow is the EWMA time constant for the swap-in rate the loop cuts on for
+// memory (GOV-B53, design.md section 5.3a).
+//
+// LONGER THAN CPU'S, AND MEASURED. Swap-in on a working Mac is bursts: in 35 minutes of ordinary
+// use there were 112 raw bursts over 20 MB/s, the longest 8 s, the tallest 386 MB/s for one
+// second — an app being brought back to the front. A 5 s EWMA carried those to 94.9 MB/s; 30 s
+// holds ordinary use under 36.7 while real thrash, which is sustained, still reads 80-170.
+// 60 s separates as well but reacts later and clears later, and a memory cut that arrives a
+// minute into the thrash has arrived after the builds that caused it started.
+const DefaultSwapInWindow = 30 * time.Second
+
 // EWMA is a time-aware exponentially weighted moving average.
 //
 // Time-aware rather than tick-counted, which matters here: the sampler ticks on a

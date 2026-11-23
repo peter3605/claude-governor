@@ -139,7 +139,7 @@ func TestSwapRateIgnoresACounterThatWentBackwards(t *testing.T) {
 	// Stage a previous reading far above anything the machine will report now.
 	s.swapIn, s.swapAt, s.swapSeen = ^uint64(0), now.Add(-time.Second), true
 
-	if got := s.swapRate(context.Background(), now); got != 0 {
+	if got, _ := s.swapRate(context.Background(), now); got != 0 {
 		t.Errorf("swap rate after the counter reset = %v, want 0", got)
 	}
 }
