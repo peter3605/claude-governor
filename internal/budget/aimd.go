@@ -38,6 +38,15 @@ type Reading struct {
 	// governor — nothing running under it, nothing asking — from one whose budget is simply
 	// not being asked for more (GOV-46).
 	InUse bool
+	// Woke is whether the machine slept since the previous tick (GOV-B48). A budget a signal
+	// cut BEFORE the sleep is restored to the ceiling on this tick: the readings that cut it
+	// describe a machine that no longer exists, and on wake the controller is in the state a
+	// freshly started daemon is in, which start() answers with the ceiling.
+	Woke bool
+	// Stale is whether RunQueue is still the load average the kernel froze at sleep, and so
+	// says nothing about the machine now. The loop neither cuts nor climbs on it; thermal is a
+	// live reading and still floors. WakeFilter decides it, for at most a few ticks.
+	Stale bool
 }
 
 // Setpoint is the host utilisation the loop aims to sit under.
@@ -305,6 +314,7 @@ const (
 	MovedClimb    = "climb"     // recovered with demand waiting: one slot up
 	MovedIdle     = "idle"      // recovered and idle long enough: back to the ceiling (GOV-46 b)
 	MovedCeiling  = "ceiling"   // the ceiling moved and carried the budget with it
+	MovedWake     = "wake"      // the machine slept; a pre-sleep cut does not survive it (GOV-B48)
 )
 
 // Moved names what changed the budget on the last Step, or "" if it did not change.
@@ -484,7 +494,22 @@ func (c *Controller) Step(r Reading) int {
 	}
 	c.seen = max
 
-	climbing := Climbing(r, c.climbRunQueue())
+	if r.Woke && c.b < max {
+		// GOV-B48. Before the switch, for the same reason as case (a): if the machine is
+		// genuinely busy at wake, this tick or the next fresh one cuts from the ceiling.
+		//
+		// It fires only when something holds the budget below the ceiling, so a DarkWake —
+		// which runs the daemon for some seconds every few minutes all night — finds the
+		// budget at the ceiling and does nothing, unless the previous DarkWake's own load cut
+		// it and the machine slept on that cut. Clearing that is the point, not a side effect.
+		c.b = max
+		c.cut = ""
+		c.clean = NominalTicksBeforeIncrease
+		c.quiet = 0
+		mark(MovedWake)
+	}
+
+	climbing := !r.Stale && Climbing(r, c.climbRunQueue())
 	idle := climbing && !r.DemandWaiting && !r.InUse && !r.ThermalSevere
 	if idle {
 		c.quiet++
@@ -520,6 +545,10 @@ func (c *Controller) Step(r Reading) int {
 		c.clean = 0
 		c.cut = "thermal"
 		mark(MovedThermal)
+	case r.Stale:
+		// The run queue is the kernel's frozen pre-sleep average (GOV-B48). It cannot justify
+		// a cut or a climb, so the loop holds until WakeFilter has a fresh reading, which is
+		// one kernel update — five seconds at most.
 	case Cutting(r, c.runQueueMax()):
 		// MULTIPLICATIVE DECREASE, on the run queue alone. It halves rather than stepping
 		// down because the cost of being over is bounded by how fast you can get back, and

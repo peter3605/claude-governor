@@ -12,6 +12,7 @@ import (
 
 	"github.com/peter3605/claude-governor/internal/budget"
 	"github.com/peter3605/claude-governor/internal/lease"
+	"github.com/peter3605/claude-governor/internal/signals"
 )
 
 // The daemon log (GOV-B29).
@@ -213,12 +214,36 @@ func budgetLine(from, to int, cause string, c *budget.Controller, rq float64, th
 		return fmt.Sprintf("restore %d->%d cause=idle rq=%.2f climb=%.2f ceiling=%d", from, to, rq, c.ClimbAt(), c.Max)
 	case budget.MovedCeiling:
 		return fmt.Sprintf("ceiling %d->%d cause=ceiling ceiling=%d->%d", from, to, ceilingFrom, c.Max)
+	case budget.MovedWake:
+		// GOV-B48. rq here is the CORRECTED run queue, which on the wake tick is usually
+		// still unknown — the line says so rather than printing the frozen value as if it
+		// were a reading.
+		return fmt.Sprintf("restore %d->%d cause=wake ceiling=%d", from, to, c.Max)
 	default:
 		// The controller moved the budget and named no cause. That should not happen, and the
 		// line is still written, because a missing transition is the defect this log exists
 		// to fix.
 		return fmt.Sprintf("move %d->%d cause=unknown rq=%.2f ceiling=%d", from, to, rq, c.Max)
 	}
+}
+
+// sleptLine describes a sleep the daemon has just woken from (GOV-B48):
+//
+//	machine was away 11h17m3s; frozen run queue 6.73, correcting until it decays
+//
+// It is what lets a reader of daemon.log tell a long gap between budget lines that was a HOLD
+// from one that was the machine asleep. Before it, the dogfooding week's "12.2 h hold" was a
+// hibernate nobody could see in this file (GOV-38, surprise 4). away is rounded to the second
+// because the clocks it is the difference of are not more precise than a tick.
+func sleptLine(away time.Duration, frozenRQ float64, correcting bool) string {
+	tail := "not correcting (the pre-sleep run queue was already low)"
+	if correcting {
+		tail = "correcting until it decays"
+	}
+	if !signals.LoadavgFrozenAcrossSleep {
+		tail = "not correcting (unmeasured on this platform; design.md section 5.6d)"
+	}
+	return fmt.Sprintf("machine was away %s; frozen run queue %.2f, %s", away.Round(time.Second), frozenRQ, tail)
 }
 
 // The names a release line gives for what released a lease. The reaper's are refined by
