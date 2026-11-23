@@ -218,6 +218,9 @@ func liveSuffix(reply statusResponse, s sessionStat) string {
 		return " ungoverned (" + g.why() + ")"
 	case g == govPreviousDaemon:
 		return " registered with a daemon that has since been replaced"
+	case g == govOlderHooks:
+		// GOV-B52: governed, on an earlier install's hooks. doctor's words again.
+		return " governed on an older set of the governor's hooks (" + olderHooksDetail(reply, s) + "; a restart picks them up)"
 	default:
 		return ""
 	}

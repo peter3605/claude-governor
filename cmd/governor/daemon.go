@@ -436,6 +436,13 @@ type statusReply struct {
 	// such file. A session that started before it could not have loaded the gate and is
 	// ungoverned for the rest of its life, which is the whole of GOV-29's defect.
 	HooksInstalled string `json:"hooks_installed,omitempty"`
+	// HookHistory is install's record of every write of that file and the hooks it held
+	// (GOV-B52, hookhistory.go), oldest first; HookHistoryKnown is false when there is none to
+	// read. HooksInstalled is the LAST write, which on its own cannot tell a session that never
+	// loaded the gate from one that loaded the previous release's hooks. Additive, no protocol
+	// bump, for the reason given above BinaryVersion.
+	HookHistory      []hookEpoch `json:"hook_history,omitempty"`
+	HookHistoryKnown bool        `json:"hook_history_known,omitempty"`
 	// SessionsKnown is false when the harness's session registry could not be read at all,
 	// which makes every Live field below meaningless. It is a separate field rather than an
 	// empty list because "no registry on this machine" and "no sessions running" are
@@ -569,6 +576,10 @@ type daemon struct {
 	// fabricate a live process to exercise the merge would be a test nobody trusts.
 	liveSessions     func() ([]signals.LiveSession, error)
 	hooksInstalledAt func() time.Time
+	// hookHistory reads install's record of every write of the gate's hooks file
+	// (GOV-B52, hookhistory.go). ok is false when it cannot be read, which the classifier
+	// takes as "no evidence", never as a fault.
+	hookHistory func() (h []hookEpoch, ok bool)
 	// surface is the spawn-surface ledger of GOV-30: which tool names the matcher has
 	// actually been seen to catch, per Claude Code version. Written off the acquire path,
 	// read by doctor through the status reply. Never consulted for a decision.
@@ -579,6 +590,8 @@ type daemon struct {
 	machineSeen []signals.LiveSession
 	machineErr  error
 	machineHook time.Time
+	machineHist []hookEpoch
+	machineHOK  bool
 
 	// overrides are the manual pins of design.md section 9.1 (GOV-B01): a pinned budget and
 	// a pause, each expiring on its own. Read on the budget path through liveBudget and
@@ -658,8 +671,17 @@ func (d *daemon) observe() (live []signals.LiveSession, hooksAt time.Time, err e
 	}
 	d.machineSeen, d.machineErr = d.liveSessions()
 	d.machineHook = d.hooksInstalledAt()
+	d.machineHist, d.machineHOK = d.hookHistory()
 	d.machineAt = time.Now()
 	return d.machineSeen, d.machineHook, d.machineErr
+}
+
+// observedHookHistory is the hooks history as of the last observe(), which every caller of
+// this has just made.
+func (d *daemon) observedHookHistory() ([]hookEpoch, bool) {
+	d.machineMu.Lock()
+	defer d.machineMu.Unlock()
+	return d.machineHist, d.machineHOK
 }
 
 // noteSpawnSurface records that the matcher caught tool on the Claude Code version this
@@ -942,6 +964,7 @@ func newDaemonWithLeases(limit int, diag io.Writer, opt lease.Options) *daemon {
 		build:            thisBuild(),
 		liveSessions:     noLiveSessions,
 		hooksInstalledAt: func() time.Time { return time.Time{} },
+		hookHistory:      func() ([]hookEpoch, bool) { return nil, false },
 		// Pathless by default, for the same reason liveSessions defaults to noLiveSessions:
 		// a daemon constructed in a test must not write to the developer's real state
 		// directory. runDaemon gives it a path; everything else keeps the ledger in memory.
@@ -966,6 +989,16 @@ func noLiveSessions() ([]signals.LiveSession, error) { return nil, signals.ErrNo
 func (d *daemon) observeThisMachine() {
 	d.liveSessions = func() ([]signals.LiveSession, error) { return signals.LiveSessions("") }
 	d.hooksInstalledAt = gateHooksInstalledAt
+	d.hookHistory = func() ([]hookEpoch, bool) {
+		// transport.StateDir, the directory install wrote it into: the history describes this
+		// machine's hooks file, not any one endpoint's daemon.
+		state, err := transport.StateDir()
+		if err != nil {
+			return nil, false
+		}
+		h, err := readHookHistory(state)
+		return h, err == nil && len(h) > 0
+	}
 	d.sampler = signals.NewSamplerEvery(treeInterval)
 
 	// The loop is wired here and nowhere else, beside the sampler that feeds it. A daemon
@@ -2029,6 +2062,7 @@ func (d *daemon) status(req request) statusReply {
 	}
 	sort.Slice(sessions, func(i, j int) bool { return sessions[i].Session < sessions[j].Session })
 
+	hist, histOK := d.observedHookHistory()
 	hooks := ""
 	if !hookAt.IsZero() {
 		hooks = hookAt.UTC().Format(time.RFC3339)
@@ -2045,6 +2079,8 @@ func (d *daemon) status(req request) statusReply {
 		Sources:           sources,
 		DaemonStarted:     d.started.UTC().Format(time.RFC3339),
 		HooksInstalled:    hooks,
+		HookHistory:       hist,
+		HookHistoryKnown:  histOK,
 		SessionsKnown:     known,
 		Sessions:          sessions,
 		SpawnSurface:      d.surface.sightings(),

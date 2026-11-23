@@ -555,7 +555,7 @@ func (d *diagnosis) checkSessions() {
 		return
 	}
 
-	var live, ungoverned []sessionVerdict
+	var live, ungoverned, older []sessionVerdict
 	registered, replaced := 0, 0
 	for _, s := range d.reply.Sessions {
 		if !s.Live {
@@ -568,6 +568,14 @@ func (d *diagnosis) checkSessions() {
 			registered++
 		case govPreviousDaemon:
 			replaced++
+		case govOlderHooks:
+			// Governed (GOV-B52): its gate runs, but on the hooks of an earlier install. Kept
+			// apart from ungoverned because the two need different words, and filtered to
+			// interactive sessions for the same reason: a restart is the fix.
+			if s.Kind == "" || s.Kind == "interactive" {
+				v.why = olderHooksDetail(d.reply.statusResponse, s)
+				older = append(older, v)
+			}
 		default:
 			// Only an interactive session is reported. Restarting is the sole fix an
 			// ungoverned session has, and that is not an action that exists for a headless
@@ -585,6 +593,16 @@ func (d *diagnosis) checkSessions() {
 		d.add("sessions", pass, "no Claude Code sessions running", "")
 		return
 	}
+	// olderNote is the older-hooks sessions, said in one clause wherever the line goes.
+	olderNote := ""
+	if len(older) > 0 {
+		names := make([]string, 0, len(older))
+		for _, v := range older {
+			names = append(names, fmt.Sprintf("%s (%s)", v.label(), v.why))
+		}
+		olderNote = fmt.Sprintf("%d governed on an older set of the governor's hooks: %s",
+			len(older), strings.Join(names, ", "))
+	}
 	if len(ungoverned) == 0 {
 		detail := fmt.Sprintf("%d of %d live session(s) registered with the daemon", registered, len(live))
 		if replaced > 0 {
@@ -592,6 +610,13 @@ func (d *diagnosis) checkSessions() {
 			// straight after an upgrade reads "0 of 5 registered" over an ok, which is the
 			// sort of line that gets a working install debugged.
 			detail += fmt.Sprintf("; %d registered with a daemon that has since been replaced", replaced)
+		}
+		if len(older) > 0 {
+			// A WARNING, NOT A FAIL (GOV-B52). These sessions are governed; what they lack
+			// is what an upgrade added, and a restart picks it up when convenient.
+			d.add("sessions", warn, detail+"; "+olderNote,
+				fmt.Sprintf("restart %s when convenient to pick up the current hooks", pluralSessions(older)))
+			return
 		}
 		d.add("sessions", pass, detail, "")
 		return
@@ -601,9 +626,12 @@ func (d *diagnosis) checkSessions() {
 	for _, v := range ungoverned {
 		names = append(names, fmt.Sprintf("%s (%s)", v.label(), v.why))
 	}
-	d.add("sessions", fail,
-		fmt.Sprintf("%d of %d live session(s) are ungoverned: %s",
-			len(ungoverned), len(live), strings.Join(names, ", ")),
+	detail := fmt.Sprintf("%d of %d live session(s) are ungoverned: %s",
+		len(ungoverned), len(live), strings.Join(names, ", "))
+	if olderNote != "" {
+		detail += "; " + olderNote
+	}
+	d.add("sessions", fail, detail,
 		fmt.Sprintf("restart %s — hooks are bound when a session starts, so an open session never picks them up",
 			pluralSessions(ungoverned)))
 }

@@ -2266,6 +2266,7 @@ claude-governor/                  the repo
 
 state  → ~/.claude/governor/      sock, daemon.pid, daemon.log, daemon.log.1, daemon.start, statusline.json,
                                   statusline.json.*, onboarded, surface.json, surface.json.tmp,
+                                  hooks-history.json, hooks-history.json.tmp,
                                   config.json, samples.jsonl, samples.jsonl.1,
                                   samples.pre-bound-<ts>.jsonl, sampler.lock, sampler.log
 config → the state directory's config.json, always (GOV-44; §13.3a)
@@ -3018,6 +3019,33 @@ sessions, four of them ungoverned for twenty-nine hours, and doctor reported 8 o
     having registered with a previous one, which is the ordinary state and not a fault. The
     check has three inputs for this reason — the registered set, the daemon's start time, and
     the hook file's mtime — and only the last of those is decisive on its own.
+  - It must not blame an **upgrade that rewrote the hooks** (GOV-B52). The hook file's mtime
+    is its *last* write, not the first install, so after every upgrade that changes
+    `hooks.json` every older session predates it — including ones whose gate has run for
+    days. Measured 2026-11-23: after the 0.1.8 upgrade doctor FAILed earbrief as "started
+    before the hooks were installed"; it started 2026-11-15 16:38 UTC under the 0.1.6 hooks
+    (written 03:11 UTC that day), had build release lines in `daemon.log` on 11-21, and lacked
+    only the `UserPromptSubmit settle` hook that 0.1.7 added at 06:11 UTC on 11-22. The
+    evidence that tells these apart is **`hooks-history.json`** in the state directory, which
+    `install` — the only writer of `hooks.json` — keeps: one entry per write of the gate's
+    hooks file, with its mtime and the hooks it held from then on. The daemon reports it in
+    status as `hook_history` (additive, no protocol bump), and `classifyGovernance` reads a
+    session that started before the latest write by the history's **first** entry:
+    - before an **unseeded** first entry — written by an install that found no gate
+      anywhere — no gate existed when it started: **ungoverned**, FAIL, restart it;
+    - before a **seeded** first entry: unknown. An install over hooks this history never saw
+      written (an upgrade from a build before GOV-B52, or a gate in `settings.json` or the
+      pre-rename tree) records what it finds, marked seeded, because the gate has existed *at
+      least* since then and the history cannot say what came before;
+    - at or after the first entry: it loaded the set in force at its start. **Governed on
+      older hooks**: a WARN, not a FAIL, naming what it lacks (the newest entry's hooks less
+      that set) and saying a restart picks it up. `governor status` and install's closing
+      notice use the same rule and the same words.
+
+    No history, or one that cannot be parsed, is unknown — never ungoverned. The mtime is
+    *not* held still across a rewrite instead: a session that predates a hooks change really
+    is missing the new hook (GOV-B41's backgrounded builds in such sessions end only by the
+    reaper), and it should be told so, just not that it is ungoverned.
   - Where the registry cannot be read it reports **"not verified"**, as a pass that states its
     own limit rather than a skip. A skip in this command means "downstream of a check that
     already failed and already named its fix", and nothing has failed here. The wording leads
@@ -3035,7 +3063,7 @@ sessions, four of them ungoverned for twenty-nine hours, and doctor reported 8 o
   red line means nothing.
 
 Neither finding writes anything. `~/.claude/sessions/` is read-only to the governor and adds
-no row to §13.3.
+no row to §13.3. The hooks history they read is written by `install` and has its rows there.
 
 GOV-B11 added `strays`, which is the only finding that reports on the **machine** rather than
 on this installation, and the first that could be a `warn`.
@@ -3196,6 +3224,8 @@ Uninstall is only verifiable if this list is exhaustive, so it is normative.
 | `~/.claude/governor/onboarded` | `session start`, only in the fallback below, and only when the directory already exists | uninstall |
 | `~/.claude/governor/surface.json` | daemon, when it first sees a spawn tool name it has not recorded for that Claude Code version (GOV-30) | uninstall |
 | `~/.claude/governor/surface.json.tmp` | daemon, staging the file above before the rename | uninstall |
+| `~/.claude/governor/hooks-history.json` | install, when it writes the gate's hooks file or first finds one it has no history for (GOV-B52, §13.2 `sessions`) | uninstall |
+| `~/.claude/governor/hooks-history.json.tmp` | install, staging the file above before the rename (a fixed name, for `surface.json.tmp`'s reason) | uninstall |
 | `~/.claude/governor/config.json` | `calibrate` (and `install`, which runs it), always — whatever `${CLAUDE_PLUGIN_DATA}` says (GOV-44, §13.3a) | uninstall |
 | `~/.claude/governor/samples.jsonl` | the gate, one `build` record per gated command (§8); `trace agent` and `trace sample` too while Phase 0 is installed | uninstall `--purge` only — plain uninstall keeps it and names it with its size, see below |
 | `~/.claude/governor/samples.jsonl.1` | rotation of the file above at 16 MiB (GOV-B26) | uninstall `--purge` only |

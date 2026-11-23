@@ -71,6 +71,7 @@ func TestAReplacedDaemonDoesNotCallAGovernedSessionUngoverned(t *testing.T) {
 	machine := func(d *daemon, startedAt time.Time) {
 		d.liveSessions = func() ([]signals.LiveSession, error) { return live, nil }
 		d.hooksInstalledAt = func() time.Time { return hooksAt }
+		d.hookHistory = firstInstallHistory(hooksAt)
 		d.started = startedAt
 	}
 

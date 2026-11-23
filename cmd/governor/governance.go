@@ -1,6 +1,9 @@
 package main
 
-import "time"
+import (
+	"strings"
+	"time"
+)
 
 // Whether a session's hooks are loaded, and how confidently that is known (GOV-29).
 //
@@ -32,12 +35,24 @@ const (
 	// fault would tell a person to restart every session on the machine every time they
 	// upgraded — the same instrument lying, pointing the other way.
 	govPreviousDaemon
-	// govNeverLoaded is the defect: the session started before the hooks file existed, so it
+	// govNeverLoaded is the defect: the session started before any gate hook existed, so it
 	// cannot have loaded the gate and never will.
+	//
+	// Since GOV-B52 this needs the hooks history to say so. hooks_installed is the LAST write
+	// of the hooks file, and a session that started before it may equally have loaded the
+	// previous release's hooks — that is govOlderHooks, and the two need opposite words.
 	govNeverLoaded
 	// govHookNeverArrived is a session that started after both the hooks and this daemon and
 	// still never registered. Its SessionStart hook should have arrived and did not.
 	govHookNeverArrived
+	// govOlderHooks is a session that loaded an earlier set of the governor's hooks: it
+	// started after the first gate was installed and before the latest rewrite of the hooks
+	// file (GOV-B52). Its gate runs; what it lacks is whatever changed since, which
+	// missingHooksFor names. NOT ungoverned, and never a FAIL: telling a person a session
+	// whose gate is visibly running is ungoverned is the false alarm that teaches them to
+	// ignore the line. But not silent either — such a session really is missing a hook
+	// (GOV-B41's settle, the measured case), and a restart is what picks it up.
+	govOlderHooks
 )
 
 // ungoverned reports whether this verdict means the session's spawns are not being governed.
@@ -52,6 +67,8 @@ func (g governance) why() string {
 		return "started before the hooks were installed"
 	case govHookNeverArrived:
 		return "its SessionStart hook never reached the daemon"
+	case govOlderHooks:
+		return "loaded an older set of the governor's hooks"
 	default:
 		return ""
 	}
@@ -86,7 +103,7 @@ func classifyGovernance(reply statusResponse, s sessionStat) governance {
 		return govUnknown
 	}
 	if hooks := parseStatusTime(reply.HooksInstalled); !hooks.IsZero() && started.Before(hooks) {
-		return govNeverLoaded
+		return beforeLatestHooks(reply, started)
 	}
 	// Tested on the PARSED value, not on the raw string. Testing the string for emptiness
 	// while the branch above tested the parse meant a daemon_started this binary could not
@@ -111,6 +128,66 @@ func classifyGovernance(reply statusResponse, s sessionStat) governance {
 		return govUnknown
 	}
 	return govHookNeverArrived
+}
+
+// beforeLatestHooks decides a session that started before the latest write of the gate's
+// hooks file, from the hooks history (GOV-B52, hookhistory.go). That mtime alone used to
+// decide it, as "never loaded", and after every upgrade that changed hooks.json it called
+// every session older than the upgrade ungoverned — including ones whose gate had been
+// running for days.
+//
+// Three answers, and the evidence for each is the history's first entry:
+//   - started before an UNSEEDED first entry, written by an install that found no gate
+//     anywhere: no gate existed when it started. Ungoverned, and only a restart fixes it.
+//   - started before a SEEDED first entry: the history begins after the fact, so it cannot
+//     say whether a gate existed then. Unknown.
+//   - started at or after the first entry: it loaded the set in force at its start. Older
+//     hooks, governed.
+//
+// No history to read is unknown, never ungoverned: the conservative rule of this file.
+func beforeLatestHooks(reply statusResponse, started time.Time) governance {
+	if !reply.HookHistoryKnown || len(reply.HookHistory) == 0 {
+		return govUnknown
+	}
+	first := reply.HookHistory[0]
+	firstAt := parseStatusTime(first.At)
+	if firstAt.IsZero() {
+		return govUnknown
+	}
+	if started.Before(firstAt) {
+		if first.Seeded {
+			return govUnknown
+		}
+		return govNeverLoaded
+	}
+	return govOlderHooks
+}
+
+// missingHooksFor names what a govOlderHooks session lacks: the hooks the newest history
+// entry holds that the entry in force at its start did not. Empty when that is not knowable
+// or nothing was added — a rewrite can change a matcher without adding a hook.
+func missingHooksFor(reply statusResponse, s sessionStat) []string {
+	started := parseStatusTime(s.Started)
+	if started.IsZero() || !reply.HookHistoryKnown {
+		return nil
+	}
+	had, ok := hooksAt(reply.HookHistory, started)
+	if !ok {
+		return nil
+	}
+	return missingHooks(reply.HookHistory, had)
+}
+
+// olderHooksDetail is the words for one govOlderHooks session: what it lacks, when known.
+func olderHooksDetail(reply statusResponse, s sessionStat) string {
+	switch m := missingHooksFor(reply, s); len(m) {
+	case 0:
+		return "missing whatever changed since"
+	case 1:
+		return "missing the " + m[0] + " hook"
+	default:
+		return "missing the " + strings.Join(m, ", ") + " hooks"
+	}
 }
 
 // registrationGrace is how long after a session starts its SessionStart is still allowed to be
