@@ -469,6 +469,9 @@ func TestStatusMarksALiveSessionThatNeverRegistered(t *testing.T) {
 		SessionsKnown:  true,
 		HooksInstalled: hooks.Format(time.RFC3339),
 		DaemonStarted:  daemonAt.Format(time.RFC3339),
+		// A first install, so "predates the hooks" means "predates every gate" (GOV-B52).
+		HookHistory:      firstInstall(hooks),
+		HookHistoryKnown: true,
 	}
 	at := func(d time.Duration) string { return hooks.Add(d).Format(time.RFC3339) }
 

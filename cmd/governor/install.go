@@ -157,7 +157,7 @@ func resolvePaths() (paths, error) {
 // It is diagnostics, not measurement: unlike samples.jsonl it is removed by a plain
 // uninstall, as daemon.log always has been.
 var stateFiles = []string{"sock", "statusline.json", daemonPIDFile, daemonLogFile, daemonLogFile + daemonLogRotatedSuffix,
-	daemonStartFile, onboardMarker, surfaceFile, surfaceTempFile, config.File}
+	daemonStartFile, onboardMarker, surfaceFile, surfaceTempFile, config.File, hookHistoryFile, hookHistoryTempFile}
 
 // stateGlobs are patterns rather than names, for the residue whose name is not known in
 // advance. They are matched inside the state directory only, and never recursively.
@@ -503,9 +503,18 @@ func runInstall(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "governor install: %v\n", err)
 		return 1
 	}
+	// Seen BEFORE the hooks file is written, so the history can tell a first install from
+	// an upgrade (GOV-B52, hookhistory.go).
+	hooksBefore := observeHookFileBefore(p.hooks, p.plugin)
 	if err := in.writeFile(p.hooks, hooks); err != nil {
 		fmt.Fprintf(stderr, "governor install: %v\n", err)
 		return 1
+	}
+	// Never fatal: see recordHookHistory.
+	if wrote, err := recordHookHistory(p.state, p.hooks, p.plugin, hooksBefore); err != nil {
+		fmt.Fprintf(stderr, "governor install: hooks history (doctor will report affected sessions as unknown): %v\n", err)
+	} else if wrote {
+		in.record(filepath.Join(p.state, hookHistoryFile), "updated", "when each set of hooks was installed")
 	}
 	if err := in.writeFile(p.command, command); err != nil {
 		fmt.Fprintf(stderr, "governor install: %v\n", err)
@@ -577,7 +586,8 @@ func runInstall(args []string, stdout, stderr io.Writer) int {
 	fmt.Fprintln(stdout, "\nRemove it with: governor uninstall")
 	// The hooks are read when a session starts, so a session already running is not
 	// governed yet. Saying so is the difference between "it does not work" and "restart".
-	fmt.Fprintln(stdout, openSessionsNotice(gateHooksInstalledAt(), signals.LiveSessions))
+	hist, _ := readHookHistory(p.state)
+	fmt.Fprintln(stdout, openSessionsNoticeFrom(hist, gateHooksInstalledAt(), signals.LiveSessions))
 
 	if *noDaemon {
 		// Not verified, and saying so beats printing a report whose daemon-dependent
@@ -1677,29 +1687,65 @@ func readDaemonPID(state string) (int, error) {
 // does not tell someone to restart sessions that are already governed — installer.writeFile
 // leaves a file whose content already matches alone, so its mtime survives a no-op install.
 func openSessionsNotice(hooksAt time.Time, enumerate func(string) ([]signals.LiveSession, error)) string {
+	// Without a history this is a first install at hooksAt, which is the case GOV-29 wrote
+	// it for.
+	var h []hookEpoch
+	if !hooksAt.IsZero() {
+		h = []hookEpoch{{At: hooksAt.UTC().Format(time.RFC3339)}}
+	}
+	return openSessionsNoticeFrom(h, hooksAt, enumerate)
+}
+
+// openSessionsNoticeFrom is openSessionsNotice read against the hooks history (GOV-B52).
+//
+// AN UPGRADE IS NOT AN INSTALL. Every session older than an upgrade that rewrote hooks.json
+// predates the hooks file's mtime, and this used to tell the user all of them would "stay
+// UNGOVERNED" — about sessions whose gate had been running for days. Those keep the hooks they
+// loaded until restarted, which is worth saying, in different words. Only a session older than
+// the first gate this machine had is told it is ungoverned, through the same rule doctor uses.
+func openSessionsNoticeFrom(h []hookEpoch, hooksAt time.Time, enumerate func(string) ([]signals.LiveSession, error)) string {
 	live, err := enumerate("")
 	if err != nil {
 		// No registry to read: say the thing that is true on every machine rather than a
 		// count that would be a guess.
 		return "Sessions already running are NOT governed until you restart them."
 	}
-	var stale []string
+	reply := statusResponse{HookHistory: h, HookHistoryKnown: len(h) > 0}
+	var stale, older []string
 	for _, s := range live {
 		// Interactive only, for the reason doctor filters the same way: restarting is the
 		// only fix, and it is not one a headless run can be given.
 		if s.Kind != "" && s.Kind != "interactive" {
 			continue
 		}
-		if hooksAt.IsZero() || s.Started.IsZero() || s.Started.Before(hooksAt) {
+		if hooksAt.IsZero() || s.Started.IsZero() {
 			stale = append(stale, liveSessionLabel(s))
+			continue
+		}
+		if !s.Started.Before(hooksAt) {
+			continue
+		}
+		if beforeLatestHooks(reply, s.Started) == govNeverLoaded {
+			stale = append(stale, liveSessionLabel(s))
+		} else {
+			older = append(older, liveSessionLabel(s))
 		}
 	}
-	if len(stale) == 0 {
+	if len(stale) == 0 && len(older) == 0 {
 		return "Every Claude Code session now running started after these hooks, so all of them are governed."
 	}
 	sort.Strings(stale)
-	return fmt.Sprintf("%d Claude Code session(s) are running now and will stay UNGOVERNED until restarted: %s",
-		len(stale), strings.Join(stale, ", "))
+	sort.Strings(older)
+	var lines []string
+	if len(stale) > 0 {
+		lines = append(lines, fmt.Sprintf("%d Claude Code session(s) are running now and will stay UNGOVERNED until restarted: %s",
+			len(stale), strings.Join(stale, ", ")))
+	}
+	if len(older) > 0 {
+		lines = append(lines, fmt.Sprintf("%d Claude Code session(s) started before these hooks and keep the ones they loaded until restarted: %s",
+			len(older), strings.Join(older, ", ")))
+	}
+	return strings.Join(lines, "\n")
 }
 
 // liveSessionLabel names a session the way a person would find it: by its directory. It is

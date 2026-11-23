@@ -117,10 +117,14 @@ type statusResponse struct {
 	// which reads as SessionsKnown false — "this daemon cannot tell me" — and every consumer
 	// then says nothing rather than guessing. That is the whole reason they are additive
 	// rather than a protocol bump.
-	DaemonStarted  string        `json:"daemon_started"`
-	HooksInstalled string        `json:"hooks_installed"`
-	SessionsKnown  bool          `json:"sessions_known"`
-	Sessions       []sessionStat `json:"sessions"`
+	DaemonStarted  string `json:"daemon_started"`
+	HooksInstalled string `json:"hooks_installed"`
+	SessionsKnown  bool   `json:"sessions_known"`
+	// The hooks history (GOV-B52). Absent from an older daemon, which reads as "no history":
+	// a session that started before hooks_installed is then unknown, not ungoverned.
+	HookHistory      []hookEpoch   `json:"hook_history,omitempty"`
+	HookHistoryKnown bool          `json:"hook_history_known,omitempty"`
+	Sessions         []sessionStat `json:"sessions"`
 	// SpawnSurface is GOV-30's ledger of spawn tool names the matcher has actually been seen
 	// to catch, per Claude Code version. Only doctor reads it; the status line does not
 	// render it. Absent from an older daemon, which reads as "nothing confirmed".

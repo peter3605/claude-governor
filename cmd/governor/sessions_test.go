@@ -83,6 +83,7 @@ func machineWithSurface(t *testing.T, live []signals.LiveSession, hooksAt, daemo
 		sessions := live
 		d.liveSessions = func() ([]signals.LiveSession, error) { return sessions, nil }
 		d.hooksInstalledAt = func() time.Time { return hooksAt }
+		d.hookHistory = firstInstallHistory(hooksAt)
 		if !daemonAt.IsZero() {
 			d.started = daemonAt
 		}
@@ -282,7 +283,10 @@ func ungovernedReply(sessionStarted, hooksAt, daemonAt time.Time, registered boo
 		V: protocolVersion, Budget: 4, InUse: 0, Thermal: "nominal",
 		DaemonStarted:  daemonAt.UTC().Format(time.RFC3339),
 		HooksInstalled: hooksAt.UTC().Format(time.RFC3339),
-		SessionsKnown:  true,
+		// A first install at hooksAt, which is what GOV-29's machine was (GOV-B52).
+		HookHistory:      firstInstall(hooksAt),
+		HookHistoryKnown: true,
+		SessionsKnown:    true,
 		Sessions: []sessionStat{{
 			Session: sampleSessionID, Live: true, Registered: registered,
 			Started: sessionStarted.UTC().Format(time.RFC3339),
