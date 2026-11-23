@@ -1073,9 +1073,10 @@ func inspectDaemon(endpoint, installed string) daemonState {
 		return daemonState{why: "it is not answering"}
 	}
 	defer conn.Close()
-	_ = conn.SetDeadline(time.Now().Add(daemonInspectTimeout))
+	inspectDeadline := time.Now().Add(daemonInspectTimeout)
+	_ = conn.SetDeadline(inspectDeadline)
 
-	req, err := json.Marshal(statusRequest{V: protocolVersion, Op: "status", Principal: localPrincipal()})
+	req, err := encodeRequest(statusRequest{V: protocolVersion, Op: "status", Principal: localPrincipal(), Client: "install"}, inspectDeadline)
 	if err != nil {
 		return daemonState{why: "its version could not be read"}
 	}

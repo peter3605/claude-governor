@@ -202,8 +202,10 @@ func TestEveryRequestCarriesTheProtocolVersion(t *testing.T) {
 			select {
 			case line := <-lines:
 				var got struct {
-					V  int    `json:"v"`
-					Op string `json:"op"`
+					V          int    `json:"v"`
+					Op         string `json:"op"`
+					DeadlineMS int64  `json:"deadline_ms"`
+					Client     string `json:"client"`
 				}
 				if err := json.Unmarshal([]byte(line), &got); err != nil {
 					t.Fatalf("decode %s request %q: %v", name, line, err)
@@ -213,6 +215,14 @@ func TestEveryRequestCarriesTheProtocolVersion(t *testing.T) {
 				}
 				if got.Op == "" {
 					t.Errorf("%s sent no op (line: %s)", name, line)
+				}
+				// GOV-B49: every request says when its sender gives up, so a reply the
+				// daemon cannot deliver can be classified, and a status says who sent it.
+				if got.DeadlineMS <= time.Now().Add(-time.Minute).UnixMilli() {
+					t.Errorf("%s sent no usable deadline_ms (line: %s)", name, line)
+				}
+				if name == "statusline" && got.Client != "statusline" {
+					t.Errorf("statusline sent client=%q (line: %s)", got.Client, line)
 				}
 			case <-time.After(2 * time.Second):
 				t.Fatalf("%s sent no request", name)
