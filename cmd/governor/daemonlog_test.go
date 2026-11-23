@@ -420,6 +420,14 @@ func TestASleepIsOneLineAndClearsAPreSleepCut(t *testing.T) {
 		"cut 2->1 cause=run-queue rq=6.73 cut=5.52 ceiling=4",
 		"restore 1->4 cause=wake ceiling=4",
 	}
+	if !signals.LoadavgFrozenAcrossSleep {
+		// No correction off darwin: the frozen 6.73 is passed through and cuts the restored
+		// budget on the same tick and the next. The restore is still its own line, not folded
+		// into the cut as `cut 1->2` (which is what CI on Linux caught).
+		want = append(want,
+			"cut 4->2 cause=run-queue rq=6.73 cut=5.52 ceiling=4",
+			"cut 2->1 cause=run-queue rq=6.73 cut=5.52 ceiling=4")
+	}
 	if got := budgetMoves(log.String()); strings.Join(got, "\n") != strings.Join(want, "\n") {
 		t.Fatalf("budget lines:\n  %s\nwant:\n  %s\nwhole log:\n%s",
 			strings.Join(got, "\n  "), strings.Join(want, "\n  "), log.String())

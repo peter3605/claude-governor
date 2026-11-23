@@ -1235,14 +1235,25 @@ func (d *daemon) step(s signals.Sample, demand, inUse bool, away time.Duration) 
 			// Budget() had been answering start() from the old ceiling.
 			cause = budget.MovedCeiling
 		}
-		moved = budgetLine(from, to, cause, d.loop, rq, string(s.Thermal), ceilingFrom)
+		if woke, ok := d.loop.Woke(); ok && cause != budget.MovedWake {
+			// Restored and then moved again on the same tick (GOV-B48): two lines, so the
+			// restore is not reported under the cause of the move that followed it.
+			moved = budgetLine(from, woke, budget.MovedWake, d.loop, rq, string(s.Thermal), ceilingFrom)
+			if next := budgetLine(woke, to, cause, d.loop, rq, string(s.Thermal), ceilingFrom); next != "" {
+				moved += "\n" + next
+			}
+		} else {
+			moved = budgetLine(from, to, cause, d.loop, rq, string(s.Thermal), ceilingFrom)
+		}
 	}
 	d.signalsMu.Unlock()
 	if slept != "" {
 		fmt.Fprintf(d.diag, "governor daemon: %s\n", slept)
 	}
 	if moved != "" {
-		d.event("%s", moved)
+		for _, l := range strings.Split(moved, "\n") {
+			d.event("%s", l)
+		}
 	}
 }
 

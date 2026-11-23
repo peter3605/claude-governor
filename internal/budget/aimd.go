@@ -303,6 +303,9 @@ type Controller struct {
 	// moved names what changed the budget on the most recent Step, or is empty when that
 	// Step left it where it was. See Moved.
 	moved string
+	// woke is the budget a wake restored on the most recent Step, or zero when that Step
+	// restored nothing. See Woke.
+	woke int
 }
 
 // The causes Moved reports. They are the vocabulary of the daemon's budget log (GOV-B29),
@@ -323,6 +326,15 @@ const (
 // and lifts a budget that was at it, then the run queue cuts from the new height. The cut is
 // what the reader needs, so it wins, which is the order Step applies them in anyway.
 func (c *Controller) Moved() string { return c.moved }
+
+// Woke reports the budget a wake restored on the most recent Step, and whether one did.
+//
+// A wake tick can move the budget twice: up to the ceiling, then down again if the same
+// tick's reading cuts it, which is what happens on a platform where the run queue is not
+// corrected (signals.LoadavgFrozenAcrossSleep). Moved names only the last cause, so a log
+// built from Moved alone printed that tick as `cut 1->2 cause=run-queue`, a budget that went
+// UP labelled as a cut. The daemon writes the restore and the cut as two lines from this.
+func (c *Controller) Woke() (int, bool) { return c.woke, c.woke > 0 }
 
 // CutAt and ClimbAt are the run-queue levels this controller cuts above and climbs at or
 // below, for a log line that shows a reading against the threshold it was judged by.
@@ -479,6 +491,7 @@ func (c *Controller) Step(r Reading) int {
 	// it inside the branches, so that a branch which runs but leaves b where it was (a halve
 	// at the floor, a climb at the ceiling) is not reported as a change.
 	c.moved = ""
+	c.woke = 0
 	from := c.b
 	mark := func(cause string) {
 		if c.b != from {
@@ -507,6 +520,7 @@ func (c *Controller) Step(r Reading) int {
 		c.clean = NominalTicksBeforeIncrease
 		c.quiet = 0
 		mark(MovedWake)
+		c.woke = c.b
 	}
 
 	climbing := !r.Stale && Climbing(r, c.climbRunQueue())
