@@ -1517,9 +1517,13 @@ then spent the day in Deep Idle with DarkWakes every few minutes (`DarkWake from
 
 The trace has 99 gaps of more than 30 s between ticks, 9.1 hours in total, the longest 1,078 s.
 
-- **(a) Before sleep.** `loadavg1` was rising or decaying normally; nothing marks the sleep
-  coming. It updates every 5 s and holds between updates, so a 1 Hz sampler reads each value
-  about five times.
+- **(a) Before sleep, the sleep itself is the spike.** `loadavg1` updates every 5 s and holds
+  between, so a 1 Hz sampler reads each value about five times. Before the 09:13:33 clamshell
+  sleep it read 3.84, 4.17, 4.16 up to 14:13:27Z, then **51.23** at 14:13:29Z, one update later:
+  some 590 runnable threads, the system answering the sleep notification. The last value before
+  the gap was 47.85, and that is what froze. The hibernate below shows the same thing: 201.70,
+  220.62, 236.51, 240.95 in the final seconds. **So the frozen value is mostly the sleep's own
+  storm, not the user's workload.** That is where GOV-38's "40-70 load average" came from.
 - **(b) After waking.** On **69 of 99** gaps the first tick after the gap reads the pre-sleep
   value **exactly** (47.85 -> 47.85 across 909 s; 186.68 -> 186.68 across 773 s). On the other 30
   the first tick landed just after a kernel update, and **every one of those moved by at most one
