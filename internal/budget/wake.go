@@ -116,18 +116,45 @@ func (f *WakeFilter) Observe(rq float64, away time.Duration) (out float64, ok bo
 		}
 		f.updates = 1
 	}
-	m := math.Exp(-float64(f.updates) * LoadavgPeriod.Seconds() / LoadavgTau.Seconds())
-	memory := f.frozen * m
+	// Counting changes can miss an update but never invent one, and a miss leaves too much
+	// memory to subtract: the corrected reading comes out LOW, which is the oversubscribing
+	// direction. The hibernate of 2026-11-22 22:02-22:07 did exactly that. Entering and
+	// leaving it spans two updates (240.95 -> 209.91 on the first tick, a ratio of 0.871 where
+	// one update allows 0.92 at the least), so a count of one read an idle machine one tick
+	// before the run queue reached 35 per core. A runnable count cannot be negative, so a
+	// negative result is proof of a missed update, and the count is raised until it is not.
+	// wakeMaxMissed bounds that: the trace never showed more than two at a transition.
+	var m, memory, fresh float64
+	for missed := 0; ; missed++ {
+		m = math.Exp(-float64(f.updates) * LoadavgPeriod.Seconds() / LoadavgTau.Seconds())
+		memory = f.frozen * m
+		fresh = (rq - memory) / (1 - m)
+		if fresh >= -wakeMissShare*f.frozen || missed == wakeMaxMissed {
+			break
+		}
+		f.updates++
+	}
 	if memory < wakeMemoryFloor {
 		f.waking = false
 		return rq, true
 	}
-	fresh := (rq - memory) / (1 - m)
 	if fresh < 0 {
 		fresh = 0
 	}
 	return fresh, true
 }
+
+// wakeMaxMissed is how many updates the filter will assume it missed at one reading.
+//
+// wakeMissShare is how far below zero, as a share of the frozen run queue, a corrected reading
+// must fall to count as a miss rather than rounding. A missed update puts it near
+// -0.92 x frozen (one update's worth of memory left in, divided by one update's weight);
+// rounding of a value kept in 1/2048ths, or read to two decimals as the measurements in this
+// file are, stays within a fraction of a percent. 5% sits far from both.
+const (
+	wakeMaxMissed = 3
+	wakeMissShare = 0.05
+)
 
 // Before is the raw run queue on the last tick before the most recent sleep: the value the
 // kernel froze.

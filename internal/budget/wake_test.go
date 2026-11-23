@@ -90,6 +90,36 @@ func TestWakeFilterRemovesExactlyThePreSleepMemory(t *testing.T) {
 	}
 }
 
+// TestWakeFilterAfterHibernate replays the measured hibernate of 2026-11-22 (Low Power Sleep
+// at 22:02:07, Wake from Hibernate at 22:07:09, 8 cores). The first tick after it is TWO
+// updates on from the frozen value, which a change count sees as one. The corrected reading
+// must not come out as an idle machine on that tick, and must read the restore storm (a
+// runnable count above a thousand) on the next.
+func TestWakeFilterAfterHibernate(t *testing.T) {
+	const cores = 8
+	f := WakeFilter{Frozen: true}
+	f.Observe(240.95/cores, 0)
+	first, ok := f.Observe(209.91/cores, 301*time.Second)
+	if !ok {
+		t.Fatal("first tick after hibernate held as stale; it had already moved")
+	}
+	// Two updates toward n from 240.95 reach 209.91 for n = 38.9, 4.86 per core.
+	if math.Abs(first-4.86) > 0.05 {
+		t.Errorf("first tick after hibernate corrected to %.3f per core, want ~4.86 (two updates, not one)", first)
+	}
+	second, _ := f.Observe(283.43/cores, 0)
+	if second < 50 {
+		t.Errorf("restore storm corrected to %.1f per core, want > 50 (raw 35.4 is the average still catching up)", second)
+	}
+	c := &Controller{Max: 4, RunQueueMax: 5.52}
+	c.Step(Reading{RunQueue: 240.95 / cores, InUse: true})
+	c.Step(Reading{RunQueue: 240.95 / cores, InUse: true})
+	c.Step(Reading{RunQueue: first, Woke: true, InUse: true})
+	if b := c.Step(Reading{RunQueue: second, InUse: true}); b != 2 {
+		t.Errorf("budget on the storm tick: %d, want the restored 4 halved to 2", b)
+	}
+}
+
 // TestWakeFilterHoldIsBounded: an update that leaves the average unchanged is possible (the
 // runnable count equalled it), and the filter must not hold forever waiting for a change.
 func TestWakeFilterHoldIsBounded(t *testing.T) {

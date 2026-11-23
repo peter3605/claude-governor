@@ -1535,12 +1535,26 @@ The trace has 99 gaps of more than 30 s between ticks, 9.1 hours in total, the l
   queue at wake would have admitted builds into that.
 - **DarkWakes are busy too.** Load averages of 20 to 210 during the 45-second maintenance
   wakes, and the controller cut 14 times between 09:13 and 20:31 with nobody at the machine.
-- **Hibernate is NOT YET MEASURED.** Nothing hibernated in the trace's 23-hour window, and
-  forcing it needs `sudo pmset`. The 2026-11-21 hibernate's samples rotated away (GOV-38's
-  trap); its `daemon.log` survives and shows the refusals above. Whether the frozen value reads
-  the same after a restore from the hibernate image is to be recorded here the next time the
-  machine hibernates; until then it is an inference that it does, and the code does not depend
-  on it beyond what the next paragraph's detection already handles.
+- **(c) Hibernate, measured the same night.** The battery was run down under load and the
+  machine was woken on the charger:
+
+      2026-11-22 22:02:07 -0500 Sleep  Entering Sleep state due to 'Low Power Sleep':TCPKeepAlive=inactive Using Batt (Charge:1%) 302 secs
+      2026-11-22 22:07:09 -0500 Wake   Wake from Hibernate [CDNVA] : due to acattach/UserActivity Assertion Using AC (Charge:2%)
+
+  The trace's gap is 300.96 s (03:02:09Z to 03:07:10Z). Before it, `loadavg1` was 240.95 (30.12
+  per core). The first tick after it read **209.91**: a ratio of 0.871. That is **two** updates on
+  from the frozen value (two allow 0.846 at the least, one allows 0.920), not the gap's worth
+  (e^(-301/60) = 0.0066). So the freeze holds across a restore from the hibernate image too, but
+  entering and leaving hibernate spans two kernel updates where a Deep Idle sleep spans at most
+  one. The restore then had a large real storm: 283.43 one second later, then 313.82, 334.66,
+  379.37, 405.04, 418.89 and a peak of **431.07 (53.9 per core) 32 s after the wake**, decaying
+  from there (339.94 at 61 s). Back-solved, the first post-wake update saw over a thousand
+  runnable threads: everything thawing at once. The daemon running at the time was the
+  pre-GOV-B48 build. It went into the hibernate cut to 1 (21:55:45, run queue 8.30) and stayed
+  there, which on this wake was the right answer for the wrong reason.
+- **On this hardware there is no other route into hibernate.** `pmset -g log` reports
+  `hibmode=3 standbydelaylow=0 standbydelayhigh=0`: a long sleep never becomes a hibernate. Only
+  `Low Power Sleep` at 1% does, which is how both 11-21 and this measurement got there.
 - **Go's monotonic clock does not count sleep.** go1.26's `runtime.nanotime` is
   `mach_absolute_time` on darwin and `CLOCK_MONOTONIC` on Linux; neither advances during sleep
   or suspend. `time.Since` between two ticks either side of a twelve-hour sleep reads about one
@@ -1568,7 +1582,10 @@ so a long silence between budget lines reads as a sleep, not a hold.
 **Chosen: the last row.** The memory is known exactly. After k updates since wake the kernel
 reads `la_k = la_0 * m_k + (1 - m_k) * n̄` with `m_k = e^(-5k/60)`, so
 `n̄ = (la_k - la_0 * m_k) / (1 - m_k)` is the load since wake with the pre-sleep part removed and
-nothing else. `budget.WakeFilter` counts updates by watching the value change, holds the loop
+nothing else. `budget.WakeFilter` counts updates by watching the value change, raises the count
+when the result comes out negative (a runnable count cannot be, so that is a missed update:
+the hibernate's two-update transition, which a change count reads as one and which would
+otherwise have read an idle machine on the first tick after the wake), holds the loop
 (`Reading.Stale`: no cut, no climb; thermal still floors) until the first one, gives up waiting
 after 7 ticks (an update that leaves the average unchanged means the runnable count equalled
 it, so the reading was never stale), and hands raw readings back once the pre-sleep share is
