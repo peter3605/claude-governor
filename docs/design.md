@@ -1264,7 +1264,8 @@ week and must be re-derived against the 11× figure before `Bash` is actually ga
 ### 5.6 How long a `Bash` lease lives, and why the reaper is the primary mechanism
 
 A subagent lease is returned by `SubagentStop`, and the TTL is a backstop for the rare lost
-event. **A `Bash` lease is not like that.** `hook-surface.md` §19 measured `PostToolUse` on
+event. A subagent still working at the TTL is renewed rather than reaped (§5.6e). **A `Bash`
+lease is not like that.** `hook-surface.md` §19 measured `PostToolUse` on
 `Bash` and found it wrong in both directions: absent when the command failed, and present while
 the command was still running when it was backgrounded or timed out. Invariant 2's posture —
 *assume the stop hooks never fire; leaks are the default outcome* — is, on this path, no longer
@@ -1616,6 +1617,70 @@ so the build lease taken before the 2026-11-21 hibernate was reaped at 13:57:48 
 `slots=1.08/1`. A build suspended by sleep is still running when the machine wakes, so the
 monotonic TTL is defensible. With the budget restored to its ceiling it no longer refuses a
 build on its own.
+
+### 5.6e How long an agent lease lives (GOV-B50, decided 2026-11-23)
+
+**The question.** GOV-38 (surprise 7) counted agent leases released by the reaper at about
+30 min, the confirmed TTL. Each one was either a subagent still running at 30 min, so released
+too early and from then on ungoverned, or a subagent that had ended without its `SubagentStop`
+reaching the daemon, so a gap in the hooks. The TTL's own comment said an agent's life was
+"bounded well under a minute", from 26 Agent calls in 2026-09.
+
+**Measured: every `kind=agent ... by=reaper:expired` line in `daemon.log`, 2026-11-15 to
+2026-11-23, matched to its subagent's transcript.** Each subagent has
+`projects/<slug>/<session>/subagents/agent-<agent_id>.jsonl`, which records every hook that ran
+inside it with the governor's stderr, and a `.meta.json` beside it (hook-surface.md §27). A
+release is matched by start time (`release - held`, within 1 s for 19 of them). Where sleep
+broke that arithmetic, because `held` is monotonic, it is matched by the subagent that was
+running across it. There were 25 releases: 2, 1, 1, 7, 12 and 2 on 11-15, 11-16, 11-19, 11-21,
+11-22 and 11-23. GOV-38's count of 8 on 11-22 was taken before the day ended.
+
+| Outcome | n | Evidence |
+|---|---|---|
+| **still running at the TTL, released too early** | **22** | lived 30.1 to 78.2 min awake (19), or 164 to 257 wall-clock min across a sleep (3). In **22 of 22** its `SubagentStop` fired later and the governor answered `ok=false reason="no_lease"` |
+| ended without a `SubagentStop`: **sleep** | 1 | 11-19, `1becacfd`: "Fix round 1 for T-038" started 01:38:50 and ended 04:22 with "API Error: Your computer went to sleep mid-response". No `SubagentStop` in its transcript. Reaped at 10:15:54 after 30 awake minutes |
+| ended without a `SubagentStop`: killed session, hook not firing | 0 | — |
+| *tentative* TTL (30 s), not this question | 2 | 11-16: `PreToolUse` granted, then the auto-mode classifier errored and the Agent call never ran. Correct. 11-23: an `isolation: worktree` agent's `SubagentStart` came 35 s after its `PreToolUse`, so it confirmed nothing and ran unleased (GOV-B55) |
+
+So the hooks were not the problem. `SubagentStop` fired for every subagent that ended normally,
+and the one lost was a subagent killed by sleep. The problem was the TTL. Across all 360
+governed subagents on the machine, a subagent's life was p50 6.4 min, p90 30.2 min, p99 223 min,
+max 732 min, and **10.3% outlived 30 min**. Most of them were long implementer and tester runs
+from a stepstool orchestrator. That is ordinary use, not an edge.
+
+**The three options, and what each costs in each direction:**
+
+| | Live subagent released early (governor not governing) | Dead subagent's lease kept (slot wasted) |
+|---|---|---|
+| **keep 30 min** | 22 in 8 days, 10% of subagents. Each runs ungoverned for the rest of its life, up to 4 h here | ≤ 30 min × 0.08 slots, once (the 11-19 case) |
+| **raise the TTL** | 240 min still loses 0.8%. No TTL covers a 732 min tail | every lost stop holds 0.08 slots for the whole TTL, hours |
+| **renew while the transcript shows the subagent alive** | 0 of the 22 measured, provided the files are found (otherwise as today) | a lost stop is still reaped at 30 min, because its meta file says `finished`. A hung subagent that stops writing is renewed at most once more |
+| **fix the missed release** | does nothing for the 22: their release was not missed | the 1 case is a subagent killed by sleep, which no hook reports |
+
+**Decided: renew.** At the TTL, the reaper asks `lease.Liveness.Working` about a confirmed Agent
+lease. This is a second method on the existing seam, implemented by `PIDLiveness`, with no
+second implementation. It renews the lease for another TTL only on positive evidence:
+
+1. the session is not dead;
+2. exactly one `agent-<agent_id>.meta.json` exists for the session and agent, parses, and does
+   not say `"finished": true`;
+3. the subagent's `.jsonl` was modified, on the wall clock, after the lease was granted or last
+   renewed.
+
+Every other answer is "not working" and the TTL reaps as before. That covers no file, two
+files, another `CLAUDE_CONFIG_DIR`, an unsafe ID, an unparseable file, and no writes since. The
+uncertain answer is the opposite of `Alive`'s, for the same reason: `Alive` can only shorten a
+life and `Working` can only lengthen one, so each resolves doubt towards what was there before.
+
+Clause 3 is checked on the wall clock deliberately. A subagent's lease clock stops while the
+machine sleeps and its transcript's mtime does not, and the 3 sleep cases each wrote before the
+sleep and resumed after it. The 30 min TTL is unchanged, and it still collects the one real
+lost stop: that subagent's meta file was finished. `Working` is asked only at the TTL, not
+every reaper tick. `SubagentStop` was reliable for 22 of 22, so reading `finished` on every
+tick would only shorten the 11-19 kind of leak, at the cost of a glob per agent lease every 2 s.
+
+`TestAStillWorkingSubagentKeepsItsLeasePastTheTTL` replays `1becacfd`'s 78 min "Fix round 2
+for T-047". With the renewal disabled, it fails at 30m0s with `Why: expired`.
 
 ## 6. Allocation
 
@@ -2633,7 +2698,17 @@ Named so they are not mistaken for settled:
   reads every `<tool-use-id>` regardless.
 - A background task's output-file layout anywhere but `/tmp/claude-<uid>`, and on Linux at all.
   The task-file check reads "not found" as "alive", so the cost of being wrong is the TTL.
+- A subagent's `meta.json` for a **nested** subagent (`spawnDepth` 2 or more), and for one
+  resumed with `SendMessage` (hook-surface.md §27.4). All 370 on this machine are depth 1.
+  `Working` reads "not found" as "not working", so the cost of being wrong is today's TTL.
 - Linux: every measurement above is macOS. Re-run the probe on Linux before trusting §10 there.
+
+**No longer on this list, measured 2026-11-23 on 2.1.310 to 2.1.330 for GOV-B50**
+(`hook-surface.md` §27): `SubagentStop` fires for a subagent that ends normally however long
+it ran (22 of 22 that outlived the TTL, up to 257 min). It does not fire for a subagent killed
+by the machine sleeping mid-response (1 of 1). Each subagent's `meta.json` gains
+`"finished": true` when it ends, never before `SubagentStop`, and also when no `SubagentStop`
+fires.
 
 **No longer on this list, measured 2026-11-20 on 2.1.327 for GOV-B41** (`hook-surface.md` §26):
 §19's "a background task's completion raises no event of any kind" was true only of the events

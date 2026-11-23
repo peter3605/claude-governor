@@ -39,11 +39,15 @@ import (
 // real, for the more mundane reason that the Agent tool is called rarely: 26 times in every
 // transcript on the machine.
 //
-// What evidence exists bounds an agent's life well under a minute — 1.7 s to 8.3 s across the
-// probe sessions, a p95 of 42.7 s and a maximum of 43.2 s across those 26 Agent tool calls,
-// and 22.8-23.1 s across the three deliberately slow agents GOV-27 ran. Half an hour is ~40x
-// the longest of those. It stays generous on purpose, and it stays a guess about the tail
-// rather than a measurement of it.
+// What evidence existed then bounded an agent's life well under a minute — 1.7 s to 8.3 s
+// across the probe sessions, a p95 of 42.7 s and a maximum of 43.2 s across those 26 Agent
+// tool calls. Half an hour was ~40x the longest of those.
+//
+// THAT BOUND DID NOT SURVIVE REAL USE (GOV-B50, design.md section 5.6e). Across 360 governed
+// subagents by 2026-11-23 the life was p50 6.4 min, p90 30.2 min, max 731.6 min, and 10.3%
+// outlived 30 min. Of the 23 agent leases the TTL reaped, 22 were still running and one was a
+// lost SubagentStop. So the TTL stays 30 min as the backstop for that one, and a lease whose
+// subagent can be shown still working is renewed at the TTL instead of reaped (renewsLocked).
 const (
 	DefaultTentativeTTL = 30 * time.Second
 	DefaultConfirmedTTL = 30 * time.Minute
@@ -936,6 +940,11 @@ func (t *Table) Reap() []Released {
 		var why string
 		switch {
 		case !l.ExpiresAt.IsZero() && now.After(l.ExpiresAt):
+			if t.renewsLocked(l, dead) {
+				l.RenewedAt = now
+				l.ExpiresAt = now.Add(t.opt.ConfirmedTTL)
+				continue
+			}
 			why = "expired"
 		case dead[l.Session]:
 			why = "session-dead"
@@ -967,6 +976,22 @@ func (t *Table) Reap() []Released {
 		}
 	}
 	return dropped
+}
+
+// renewsLocked reports whether a lease that has reached its TTL should be renewed rather than
+// reaped: a confirmed Agent lease, in a session that is not dead, whose subagent Liveness can
+// show is still working (GOV-B50).
+//
+// THE MEASURED CASE. Across 11-15 to 11-23, 23 confirmed agent leases were reaped at the
+// 30 min TTL and 22 of those subagents were still running: they went on for 30.1 to 257 min of
+// wall-clock time, and every one's SubagentStop fired afterwards and found no lease. The TTL
+// was releasing live agents, not catching lost hooks (design.md section 5.6e).
+//
+// Only Agent leases. A Build lease's TTL is the measured control constant of section 5.6, and
+// a tentative lease has no subagent yet to ask about.
+func (t *Table) renewsLocked(l *Lease, dead map[string]bool) bool {
+	return l.Kind == Agent && l.State == Confirmed && l.AgentID != "" &&
+		!dead[l.Session] && t.opt.Liveness != nil && t.opt.Liveness.Working(*l)
 }
 
 // deadSessionsLocked names the registered sessions whose own process is gone.

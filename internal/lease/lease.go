@@ -78,10 +78,15 @@ type Lease struct {
 	// section 26), and the main thread's are reported by a task notification.
 	BackgroundAgent string
 	GrantedAt       time.Time
-	ExpiresAt       time.Time
-	AgentID         string
-	OwnerPID        int
-	OwnerStarted    time.Time
+	// RenewedAt is when the reaper last renewed this Agent lease at its TTL because its
+	// subagent was still working (GOV-B50), or zero if it never has been. Liveness.Working
+	// asks for transcript activity since this, or since GrantedAt before the first renewal,
+	// so a subagent that has stopped writing stops being renewed.
+	RenewedAt    time.Time
+	ExpiresAt    time.Time
+	AgentID      string
+	OwnerPID     int
+	OwnerStarted time.Time
 }
 
 // Liveness answers whether the holder of a lease is still running.
@@ -91,6 +96,15 @@ type Lease struct {
 // lease double-counts the budget, while keeping a dead one costs a slot for one TTL.
 type Liveness interface {
 	Alive(l Lease) bool
+	// Working reports POSITIVE evidence that a confirmed Agent lease's subagent is still
+	// running, and is asked only when that lease reaches its TTL (GOV-B50, design.md section
+	// 5.6e). A true answer renews the lease for another TTL; anything else lets the TTL reap
+	// it exactly as before.
+	//
+	// ITS UNCERTAIN ANSWER IS THE OPPOSITE OF ALIVE'S, and for the same reason. Alive can only
+	// shorten a lease's life, so doubt resolves to "alive"; Working can only lengthen it, so
+	// doubt resolves to "not working". Either way, not knowing costs what it cost before.
+	Working(l Lease) bool
 }
 
 // Released is a lease that has just left the table, and when and why.
