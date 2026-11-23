@@ -509,3 +509,271 @@ daemon that can name its cut").
 Tests: `TestARaisedCeilingIsReachedWithoutDemand` and
 `TestARecoveredCutReturnsToTheCeilingOnAnIdleMachine` replay the two observations. Against the
 controller from before this change, both fail, along with the four tests of the new `cut` rule.
+
+## A week on the released build (GOV-38)
+
+Every earlier section of this file ran a build from the working tree. This one runs what a
+stranger gets: governor 0.1.6 from the Homebrew tap, installed on the real HOME. The hooks run
+`~/.claude/skills/build-governor/bin/governor`, byte-identical to `/opt/homebrew/bin/governor`.
+One entry per day. The subjective fields (did the budget feel right, refusals disagreed with,
+overrides used) are the owner's report. Everything else comes from `daemon.log` and `doctor`.
+
+**Overrides are in the log.** Every `limit`, `pause`, `resume` and `boost` writes a
+`budget control …` line to `daemon.log` (since GOV-B01), so the override row in each entry is
+checked against the log, not taken on memory. The *reason* for an override is the owner's
+word.
+
+### Day zero, 2026-11-14 (released build from 22:11 only)
+
+The released daemon (PID 74409, `0.1.6 build 78ae6a98f019`) started at **22:11:49**. Until then
+the machine ran dev daemons (`0.0.0-dev` builds 7673c843 and 67c63bc8), so nothing logged on
+11-14 before 22:11 counts as evidence about the shipped artifact. That covers 35 `reason=depth`
+denies between 00:07 and 16:33, a run-queue cut 4→2→1 at 21:50 followed by a park that was
+granted in 5.6s and an idle restore to 4 at 21:52, and one `write: broken pipe` at 21:50:54. They
+are listed here so it is clear they were looked at and left out of the week, not missed.
+
+- **On the released build:** about two minutes of governed use. One Medium build lease, held
+  5.4s (peak `in_use=1/4` at 22:12:22, released by PostToolUse at 22:12:27). No cuts, parks or
+  denies. Budget 4 of ceiling 4 throughout.
+- **Did the budget feel right:** yes.
+- **Refusals disagreed with:** none. There were no refusals on the released build.
+- **Overrides:** none (no `budget control` lines in `daemon.log`).
+- **Doctor:** clean after the upgrade (18/18, as recorded on GOV-B40).
+- **Upgrade (clause 4: recorded, not counted).** The 22:11 install replaced a running dev-build
+  daemon with brew's 0.1.6. Session `f0da448c` stayed attached across it: it held leases on the
+  dev daemon at 21:33 and 21:40, then on the 0.1.6 daemon at 22:12, with no hang. Install said to
+  restart sessions, and seven sessions ended between 22:04 and 22:11. This does not count as
+  clause 4 because it was not one published release replacing another over a running daemon.
+  Clause 4 stays open for the next `brew upgrade`.
+- **Calibration as the week starts.** `governor calibrate` was run three times on 11-14 (02:13Z,
+  02:31Z and 03:11Z) and produced run-queue cuts of 4.61, 4.76 and 4.70. The run before those, on
+  11-03, gave 6.59. The week runs at **4.70**, measured at an ambient loadavg1 of 3.18 (0.40 per
+  core) and a probe of 5.57 effective cores of 8. This is not a surprise from the week. It is the
+  starting condition, and the verdict (clause 5) has to say whether 4.70 or 6.59 is the right cut
+  for this machine.
+
+### Day 1, 2026-11-15 (Sunday)
+
+- **Governed activity to 12:00:** none. Nothing was written to `daemon.log` between 22:13 on
+  11-14 and 12:01. Six live sessions were registered and idle (`status`: budget 4, 0 in use,
+  cpu 0.19, thermal nominal).
+- **From 12:00 (written up on 11-20 from the log): the busiest day of the week.** 157 build
+  leases (149 Medium, 8 Heavy) and 96 agent leases. 38 builds refused on `capacity`. 53 parked:
+  22 granted after waiting and **31 that waited and gave up**, which is a refusal by another
+  name. 22 run-queue cut episodes at rq 4.90-8.62 per core. Only 4 of them reached 6.59, the
+  cut this machine ran at before 11-14's re-calibration. 24 build leases were released by the
+  reaper rather than by their build (surprise 3).
+- **Did the budget feel right:** yes, as reported at about 12:00. The afternoon and evening,
+  which held nearly all of the day's contention, were not asked about on the day.
+- **Refusals disagreed with:** none.
+- **Overrides:** none (no `budget control` lines in `daemon.log`).
+- **Doctor:** 17 of 18 passing, 1 unknown. `spawn: no spawn seen yet on Claude Code 2.1.325`.
+  Claude Code updated overnight, and the hook surface was last seen firing on Agent at 2.1.316,
+  2.1.319 and 2.1.322. The check is behaving as designed: it reports that nothing has confirmed
+  the matcher on the new version yet. It does not report a fault. (Surprise 1.)
+
+### Days 2-6, 2026-11-16 to 11-20 (written up on 11-20 from the log)
+
+**No session asked the owner about these days while they happened.** The subjective fields
+(did the budget feel right, refusals disagreed with) are recorded as *not captured*, not
+filled in afterwards. A judgement made at the end of the week about a Tuesday is not evidence
+about that Tuesday. Everything else comes from `daemon.log`. No day has a `budget control`
+line, so no override was used all week. `doctor` was run on 11-15 and 11-20 only, and passed
+18 of 18 on 11-20.
+
+| Day | Builds (Heavy) | Agents | Refused | Cut episodes | Budget below 4 for | `broken pipe` |
+|---|---:|---:|---:|---:|---|---:|
+| Mon 11-16 | 7 (1) | 97 | 2 (`depth`) | 0 | - | 1 |
+| Tue 11-17 | 0 | 7 | 0 | 2 | 22:56 → 06:04 next day | 33 |
+| Wed 11-18 | 0 | 21 | 0 | 9 | most of the day (see below) | 31 |
+| Thu 11-19 | 0 | 1 | 0 | 4 | 02:08 → 10:42, then minutes | 10 |
+| Fri 11-20 | 0 | 3 | 0 | 2 | minutes | 4 |
+
+- **Mon 11-16:** ordinary use, mostly subagents. Four build leases were reaper-expired
+  (surprise 3). No cuts.
+- **Tue 11-17 to Thu 11-19: the budget was held at 1 for long stretches with almost nothing
+  asking for it.** A cut at 22:56 on 11-17 (rq 5.76 per core, a load average near 46 on 8
+  cores) held the budget at 1 for **7.1 hours**, until an idle restore at 06:04. On 11-18 it
+  was below 4 from 06:57 to 08:28, 08:46 to 10:37, 12:08 to 14:49, 15:39 to 16:46, 19:31 to
+  23:23 and 23:40 to 01:38, with rq peaking at 9.23 per core. A cut at 02:08 on 11-19 held for
+  **8.6 hours**. In each case the controller behaved as designed: an idle restore needs the run
+  queue below the climb level of 4.20 per core, and it wasn't. No build was refused because of
+  it, since none was asked for. What is unexplained is the load (surprise 4).
+- **Fri 11-20:** two short cuts (rq 5.13, 5.77), each recovered within three minutes.
+- **Did the budget feel right / refusals disagreed with:** not captured for any of the five
+  days.
+
+### Day 7, 2026-11-21 (Saturday; written up on 11-22 from the log)
+
+The owner's answers were given on 11-22, the day after, and are labelled that way. That is
+closer than days 2-6 got, but it is still not on the day.
+
+| Day | Builds (Heavy) | Agents | Refused | Cut episodes | Budget below 4 for | `broken pipe` |
+|---|---:|---:|---:|---:|---|---:|
+| Sat 11-21 | 237 (52) | 43 | 15 (`capacity`) | 6 | 01:51 → 14:03, then minutes | 20 |
+
+- **The second-busiest day of the week, and the most Heavy builds by far.** 52 Heavy leases,
+  against at most 8 on any earlier day. Nearly all came from stepstool: one session
+  (`1becacfd`) from 16:00 to 22:00, then a second session (`356dc884`) with 19 Heavy builds
+  between 22:00 and 23:00. 15 builds parked: 4 were granted after waiting and 10 waited 20 s
+  and gave up. All 15 refusals were stepstool, all `capacity`: around 00:07, from 13:53 to
+  13:56, at 16:34, and from 22:23 to 22:29.
+- **Surprise 4 happened again, for longer, and this time it cost refusals.** A cut at 01:51
+  (rq 6.73 per core against the 4.70 cut) held the budget at 1 for **12.2 hours**, until a
+  climb at 14:03 (rq 0.80). Nothing asked for a slot until 13:53. Then stepstool was refused
+  4 times in three minutes at `slots=1.08/1`, with the budget still pinned from overnight. This
+  is the first time the overnight hold refused real work, not just an idle machine. The 1 Hz
+  samples that could name the load are already gone. The trace log keeps about 23 hours, and
+  its oldest file starts at 21:51 on 11-21.
+- **Other cuts were short or explained by the work itself.** Cuts at 14:13 (21 s), 20:51
+  (1.6 min) and 21:54 (1.6 min) recovered quickly. Cuts at 22:00 (rq 8.05) and 22:33 (rq 4.94)
+  held until 22:29 and 23:49, during the second stepstool session's Heavy burst. That is the
+  governor doing its job.
+- **Reaper releases: 14.** 7 build leases at about 300 s (2 of them Heavy), which is GOV-B41's
+  pattern; the hooks that fix it were installed on 11-22. And **7 agent leases at 30 min**, all
+  stepstool, which is new (surprise 7).
+- **Broken pipes: 20.** 9 of them fell between 22:00 and 22:18, during the Heavy burst, and
+  one came at 01:51:36 alongside the overnight cut. Unlike 11-17 to 11-19, this was a busy day,
+  so a gate giving up is a plausible client (surprise 6).
+- **Did the budget feel right:** yes (owner, 11-22).
+- **Refusals disagreed with:** none. The owner did not notice them, including the 13:53 ones
+  (owner, 11-22).
+- **Overrides:** none (no `budget control` lines in `daemon.log`).
+- **Doctor:** not run on 11-21. On 11-22, around the 0.1.7 upgrade (GOV-B46), it passed every
+  check except `sessions`, which named the sessions to restart.
+
+### Surprises and how each is resolved (clause 3)
+
+1. **Doctor `spawn: unknown` after Claude Code 2.1.325 arrived (11-15).** *Understood and
+   correct; resolved 11-15 13:04.* One trivial subagent was spawned on 2.1.325 to settle it. The
+   gate leased it and `SubagentStop` released it (`kind=agent weight=0.08 held=2.209s
+   by=SubagentStop`), and `doctor` then read `spawn: matcher confirmed firing by real spawns
+   (Agent on 2.1.325)`, 18 of 18 passing. The unknown only meant no spawn had happened yet on the
+   new version, which is what the check is for. Expect it again after each Claude Code update.
+2. **"Overrides never reach `daemon.log`" (raised 11-15, withdrawn the same day).**
+   *Understood and correct; not a defect.* It came from a search of the code for logging near
+   the word "override", which missed that `control()` in cmd/governor/daemon.go logs every
+   verb through `d.event("control …")`, written as `budget control …` (GOV-B01). The log has
+   zero such lines since it began on 11-01 because no override was used, which matches the
+   owner's report. Recorded rather than deleted, so the week's record shows the claim was made,
+   checked, and withdrawn.
+3. **A build Claude Code moves to the background holds its slot for the full five-minute TTL
+   (11-15/16).** *Filed as GOV-B41.* 25 build leases were released by the reaper at about
+   301 s, 24 of them from one earbrief session: 15 `pytest` runs that hit the Bash timeout and
+   were moved to the background, and 8 `run_in_background` builds. They account for 66% of the
+   window's build slot-seconds, and that session took 29 capacity refusals. The hold itself is
+   deliberate (`buildFinish`). What's missing is any signal for when a background task ends.
+4. **Load average near 40-70 overnight, holding the budget at 1 for 7-8.6 hours (11-17 to
+   11-19).** *Explained 11-22: the machine was asleep. Filed as GOV-B48 for what it costs at
+   wake.* The run queue stayed above 4.20 per core all night with no
+   governed work running. The 1 Hz samples that could name the process are lost (surprise 5).
+   On 11-20 at 23:00 the load was normal (0.9 per core), with one `xcodebuild` in the
+   uninterruptible state. On macOS, processes in that state count toward the load average
+   without using CPU, which is a lead and not a finding. It resolves when it either recurs and
+   is caught with `top`, or the week's verdict explains it.
+   **Recurred 11-21:** held at 1 from 01:51 to 14:03 (12.2 h), and refused 4 stepstool builds
+   at 13:53-13:56 before it lifted (Day 7). The samples were again lost to rotation before anyone
+   looked, so catching it needs a deliberate capture the next time it happens.
+   **Cause, from `pmset -g log` (11-22).** Every long hold starts at a sleep. On 11-17 the cut
+   at 22:56 is the second a `Clamshell Sleep` began (22:56:18). On 11-21 the display went off at
+   01:51:35, the cut came at 01:51:36, and the machine slept on low battery at 01:51:40. It stayed
+   in hibernate until 13:53:30, and the first refusal came at 13:53:46. The daemon does not tick
+   while the machine sleeps, so a "12-hour hold" is 12 hours of nothing running. The 40-70 load
+   average is the burst as the machine goes to sleep, carried across the sleep. It was never a
+   hidden process, and the `xcodebuild` lead is withdrawn. What it costs is real but narrow: for
+   a few minutes after wake, the controller judges a just-woken machine on pre-sleep numbers and
+   refuses work, as it did 4 times on 11-21. That is GOV-B48.
+5. **A Phase 0 sampler has been writing to a deleted file since 11-01 (found 11-20).** *Filed
+   as GOV-B42. Process stopped on the owner's instruction at 23:34 on 11-20, freeing 1.1 GiB.
+   The stop is temporary:* the five Phase 0 hooks in `~/.claude/settings.json` still name the
+   September binary, and its `trace ensure` restarts the sampler at the next SessionStart. `governor trace sample` (PID 23958, from the pre-Homebrew
+   `~/.local/share/claude-governor` install, running since 2026-09-21) holds file descriptor 4
+   on a `samples.jsonl` with link count 0. That file is 1.17 GB and growing, and nothing can
+   read it. The rotation on 11-01 replaced the file under it. `doctor`'s `strays` check looks
+   only for daemons, so it reports nothing. Left running: the process is the owner's to stop.
+   **Resolved by GOV-B42 (#103, shipped in 0.1.7).** `doctor` now has a `trace` check that
+   catches both the old-build hooks and a sampler writing to a replaced or deleted log. The owner
+   chose to re-install trace from the current build, and on 11-22 `doctor` reports `ok trace`:
+   the hooks and the sampler run the hooked build and write the live log.
+6. **About 80 `write reply: broken pipe` lines over the week, most of them on days with no
+   build requests (33 on 11-17, with 0 builds and 7 agents).** *Partly explained; filed as GOV-B49.* A client
+   hung up before the daemon replied. That is how a gate that gave up looks, but on days with
+   no gate requests the client is something else, perhaps a status reader. On 11-22, 28 of
+   the 156 lines since 11-14 were found within 2 s of a sleep or wake transition in `pmset -g log`,
+   about 28 times what chance would give. The rest cannot be traced to a client, because the log
+   line does not name the op it was replying to. GOV-B49 adds that and classifies them.
+7. **Agent leases released by the 30-minute reaper, more often (11-21).** *Filed as GOV-B50.* 7 on
+   11-21 and 8 on 11-22, all or mostly stepstool, against 1-2 a day earlier in the week. Each
+   one is a subagent whose lease was not released by `SubagentStop` within 30 minutes. That
+   means either a subagent that really ran longer than 30 minutes, released while still running
+   (the too-early direction), or a `SubagentStop` that never arrived. GOV-B50 matches each one to
+   its transcript before deciding which.
+
+### The upgrade, 0.1.6 → 0.1.7 over a running daemon (clause 4), 2026-11-22
+
+The first time one published release replaced another under live sessions (GOV-B46). At
+01:11 EST, `brew upgrade governor` installed 0.1.7 while the 0.1.6 daemon (PID 74409) was
+serving 6 live sessions, this one among them.
+
+- **Hangs:** none. The 0.1.6 daemon kept answering between the upgrade and the install.
+  Upgrading the binary does not touch the running daemon or the hooks, which is the intended
+  shape.
+- **Between upgrade and install, doctor said so.** It reported two FAILs, each with the fix
+  `governor install`. `hooks` said 1 of 8 hooks was not registered (the new `UserPromptSubmit →
+  governor settle`). `binary` said the hooks run 0.1.6 and this is 0.1.7. It also warned on
+  `trace` (the sampler was from the old build). The `hooks` line pointed at `settings.json`
+  rather than the plugin's `hooks.json`, which is GOV-B47, fixed and merged that day.
+- **After `$(brew --prefix)/opt/governor/bin/governor install`:** the daemon became PID 26861,
+  `0.1.7 build fc38885daf57`, with eight hooks registered, and `binary`, `hooks` and `trace`
+  all ok. The one remaining FAIL was `sessions`: 6 of 6 live sessions started before the hooks
+  were installed, and the fix line named every project to restart.
+- **Was a restart needed, and did anything say so:** yes, and yes. Hooks bind when a session
+  starts, so open sessions keep the old hook set until restarted. Both install and doctor said
+  that, by name. Nothing hung while they waited.
+- **Something the upgrade did that nobody asked for:** install re-calibrates every time, by
+  design. That moved the run-queue cut from 4.70 to **5.52** per core and the climb level to
+  5.02, with b_max 4 unchanged. The verdict below takes that into account.
+
+### Closing the week (clause 2)
+
+The week is closed at seven full days, 11-15 to 11-21, with day zero (11-14 from 22:11)
+recorded but not counted. The subjective fields are thin: the owner was asked on 11-15 and,
+the day after, about 11-21. Days 2-6 are recorded as *not captured*. Asking further days
+would not change the answer, for two reasons. First, the log records every override, and
+there were none in eight days. Second, on the three days the owner was asked, the answer was
+the same each time: the budget felt right, and no refusal was noticed or disagreed with. What
+the week did find (surprises 3, 4, 6 and 7) came from the log and `pmset`, not from how the
+budget felt, and more days would only add instances of the same four.
+
+### Verdict (clause 5)
+
+**The shipped default stays as it is: calibrate on install, and use what it measures.** On
+this machine that is now a run-queue cut of 5.52 per core with b_max 4. `governor calibrate`
+does not need re-running, and its defaults do not change.
+
+The evidence: 45 cut episodes from 11-14 22:11 to 11-22, grouped by the reading that caused
+them. "Refusals while cut" counts builds refused while the budget was below 4.
+
+| Reading at the cut (rq per core) | Episodes | Refusals while cut | Within 10 s of a sleep or wake |
+|---|---:|---:|---:|
+| below 5.52 (cut only at 4.70) | 24 | 25 | 10 |
+| 5.52 to 6.59 | 13 | 8 | 11 |
+| above 6.59 (cut at any of the three) | 8 | 8 | 4 |
+
+- **4.70 was too low for this machine.** Over half the week's cuts (24 of 45) and 25 of the
+  41 refusals made while cut came from readings that 5.52 would not have cut on. The owner
+  felt nothing wrong, so the cost was invisible to them, but those 25 builds were still refused.
+- **6.59 is not supported, and choosing it would be tuning on this laptop.** Going from 5.52
+  to 6.59 would remove 13 more episodes, but 11 of those 13 are within 10 s of a sleep or wake.
+  Their real cause is the sleep transition (GOV-B48), not where the threshold sits. Once those
+  are set aside, 2 mid-band cuts remain, which is no basis for raising the threshold. The cuts
+  above 6.59 were real saturation: on 11-22 from 09:13 to 12:18, CPU was at 77-91% and the run
+  queue at 8-27 per core, mostly from work Claude did not start. Cutting to 1 there is the
+  governor doing its job.
+- **The number came from the machine, which is the rule.** 5.52 is what `calibrate` measured
+  on 11-22. Picking 6.59 by hand because the week looked calm would be a constant tuned on one
+  laptop, which CLAUDE.md rules out.
+- **One thing to watch, not act on.** Calibrations on this machine have read 6.59 (11-03),
+  4.61, 4.76 and 4.70 (11-14) and 5.52 (11-22). The spread across days is wider than within a
+  day, which suggests ambient load at calibration time matters. If GOV-B48's sleep fix still
+  leaves false cuts at 5.52, calibration stability is the next thing to look at.
