@@ -49,6 +49,40 @@ config schema 1      the "schema" key in ~/.claude/governor/config.json
 Releases are fixed by a new patch version and never by moving a tag. [0.1.1](#011---2026-10-29)
 is the first example.
 
+## [0.1.8] - 2026-11-23
+
+Protocol and config schema are unchanged (`protocol 1`, `config schema 1`), and no hook is
+added or removed. Upgrading takes the usual step only: rerun the install one-liner, or
+`brew upgrade governor` followed by `$(brew --prefix)/opt/governor/bin/governor install`.
+Open Claude Code sessions do not need restarting.
+
+### Fixed
+
+- **Builds are no longer refused just after your Mac wakes.** macOS freezes the load average
+  across sleep, often at the spike sleep itself causes. On waking, the governor resumed on that
+  stale reading, so a budget cut before sleep stayed cut and the first builds of the morning
+  were refused on an idle machine. The daemon now notices that the machine was away, puts a
+  pre-sleep cut back to the ceiling, and removes the frozen value from the reading. A machine
+  that really is busy at wake is still cut on the first fresh reading. Each sleep is one
+  `daemon.log` line saying how long the machine was away. On Linux the sleep is detected and
+  the cut cleared, but the reading is not corrected, because the freeze has not been measured
+  there. ([#109](https://github.com/peter3605/claude-governor/pull/109))
+- **`governor doctor` names the right file when a hook is missing.** It used to say the hook
+  was missing from `~/.claude/settings.json`, although install writes hooks to the plugin's
+  `hooks/hooks.json`. The line now names the file the other hooks were found in.
+  ([#107](https://github.com/peter3605/claude-governor/pull/107))
+
+### Changed
+
+- **`daemon.log` says who hung up.** The `write reply: ... broken pipe` lines carried no
+  detail, and there were often dozens a day. A reply the daemon could not deliver is now
+  logged with the request it answered (`op=`, and `client=statusline`, `doctor` or `install`
+  for a status request), how long it took, and a cause. A client that had already given up at
+  its own deadline, or a reply cut off by sleep, is now an ordinary `reply undelivered` line.
+  Anything else is still a `write reply:` error. Requests now carry the sender's deadline for
+  this purpose. An older daemon ignores it.
+  ([#110](https://github.com/peter3605/claude-governor/pull/110))
+
 ## [0.1.7] - 2026-11-22
 
 Protocol and config schema are unchanged (`protocol 1`, `config schema 1`). Upgrading takes
