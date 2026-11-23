@@ -2543,3 +2543,128 @@ counts the eighth hook.
 - **Several notifications in one prompt.** Every notification observed arrived alone.
   `settle` reads every `<tool-use-id>` in the prompt regardless.
 - Linux.
+
+## 27. A subagent's own files, and whether `SubagentStop` is ever lost (GOV-B50)
+
+GOV-38 counted agent leases reaped at the 30 min confirmed TTL. This section matches every one
+to its subagent and asks the question the trap in GOV-B50 poses: was the subagent still
+running, or did its `SubagentStop` never arrive? It is not a hook probe. It is a reading of the
+files Claude Code already keeps for every subagent, because those files record each hook that
+ran inside the subagent together with the governor's stderr. That makes them direct evidence of
+whether `SubagentStop` fired, which no headless probe of a short agent could give for a 78 min
+one.
+
+**The headline: `SubagentStop` was not lost. The TTL released live agents.** Of 23
+confirmed-TTL reaps, 22 subagents were still running. Each one's `SubagentStop` fired later,
+22 of 22, and found no lease. The one lost `SubagentStop` was a subagent killed by the machine
+going to sleep.
+
+### 27.0 Provenance
+
+| | |
+|---|---|
+| Claude Code | 2.1.310 to 2.1.330 (the versions recorded in the 370 subagent transcripts) |
+| Host | macOS 25.4.0, darwin/arm64 |
+| Date | 2026-11-23 |
+| Sources | `~/.claude/governor/daemon.log` (every `release ... kind=agent`), `~/.claude/projects/*/<session>/subagents/agent-<id>.{jsonl,meta.json}`, `pmset -g log` |
+
+### 27.1 The layout
+
+Beside each session's transcript `<slug>/<session>.jsonl` is a directory `<slug>/<session>/`
+whose `subagents/` holds, per subagent:
+
+- `agent-<agent_id>.jsonl`: its transcript. The `<agent_id>` is the same `agent_id` that
+  `SubagentStart` and `SubagentStop` carry. Every hook that ran in the subagent appears as an
+  `attachment` record with `hookEvent`, `command`, `exitCode` and `stderr`. For `SubagentStop`
+  that is `governor release: ok=… reason=… in_use=…`.
+- `agent-<agent_id>.meta.json`: about 300 bytes. For example:
+
+```json
+{"agentType":"general-purpose","isBuiltIn":true,"launchedWithDefaults":true,"description":"Implement and ship EAR-35","toolUseId":"toolu_01KoPECTnhAQg5PXWnud8i29","spawnDepth":1,"requestShape":"background","requestNonInteractive":true,"pickedEffortModel":"claude-opus-5-5","finished":true}
+```
+
+`toolUseId` is the `Agent` call's `tool_use_id` in the parent transcript, and `requestShape`
+is `foreground` or `background`.
+
+### 27.2 `finished`
+
+| | n |
+|---|---|
+| meta files on the machine | 370, one per subagent transcript, none missing |
+| `"finished": true` | 365 |
+| no `finished` key | 5, all subagents running at the time of reading (transcript written within the last minute) |
+| `finished` present but not `true` | 0 |
+| meta file's last write minus the subagent's first `SubagentStop` | min 0.0 s, p50 0.0 s, never negative (n=361) |
+| `finished: true` with no `SubagentStop` in the transcript | 1, the sleep-killed subagent below |
+
+So `finished` is absent while a subagent runs, is set at its end and never before
+`SubagentStop`, and is set on an end that raises no `SubagentStop` too. The latest writes,
+up to 4,406 s after the stop, are a resumed agent's file being rewritten.
+
+### 27.3 The reaps
+
+Every `kind=agent ... by=reaper:expired` line, 2026-11-15 to 2026-11-23, 25 in all:
+
+| Reaped | Session | Subagent | Life | `SubagentStop` |
+|---|---|---|---|---|
+| 11-15 16:34:00 | earbrief `4aabf99f` | Implement and ship EAR-B5 (bg) | 31.7 m | 16:35:40 `no_lease` |
+| 11-15 17:24:56 | earbrief `4aabf99f` | Implement and ship EAR-B16 (bg) | 35.2 m | 17:30:08 `no_lease` |
+| 11-16 02:36:03 | stepstool `4a7b51df` | *tentative, 30 s.* At 02:35:09 `PreToolUse` granted and the auto-mode classifier then refused the `Agent` call; it was re-issued at 02:35:33 and granted again. FIFO bound the one `SubagentStart` to the older lease, so the second was the one left tentative. One spawn, one lease, correctly | — | — |
+| 11-19 10:15:54 | stepstool `1becacfd` | Fix round 1 for T-038 | 01:38:50 to 04:22, ended "Your computer went to sleep mid-response" | **none** |
+| 11-21 15:01:44 | stepstool `1becacfd` | Test T-044 | 37.6 m | `no_lease` |
+| 11-21 18:11:28 | stepstool `1becacfd` | Implement T-047 | 36.4 m | `no_lease` |
+| 11-21 18:48:16 | stepstool `1becacfd` | Test T-047 | 30.2 m | `no_lease` |
+| 11-21 19:41:24 | stepstool `1becacfd` | Re-test T-047 fix round | 34.2 m | `no_lease` |
+| 11-21 20:15:52 | stepstool `1becacfd` | Fix round 2 for T-047 | 78.2 m | `no_lease` |
+| 11-21 21:34:18 | stepstool `1becacfd` | Re-test T-047 round 3 | 49.8 m | `no_lease` |
+| 11-21 23:48:02 | stepstool `9628e7e2` | T-040 fix round 1 | 33.0 m | `no_lease` |
+| 11-22 04:05:08 | stepstool `9628e7e2` | Test T-042 | 42.0 m | `no_lease` |
+| 11-22 05:47:44 | stepstool `9628e7e2` | T-042 fix round 2 | 42.4 m | `no_lease` |
+| 11-22 07:01:24 | stepstool `9628e7e2` | T-042 complete the split | 42.4 m | `no_lease` |
+| 11-22 08:08:50 | stepstool `9628e7e2` | Implement T-048 | 35.0 m | `no_lease` |
+| 11-22 08:43:58 | stepstool `9628e7e2` | Test T-048 | 34.8 m | `no_lease` |
+| 11-22 11:33:48 | stepstool `9628e7e2` | T-048 fix round 1, across sleep | 223.0 m wall | `no_lease` |
+| 11-22 14:20:54 | stepstool `9628e7e2` | T-048 finish 500-char cap, across sleep | 164.1 m wall | `no_lease` |
+| 11-22 19:24:34 | stepstool `9628e7e2` | T-048 fix round 2, across sleep | 256.5 m wall | `no_lease` |
+| 11-22 21:03:46 | stepstool `9628e7e2` | T-048 finish round 2 items | 30.1 m | `no_lease` |
+| 11-22 21:36:44 | stepstool `9628e7e2` | T-048 reduce by split | 65.6 m | `no_lease` |
+| 11-22 22:45:09 | stepstool `9628e7e2` | Implement T-049 | 42.1 m | `no_lease` |
+| 11-22 23:27:51 | stepstool `9628e7e2` | T-049 continue after finding | 64.1 m | `no_lease` |
+| 11-23 00:32:09 | stepstool `9628e7e2` | Test T-049 | 34.2 m | `no_lease` |
+| 11-23 13:14:01 | edgefinder `b961a293` | *tentative, 30 s.* EF-B18, `isolation: worktree`, `run_in_background`. `SubagentStart` came 34.9 s after `PreToolUse`, and its confirm answered `ok=false`, so the subagent ran with no lease | — | — |
+
+A release whose `release - held` lands within 1 s of a subagent's first record is matched by
+that, 19 of the 23 confirmed. `held` is on the monotonic clock, which stops while the Mac
+sleeps (design.md §5.6d), so the other four are matched by the subagent that was running across
+the sleep, read against `pmset -g log`.
+
+Consequences:
+
+1. **`SubagentStop` fires for a subagent that ends normally, however long it ran.** That held
+   for 22 of 22, up to 257 min. Its `agent_id` matched the confirm's, because the release
+   *found* the agent and answered `no_lease` rather than nothing.
+2. **`SubagentStop` does not fire for a subagent killed by sleep mid-response** (1 of 1). Its
+   meta file was finished all the same.
+3. **The confirmed TTL's bound was wrong by two orders of magnitude.** Over the 360 governed
+   subagents (those whose `SubagentStop` ran `governor release`), life is p50 6.4 min, p90
+   30.2 min, p99 223.0 min, max 731.6 min. 10.3% outlive 30 min, 1.9% outlive 2 h.
+4. **The tentative TTL is shorter than a worktree's setup.** 35 s from `PreToolUse` to
+   `SubagentStart` for an `isolation: worktree` agent, against a 30 s tentative TTL. This is
+   not this story's question; it is GOV-B55.
+
+### 27.4 Folded into design.md
+
+§5.6e records the decision: a confirmed Agent lease is renewed at its TTL while
+`lease.Liveness.Working` finds its meta file unfinished and its transcript written since the
+grant or last renewal. §5.6's opening states it. §10.3 gains the unmeasured cases below.
+
+### 27.5 Still unmeasured
+
+- **Nested subagents.** All 370 meta files are `spawnDepth: 1`. Where a depth-2 subagent's files
+  live was not observed. `Working` finds them by `projects/*/<session>/subagents/agent-<id>`
+  and reads "not found" as "not working", so the cost of a different layout is today's TTL.
+- **A subagent resumed with `SendMessage`.** Whether its meta file loses `finished` while it runs
+  again. If it does not, a resumed agent past its TTL is reaped as today.
+- **A session started with a `CLAUDE_CONFIG_DIR` other than the daemon's.** Not found, so the
+  TTL applies, as above.
+- Linux.

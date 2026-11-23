@@ -2,12 +2,14 @@ package lease
 
 import (
 	"context"
+	"encoding/json"
 	"io"
 	"math"
 	"os"
 	"path/filepath"
 	"regexp"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/shirou/gopsutil/v4/process"
@@ -50,6 +52,98 @@ const startTimeTolerance = 2 * time.Second
 type PIDLiveness struct {
 	// taskRoot overrides /tmp/claude-<uid>, for tests.
 	taskRoot string
+	// projectsRoot overrides Claude Code's projects directory, for tests.
+	projectsRoot string
+}
+
+// agentMetaMax bounds how much of a subagent's meta.json is read. The measured files are
+// about 300 bytes; anything near this is not the file that was measured.
+const agentMetaMax = 64 << 10
+
+// Working reports whether a confirmed Agent lease's subagent is still running, from the two
+// files Claude Code keeps for it (GOV-B50; hook-surface.md section 27):
+//
+//	<projects>/<cwd slug>/<session>/subagents/agent-<agent_id>.meta.json
+//	<projects>/<cwd slug>/<session>/subagents/agent-<agent_id>.jsonl
+//
+// The meta file gains "finished": true when the subagent ends, and never before: 365 of 370
+// files on this machine carried it, the other 5 belonged to subagents running at the time, and
+// its last write was never earlier than SubagentStop (n=361). It is written on an end that
+// raises no SubagentStop too, as on 11-19 when a sleep killed a subagent mid-response. So an
+// unfinished meta file is evidence of a running subagent, and the transcript having been
+// written since the lease was granted or last renewed is evidence that it is not a stale one.
+//
+// Every uncertain answer is false, per the Working contract: no file, two files, an unsafe
+// ID, an unreadable or unparseable meta file, or a transcript with no writes since. Each of
+// those leaves the lease to its TTL, which is what happened before this existed.
+func (v PIDLiveness) Working(l Lease) bool {
+	if l.Kind != Agent || l.State != Confirmed {
+		return false
+	}
+	if !pathSafe.MatchString(l.Session) || !pathSafe.MatchString(l.AgentID) {
+		return false
+	}
+	root := v.projectsRoot
+	if root == "" {
+		root = claudeProjectsDir()
+		if root == "" {
+			return false
+		}
+	}
+	matches, err := filepath.Glob(filepath.Join(root, "*", l.Session, "subagents", "agent-"+l.AgentID+".meta.json"))
+	if err != nil || len(matches) != 1 {
+		return false
+	}
+	if finished, ok := agentFinished(matches[0]); !ok || finished {
+		return false
+	}
+	fi, err := os.Stat(strings.TrimSuffix(matches[0], ".meta.json") + ".jsonl")
+	if err != nil || !fi.Mode().IsRegular() {
+		return false
+	}
+	since := l.GrantedAt
+	if !l.RenewedAt.IsZero() {
+		since = l.RenewedAt
+	}
+	// Wall-clock on both sides, deliberately: a file's mtime carries no monotonic reading, and
+	// after a sleep the lease's own clock has not advanced while the wall has. A subagent that
+	// wrote before the sleep and is resumed after it is still renewed.
+	return fi.ModTime().After(since.Round(0))
+}
+
+// agentFinished reads a subagent's meta.json. ok is false when the file cannot be read as the
+// measured shape, which Working treats as not knowing.
+func agentFinished(path string) (finished, ok bool) {
+	f, err := os.Open(path)
+	if err != nil {
+		return false, false
+	}
+	defer f.Close()
+	b, err := io.ReadAll(io.LimitReader(f, agentMetaMax+1))
+	if err != nil || len(b) > agentMetaMax {
+		return false, false
+	}
+	var m struct {
+		Finished *bool `json:"finished"`
+	}
+	if err := json.Unmarshal(b, &m); err != nil {
+		return false, false
+	}
+	return m.Finished != nil && *m.Finished, true
+}
+
+// claudeProjectsDir is where Claude Code keeps session transcripts: $CLAUDE_CONFIG_DIR/projects
+// when that is set in the daemon's environment, ~/.claude/projects otherwise. A session started
+// with a different CLAUDE_CONFIG_DIR than the daemon's is simply not found, which costs the TTL.
+func claudeProjectsDir() string {
+	if d := os.Getenv("CLAUDE_CONFIG_DIR"); d != "" {
+		return filepath.Join(d, "projects")
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return ""
+	}
+	return filepath.Join(home, ".claude", "projects")
 }
 
 // Alive reports whether the lease's owner is still running.

@@ -31,12 +31,15 @@ func (c *clock) advance(d time.Duration) {
 // deadLiveness reports every lease's owner as gone.
 type deadLiveness struct{}
 
-func (deadLiveness) Alive(Lease) bool { return false }
+func (deadLiveness) Alive(Lease) bool   { return false }
+func (deadLiveness) Working(Lease) bool { return false }
 
-// liveLiveness reports every owner as running.
+// liveLiveness reports every owner as running, and offers no evidence that a subagent is
+// still working — the lost-SubagentStop case, which the TTL must still collect.
 type liveLiveness struct{}
 
-func (liveLiveness) Alive(Lease) bool { return true }
+func (liveLiveness) Alive(Lease) bool   { return true }
+func (liveLiveness) Working(Lease) bool { return false }
 
 func TestLifecycleTentativeConfirmedReleased(t *testing.T) {
 	tbl := NewTable(Options{})
