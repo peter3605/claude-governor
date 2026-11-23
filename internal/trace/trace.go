@@ -183,6 +183,10 @@ type Sample struct {
 	MemAvailableBytes uint64  `json:"mem_available_bytes"`
 	MemTotalBytes     uint64  `json:"mem_total_bytes"`
 	MemoryPressure    float64 `json:"mem_pressure"`
+	// SwapInBytesPerSec is the instantaneous swap-in rate, or absent where the platform would
+	// not answer. Absent is not zero: the loop cuts on this signal (GOV-B53) and a trace that
+	// wrote 0 for "unreadable" would tune that cut against a silence.
+	SwapInBytesPerSec *float64 `json:"swap_in_bytes_per_sec,omitempty"`
 	// Thermal is nominal, fair, serious, critical, or unknown on a host with no thermal
 	// API. Unknown is not a hot machine and must never be read as one.
 	Thermal string `json:"thermal"`
@@ -207,6 +211,11 @@ type Sample struct {
 
 // RecordV is the current record schema version.
 //
+// Bumped to 4 by GOV-B53, which added swap_in_bytes_per_sec to samples. Backward compatible
+// like the bumps before it, and versioned for the same reason: before v4 no trace carried
+// swap-in at all — and on darwin the sampler could not read it — so "no swap-in before this
+// line" is a fact about the instrument, not a machine that never swapped.
+//
 // Bumped to 3 by GOV-17, which added KindBuild. Backward compatible in the same way the last
 // bump was — every v2 field means what it always did — and versioned for the same reason:
 // "no build records before this line" is a fact about the INSTRUMENT and not about the
@@ -219,7 +228,7 @@ type Sample struct {
 // every v1 field means what it always did — but the file is read as a whole by Phase 0
 // analysis and "no PostToolUse records before this line" is a fact about the instrument
 // rather than about the machine. That distinction is the entire reason this field exists.
-const RecordV = 3
+const RecordV = 4
 
 // StateDir is the directory holding the governor's state, per design.md section 13.3.
 func StateDir() (string, error) {

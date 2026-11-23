@@ -139,7 +139,7 @@ type statusResponse struct {
 	Paused       bool   `json:"paused"`
 	PausedUntil  string `json:"paused_until"`
 	// Ceiling is the largest budget this host would allow with nothing cutting it, and Cut
-	// names the signal that is cutting it — "run queue", "thermal", or "" for neither
+	// names the signal that is cutting it — "run queue", "thermal", "memory", or "" for none
 	// (GOV-34). Only doctor reads them; the status line does not render them.
 	//
 	// They exist because a budget of three and a ceiling of three print the same digit as a

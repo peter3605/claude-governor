@@ -47,6 +47,14 @@ type Sample struct {
 	// A rate, so it is a difference between ticks like the CPU readings, and zero on the
 	// priming sample for the same reason they are.
 	SwapInBytesPerSec float64
+	// SwapInKnown reports whether the platform answered the swap-in counter at all.
+	//
+	// It is separate from the rate because "nothing is swapping" and "this machine would not
+	// say" are different facts and the loop must act on only the first: a memory cut on a
+	// reading that was never taken would be a cut from nothing (GOV-B53 clause 5). Until
+	// GOV-B53 the darwin rate was a zero that meant the second — gopsutil never fills it on
+	// macOS — and nothing could tell.
+	SwapInKnown bool
 
 	// The fields below are the raw readings the derived ones above are computed from.
 	// They are recorded rather than discarded because Phase 0's whole purpose is to tune

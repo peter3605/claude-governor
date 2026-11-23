@@ -636,7 +636,7 @@ suite again, recursively. That is the same shape as the trap GOV-21 hit when `do
 | CPU utilisation | `gopsutil/cpu`, 5 s EWMA | traced and reported; **not** a control input (§5.2) |
 | Run-queue depth | `loadavg1 / ncpu` | **the setpoint the loop controls on**, both directions |
 | Thermal pressure | `ProcessInfo.thermalState` | hard cut trigger |
-| Memory pressure | free pages + swap-in rate | secondary cut trigger |
+| Memory pressure | swap-in rate, 30 s EWMA (§5.3a); free memory is traced only | secondary cut trigger |
 | Process-tree cost | CPU across the `claude` tree, roots and children separately | traced and reported; **not** a control input (§5.4) |
 
 **Identifying a session process: match `argv[0]`, not the executable name.** Measured in
@@ -670,7 +670,8 @@ only, never values: the payload carries the agent's prompt.
 GOV-12. The walk is essentially the entire cost of a tick, so paying it at 1 Hz put the
 daemon over the 1%-of-a-core bar that story sets. Nothing the loop reads is affected: tree cost
 is not a control input (§5.4), and CPU, run queue, thermal and memory — the signals §5.2 acts
-on — still tick every second. Samples carry `TreeFresh` so a consumer cannot mistake five
+on (memory since GOV-B53; until then it was sampled and reported, and nothing read it) — still
+tick every second. Samples carry `TreeFresh` so a consumer cannot mistake five
 carried-over copies for five readings. Phase 0's own sampler is unchanged and still walks
 every tick, because GOV-15 tunes the setpoint against traces collected at that cadence.
 
@@ -728,6 +729,8 @@ run_queue = loadavg1 / usable_cores
 
 if thermal is serious or critical:    B = B_min                # hard floor
 elif run_queue > 2.0:                 B = max(B_min, B // 2)   # multiplicative decrease
+elif swap_in > SWAP_IN_MAX:           B = max(B_min, B // 2)   # memory cut (GOV-B53, §5.3a)
+elif memory clear < 30 ticks:         B = B                    # memory hysteresis: hold
 elif run_queue <= 1.5 and demand_waiting:
                                       B = min(B_max, B + 1)    # additive increase
 elif run_queue <= 1.5 and idle for 60 ticks:
@@ -735,7 +738,9 @@ elif run_queue <= 1.5 and idle for 60 ticks:
 else:                                 B = B                    # busy and coping: hold
 
 # before the branches: if B_max rose and B was at the old B_max, B = new B_max  (GOV-46)
-# idle = no lease held and nothing waiting
+# idle = no lease held, nothing waiting, and memory neither pressed nor in its hold
+# swap_in = 30 s EWMA of bytes/s swapped back in; an unreadable counter is never pressure,
+#           and the 30 ticks after a wake do not read it (§5.3a)
 
 B_min = 1
 B_max = floor(usable_cores / 1.2)          # slots, one slot = one Medium build
@@ -1149,6 +1154,84 @@ another platform's C toolchain; it is for checking that the four targets still c
 darwin output MUST NOT be shipped. The released darwin binaries are the ones CI builds natively
 on a macOS runner with `CGO_ENABLED=1` (GOV-19). `governor status` is the check: on a Mac it
 must not say `unknown`.
+
+### 5.3a Memory (GOV-B53, decided 2026-11-23)
+
+§5.1 has listed memory pressure as a secondary cut trigger since the first draft, and GOV-12's
+paragraph says §5.2 acts on it. Until GOV-B53 nothing did: the daemon sampled
+`MemoryPressure` and `SwapInBytesPerSec`, reported them in `status`, and the controller read
+neither. It was found on 2026-11-22 diagnosing a 90%+ CPU reading with `kernel_task` at 200%
+and Docker, Xcode, Chrome and VS Code open. That incident's cause was never confirmed, so this
+section makes no claim that memory caused it. It closes the gap between spec and code.
+
+**The loop cuts on swap-in rate, smoothed by a 30 s EWMA, at 64 MB/s.** Over that, `B` is halved
+like the run-queue cut, and the cut is named `memory` on every surface that names a cut. It
+does not climb again until swap-in has been at or under the cut for 30 consecutive ticks. An
+unreadable counter is never pressure. For the 30 ticks after a wake, memory is not read, and the
+daemon restarts the EWMA across the sleep. The branch sits after the run queue in §5.2, so a
+tick on which both would cut halves once and names the run queue.
+
+**Two candidates measured useless on this machine, and one silent defect.**
+
+- **Free memory never leaves a narrow high band.** `MemoryPressure = 1 − available/total` over
+  74,177 Phase 0 samples (2026-11-22/23): p10 0.80, p50 0.84, p90 0.85, max 0.90, with Docker
+  Desktop's 8 GiB VM resident throughout. A threshold on it would either never fire or never
+  clear. It is still sampled and traced; the loop does not read it.
+- **The kernel's own verdict is erratic.** `kern.memorystatus_vm_pressure_level` (no privileges)
+  read 2 ("warn") on every one of 1,799 ordinary ticks. Under a real thrash it moved between 1,
+  2 and 4 and sat at 1 ("normal") for the last minute of it, while swap-in was still running at
+  tens of MB/s. GOV-13 found the same of `thermalState`: an API that is cheap to read is not
+  thereby a signal.
+- **Swap-in had never been read on macOS.** gopsutil's darwin `SwapMemory` fills Total, Used and
+  Free from `vm.swapusage` and leaves `Sin` at zero, so `SwapInBytesPerSec` read 0 on every Mac
+  on every tick. That zero looked exactly like an unpressured machine. `internal/signals/swapin_darwin.go`
+  now reads `vm.compressor.swapper.swapins_total` × `vm.pagesize`, a sysctl with no privilege
+  and no cgo, and it agrees with `vm_stat`'s Swapins to the page. Linux keeps gopsutil's
+  `/proc/vmstat` `pswpin`. `Sample.SwapInKnown` separates "nothing is swapping" from "this
+  platform would not say", and only the first is a reading. Trace records carry
+  `swap_in_bytes_per_sec` from schema v4, absent rather than zero where it was unknown.
+
+**The measurement, both sides, one machine.** M1 Air, 8 cores, 16 GiB, 22 GiB already in swap,
+113 days up. Recorded at 1 Hz from the same counter the sampler reads.
+
+| Window | Raw MB/s p50 / p90 / p99 / max | 30 s EWMA p50 / p90 / p99 / max |
+|---|---|---|
+| Ordinary use, 35 min: Docker VM up on every tick, other sessions working, a full `go test ./...` inside it | 2.7 / 24.5 / 123.7 / 385.9 | 7.1 / 22.8 / 32.0 / **36.7** |
+| Controlled thrash: 6 GiB of incompressible memory swept for 150 s | 44.4 / 242.6 / 395.1 / 448.5 | **80.6** / 142.3 / 170.4 / 172.9 |
+
+Ordinary use is bursty: 112 raw bursts over 20 MB/s, none longer than 8 s, the tallest 386 MB/s
+for one second (an app brought back to the front). That is why the window is 30 s and not CPU's
+5 s. At 5 s ordinary use reaches 94.9 MB/s and overlaps the thrash; at 30 s it stays under 37.
+Against the 30 s series:
+
+| Cut at | Ordinary ticks over | Thrash: first over | Thrash ticks over | Clears after thrash ends |
+|---|---|---|---|---|
+| 40 MB/s | 0 / 1,799 | +11 s | 93% | 86 s |
+| 50 MB/s | 0 / 1,799 | +13 s | 92% | 79 s |
+| **64 MB/s** | **0 / 1,799** | **+16 s** | **90%** | **49 s** |
+| 75 MB/s | 0 / 1,799 | +17 s | 82% | 44 s |
+| 100 MB/s | 0 / 1,799 | +34 s | 25% | 31 s |
+
+**Chosen: 64 MB/s**, 1.74× the ordinary peak. Below 50 the margin over one busy afternoon is too
+thin to trust. Above 75 the cut arrives after most of the damage. Clearing 49 s after the probe
+ended is not lag. Swap-in continued after it as the sessions it had evicted paged back in, and
+that is still pressure.
+
+**Clause 2's own question, answered.** With Docker running, the memory cut fired on **0** of
+1,799 ordinary ticks. The trigger does not sit tripped while Docker runs; the level signal and
+free memory both would have.
+
+**What is not measured, stated.**
+
+- **A real wake.** No session can sleep this machine on demand. `vm.compressor.swapper.swapins_darkwake`
+  read 0 throughout, so DarkWakes are not where swap-in comes from here. The 30-tick grace and
+  the EWMA restart are a guard derived from the window, not from a measured wake. A wake whose
+  page-in outlasts them would show as `cause=memory` within a minute of a `machine was away`
+  line in daemon.log.
+- **Any other machine.** The number comes from a 16 GiB machine that lives in swap. On a 64 GiB
+  workstation ordinary swap-in is likely to be near zero, which means it would not cut there
+  rather than cut too often: the fail-open direction. `governor calibrate` does not measure
+  this yet, and `SwapInMax` is a constant, as `RunQueueMax` was before GOV-25.
 
 ### 5.4 Attributed cost — measured, and NOT built
 

@@ -346,6 +346,7 @@ func runTraceSample(stderr io.Writer) int {
 				MemAvailableBytes: s.MemAvailableBytes,
 				MemTotalBytes:     s.MemTotalBytes,
 				MemoryPressure:    s.MemoryPressure,
+				SwapInBytesPerSec: swapInField(s),
 				Thermal:           string(s.Thermal),
 				ClaudeRoots:       s.Tree.Roots,
 				ClaudeProcs:       s.Tree.Procs,
@@ -436,4 +437,14 @@ func takeLock() (bool, *os.File, error) {
 		return false, f, nil
 	}
 	return true, f, nil
+}
+
+// swapInField is the sample's swap-in rate for the trace, or nil where the platform did not
+// answer, so that the record says "unknown" rather than writing a zero (GOV-B53).
+func swapInField(s signals.Sample) *float64 {
+	if !s.SwapInKnown {
+		return nil
+	}
+	v := s.SwapInBytesPerSec
+	return &v
 }

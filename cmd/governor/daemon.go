@@ -645,6 +645,10 @@ type daemon struct {
 	// rather than in the Sample because an average is a property of the series, not of any
 	// one reading in it.
 	cpuAvg *signals.EWMA
+	// swapAvg is the EWMA of the swap-in rate the loop cuts on for memory (GOV-B53). It is
+	// reset across a sleep, so that the pages a wake brings back in are never averaged into
+	// the reading the loop acts on once budget.MemoryWakeGraceTicks has passed.
+	swapAvg *signals.EWMA
 	// wake corrects the run queue across a sleep (GOV-B48, design.md section 5.6d). Only the
 	// sampling goroutine touches it, under signalsMu like the loop it feeds.
 	wake budget.WakeFilter
@@ -1258,6 +1262,13 @@ func (d *daemon) step(s signals.Sample, demand, inUse bool, away time.Duration) 
 		d.cpuAvg = signals.NewEWMA(signals.DefaultCPUWindow)
 	}
 	d.cpuAvg.Update(s.CPU, time.Now())
+	if d.swapAvg == nil || away > 0 {
+		d.swapAvg = signals.NewEWMA(signals.DefaultSwapInWindow)
+	}
+	var swapIn float64
+	if s.SwapInKnown {
+		swapIn = d.swapAvg.Update(s.SwapInBytesPerSec, time.Now())
+	}
 	if avg, ok := d.cpuAvg.Value(); ok && d.loop != nil {
 		// The ceiling comes from the machine on every tick rather than once at start-up,
 		// because CPUCapacity is the cgroup quota where there is one and a quota can be
@@ -1272,6 +1283,8 @@ func (d *daemon) step(s signals.Sample, demand, inUse bool, away time.Duration) 
 			InUse:         inUse,
 			Woke:          away > 0,
 			Stale:         !fresh,
+			SwapIn:        swapIn,
+			SwapInKnown:   s.SwapInKnown,
 		})
 		// Formatted under the lock, because it reads the controller. Written after it,
 		// because liveBudget takes this lock on every acquire and a file write does not

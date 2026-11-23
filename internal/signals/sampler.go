@@ -260,33 +260,37 @@ func (s *hostSampler) Sample(ctx context.Context) (Sample, error) {
 			out.MemoryPressure = 1 - float64(v.Available)/float64(v.Total)
 		}
 	}
-	out.SwapInBytesPerSec = s.swapRate(ctx, start)
+	out.SwapInBytesPerSec, out.SwapInKnown = s.swapRate(ctx, start)
 	out.Tree, out.TreeFresh = s.treeCached(ctx, start)
 
 	out.CostMS = float64(time.Since(start).Microseconds()) / 1000
 	return out, nil
 }
 
-// swapRate returns bytes per second faulted back in from swap since the previous tick.
+// swapRate returns bytes per second faulted back in from swap since the previous tick, and
+// whether the platform could be read at all.
 //
 // Zero on the priming tick, and zero again if the counter goes backwards — which it does on
 // a machine that has swapoff'd, and would otherwise present as a large negative rate or, once
-// stored in a uint64 difference, an enormous positive one.
-func (s *hostSampler) swapRate(ctx context.Context, now time.Time) float64 {
-	sw, err := mem.SwapMemoryWithContext(ctx)
-	if err != nil {
-		return 0
+// stored in a uint64 difference, an enormous positive one. Both of those are KNOWN zeroes:
+// the counter was read, there is simply no rate yet. Unknown is reserved for a platform that
+// would not answer, because the control loop treats the two differently — a known zero is
+// "no pressure", an unknown is "do not cut on this" (GOV-B53 clause 5).
+func (s *hostSampler) swapRate(ctx context.Context, now time.Time) (float64, bool) {
+	cur, ok := swapInBytes(ctx)
+	if !ok {
+		return 0, false
 	}
 	prev, at, seen := s.swapIn, s.swapAt, s.swapSeen
-	s.swapIn, s.swapAt, s.swapSeen = sw.Sin, now, true
+	s.swapIn, s.swapAt, s.swapSeen = cur, now, true
 	if !seen {
-		return 0
+		return 0, true
 	}
 	elapsed := now.Sub(at).Seconds()
-	if elapsed <= 0 || sw.Sin < prev {
-		return 0
+	if elapsed <= 0 || cur < prev {
+		return 0, true
 	}
-	return float64(sw.Sin-prev) / elapsed
+	return float64(cur-prev) / elapsed, true
 }
 
 // treeCached walks the process tree, or returns the previous walk when one is recent enough.

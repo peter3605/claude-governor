@@ -47,6 +47,13 @@ type Reading struct {
 	// says nothing about the machine now. The loop neither cuts nor climbs on it; thermal is a
 	// live reading and still floors. WakeFilter decides it, for at most a few ticks.
 	Stale bool
+	// SwapIn is how fast pages are coming back from swap, in bytes per second, already
+	// smoothed — signals.EWMA owns the window, as it does for CPU. It is the memory half of
+	// section 5.1, and the only half the loop reads; see SwapInMax for why free memory is not.
+	SwapIn float64
+	// SwapInKnown is whether SwapIn was read at all. False never cuts: an unreadable memory
+	// signal fails open (GOV-B53 clause 5), the way thermal's `unknown` is nominal.
+	SwapInKnown bool
 }
 
 // Setpoint is the host utilisation the loop aims to sit under.
@@ -189,6 +196,67 @@ const RunQueueMax = 2.0
 // test bounds that hunting at 10% of ticks; what it does in practice is in the same document.
 const RunQueueBand = 0.5
 
+// SwapInMax is the smoothed swap-in rate, in bytes per second, above which the budget is
+// halved for memory (GOV-B53, design.md section 5.3a).
+//
+// SWAP-IN, NOT FREE MEMORY. signals.Sample.MemoryPressure is 1 - available/total, and on this
+// machine it never leaves the band 0.80-0.90: over 74,177 Phase 0 samples on 2026-11-22/23 its
+// p10 is 0.80 and its p90 0.85, with Docker Desktop's 8 GiB VM resident throughout. A threshold
+// on it would either never fire or never clear. The kernel's own verdict,
+// kern.memorystatus_vm_pressure_level, is no better: it read 2 ("warn") on every one of the
+// measured ticks, idle and loaded alike. Pages coming BACK from swap is the reading that
+// separates a machine holding a lot of memory from one fighting over it right now, which is
+// what signals.go has said since GOV-12.
+//
+// MEASURED ON BOTH SIDES, 2026-11-23, on the 30 s EWMA the loop reads (section 5.3a has the
+// tables). Ordinary use — 35 minutes with Docker Desktop's VM up throughout, other sessions
+// working, a full `go test ./...` inside it — peaked at 36.7 MB/s, p99 32.0. A controlled
+// thrash, 6 GiB of incompressible memory swept for 150 s, ran 100-450 MB/s raw, p50 80.6 and
+// p90 142 smoothed. Against those:
+//
+//	 40 MB/s   ordinary 0/1799 ticks   thrash: over at +11 s, 93% of it   (9% above ordinary)
+//	 50 MB/s   ordinary 0/1799         thrash: +13 s, 92%
+//	 64 MB/s   ordinary 0/1799         thrash: +16 s, 90%                  <- here
+//	 75 MB/s   ordinary 0/1799         thrash: +17 s, 82%
+//	100 MB/s   ordinary 0/1799         thrash: +34 s, 25%
+//
+// 64 is 1.74x the ordinary peak and still catches the thrash within one build's startup. Below
+// 50 the margin over a busy afternoon is too thin to trust from one window; above 75 the cut
+// arrives after most of the damage. ONE MACHINE, ONE AFTERNOON: a 16 GiB Air with 22 GiB already
+// in swap. `governor calibrate` does not yet measure this, and nothing here claims the number
+// is right for a 64 GiB workstation, whose ordinary swap-in is likely to be near zero — which
+// errs toward never cutting there, the fail-open direction.
+const SwapInMax = 64e6
+
+// MemoryClearTicks is how many consecutive ticks the swap-in rate must stay at or under
+// SwapInMax before a memory-cut budget may climb again.
+//
+// It is the memory analogue of NominalTicksBeforeIncrease and exists for the same reason: the
+// signal is bursty, and a loop that climbs on the first quiet second after a burst re-admits
+// the build that caused it straight into the next one. The measured bursts are in section
+// 5.3a.
+//
+// 30 is one EWMA time constant. Inside the measured thrash the smoothed rate dipped under the
+// cut on 10% of ticks, in runs shorter than that, so a hold of one time constant spans them and
+// the loop does not climb into the middle of the thrash it just cut for.
+const MemoryClearTicks = 30
+
+// MemoryWakeGraceTicks is how many ticks after a wake the memory signal is not acted on.
+//
+// PAGES SWAP BACK IN AFTER SLEEP AS A MATTER OF COURSE: whatever was paged out while the
+// machine was idle is touched again when someone comes back to it. That is a wake, not
+// pressure, and GOV-B48 already established that a wake must not refuse builds on readings
+// that describe the sleep. The grace is the smoothing window, so the EWMA has been fed only
+// post-wake seconds by the time the loop reads it again — the daemon also restarts the EWMA at
+// a wake, so nothing from before the sleep is in it.
+//
+// NOT MEASURED AGAINST A REAL WAKE, and said so: no session can sleep this machine on demand.
+// vm.compressor.swapper.swapins_darkwake read 0 throughout, so DarkWakes are not where swap-in
+// comes from here; a full wake is. If a wake's page-in outlasts 30 s at over 64 MB/s, that
+// is a cut the daemon log will name as cause=memory within a minute of a `machine was away`
+// line, which is how it would be found.
+const MemoryWakeGraceTicks = 30
+
 // NominalTicksBeforeIncrease is the hysteresis on the way back up from a thermal cut
 // (design.md section 5.3): require clean ticks before the additive increase resumes, so the
 // budget does not oscillate against the platform's own governor.
@@ -270,6 +338,13 @@ type Controller struct {
 	b int
 	// clean counts consecutive ticks with no severe thermal state, for the hysteresis.
 	clean int
+	// memClear counts consecutive ticks on which swap-in was at or under SwapInMax, or unknown.
+	// It starts satisfied, so a daemon that has never seen pressure is not holding for it.
+	memClear int
+	// memGrace counts down the ticks after a wake on which memory is not read.
+	memGrace int
+	// swapIn is the smoothed swap-in rate of the most recent Step, for the daemon's log line.
+	swapIn float64
 	// started is false until the first Step, so that B begins at Max rather than at zero.
 	started bool
 	// seen is the ceiling the previous tick ran under, so a ceiling that RISES can be told
@@ -318,6 +393,7 @@ const (
 	MovedIdle     = "idle"      // recovered and idle long enough: back to the ceiling (GOV-46 b)
 	MovedCeiling  = "ceiling"   // the ceiling moved and carried the budget with it
 	MovedWake     = "wake"      // the machine slept; a pre-sleep cut does not survive it (GOV-B48)
+	MovedMemory   = "memory"    // swap-in crossed SwapInMax: multiplicative decrease (GOV-B53)
 )
 
 // Moved names what changed the budget on the last Step, or "" if it did not change.
@@ -341,8 +417,11 @@ func (c *Controller) Woke() (int, bool) { return c.woke, c.woke > 0 }
 func (c *Controller) CutAt() float64   { return c.runQueueMax() }
 func (c *Controller) ClimbAt() float64 { return c.climbRunQueue() }
 
+// SwapIn is the smoothed swap-in rate, in bytes per second, the most recent Step was given.
+func (c *Controller) SwapIn() float64 { return c.swapIn }
+
 // Cut names the signal currently holding the budget below its ceiling: "run queue",
-// "thermal", or "" when nothing is.
+// "thermal", "memory", or "" when nothing is.
 func (c *Controller) Cut() string {
 	if !c.started || c.b >= c.Max {
 		return ""
@@ -441,6 +520,16 @@ func Climbing(r Reading, climbAt float64) bool {
 	return r.RunQueue <= climbAt
 }
 
+// MemoryPressed is the memory cut condition on the signals alone, exported for the same
+// reason Cutting is: a measurement of how often it fires must evaluate the expression the
+// controller branches on, not a re-typed copy of it.
+//
+// An unknown reading is never pressure. That is the whole of clause 5 of GOV-B53 and it is
+// here, in the one expression, rather than at each caller.
+func MemoryPressed(r Reading) bool {
+	return r.SwapInKnown && r.SwapIn > SwapInMax
+}
+
 // Step advances the loop by one tick and returns the new budget.
 //
 // The order of the branches is the policy and must not be rearranged: a severe thermal state
@@ -486,6 +575,7 @@ func (c *Controller) Step(r Reading) int {
 		c.b = c.start()
 		c.started = true
 		c.seen = max
+		c.memClear = MemoryClearTicks
 	}
 	// moved is computed by comparing b before and after each branch, rather than by setting
 	// it inside the branches, so that a branch which runs but leaves b where it was (a halve
@@ -518,13 +608,32 @@ func (c *Controller) Step(r Reading) int {
 		c.b = max
 		c.cut = ""
 		c.clean = NominalTicksBeforeIncrease
+		c.memClear = MemoryClearTicks
 		c.quiet = 0
 		mark(MovedWake)
 		c.woke = c.b
 	}
 
+	if r.Woke {
+		// Whether or not anything was restored: the swap-in that follows a wake is the wake.
+		c.memGrace = MemoryWakeGraceTicks
+	}
+	c.swapIn = r.SwapIn
+	pressed := false
+	if c.memGrace > 0 {
+		c.memGrace--
+	} else {
+		pressed = MemoryPressed(r)
+	}
+	if pressed {
+		c.memClear = 0
+	} else if c.memClear < MemoryClearTicks {
+		c.memClear++
+	}
+	memHeld := !pressed && c.memClear < MemoryClearTicks
+
 	climbing := !r.Stale && Climbing(r, c.climbRunQueue())
-	idle := climbing && !r.DemandWaiting && !r.InUse && !r.ThermalSevere
+	idle := climbing && !r.DemandWaiting && !r.InUse && !r.ThermalSevere && !pressed && !memHeld
 	if idle {
 		c.quiet++
 	} else {
@@ -574,11 +683,25 @@ func (c *Controller) Step(r Reading) int {
 		}
 		c.cut = "run queue"
 		mark(MovedRunQueue)
+	case pressed:
+		// MULTIPLICATIVE DECREASE ON MEMORY, the same halving as the run queue's and for the
+		// same reason. It sits after the run-queue case so that a tick both signals would cut
+		// halves once and names the run queue, which is the setpoint; and after Stale, because
+		// a stale tick is a wake tick and the swap-in that follows a wake is not pressure.
+		c.b = c.b / 2
+		if c.b < Floor {
+			c.b = Floor
+		}
+		c.cut = "memory"
+		mark(MovedMemory)
 	case c.clean < NominalTicksBeforeIncrease:
 		// Coming back from a thermal cut. Hold at the floor until the machine has been clean
 		// for three consecutive ticks, so the budget does not oscillate against the
 		// platform's own governor (design.md section 5.3).
 		c.clean++
+	case memHeld:
+		// Coming back from a memory cut: hold until swap-in has been quiet for
+		// MemoryClearTicks. Memory is still what keeps the budget here, so the cut stays named.
 	case climbing && r.DemandWaiting:
 		// DemandWaiting gates the increase while the machine is in use: do not climb when
 		// nobody is asking, or the next arrival gets room the loop never saw the machine cope
@@ -601,6 +724,12 @@ func (c *Controller) Step(r Reading) int {
 			mark(MovedCeiling)
 		} else {
 			mark(MovedIdle)
+		}
+	default:
+		// The hold band: busy and coping. If memory cut the budget and has since cleared, it is
+		// the run queue that holds it here now, and the name follows what holds it (GOV-46).
+		if c.cut == "memory" {
+			c.cut = "run queue"
 		}
 	}
 

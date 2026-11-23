@@ -214,6 +214,9 @@ func budgetLine(from, to int, cause string, c *budget.Controller, rq float64, th
 		return fmt.Sprintf("restore %d->%d cause=idle rq=%.2f climb=%.2f ceiling=%d", from, to, rq, c.ClimbAt(), c.Max)
 	case budget.MovedCeiling:
 		return fmt.Sprintf("ceiling %d->%d cause=ceiling ceiling=%d->%d", from, to, ceilingFrom, c.Max)
+	case budget.MovedMemory:
+		return fmt.Sprintf("cut %d->%d cause=memory swapin=%.1fMB/s cut=%.1fMB/s ceiling=%d",
+			from, to, c.SwapIn()/1e6, budget.SwapInMax/1e6, c.Max)
 	case budget.MovedWake:
 		// GOV-B48. rq here is the CORRECTED run queue, which on the wake tick is usually
 		// still unknown — the line says so rather than printing the frozen value as if it
