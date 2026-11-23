@@ -1495,6 +1495,128 @@ capacity refusal now says which task (`own_background`, §7), under every head, 
 all-own one. The earbrief session's 29 refusals were true, but they named nothing, and the
 model had no way to know the cause was itself.
 
+### 5.6d Waking up (GOV-B48, decided 2026-11-22)
+
+**The question.** GOV-38 found that every long "overnight hold" of the dogfooding week lines up
+with macOS sleep. On 2026-11-21 the budget was cut 4 -> 1 at 01:51:36 (run queue 6.73 per core),
+the machine slept at 01:51:40 and hibernated until `Wake from Hibernate` at 13:53:30, and
+stepstool was refused at `slots=1.08/1` from 13:53:54 to 13:56:11. The controller resumed from a
+pre-sleep cut and judged a just-woken machine on pre-sleep numbers.
+
+**Measured: the load average freezes across sleep and resumes from the frozen value.** macOS
+26.4.1 (25E253), Apple silicon, `hibernatemode 3`, no sudo: the 1 Hz trace
+(`samples.jsonl`, `loadavg1` and `runqueue`) read against `pmset -g log` for 2026-11-22. The
+machine went to sleep at
+
+    2026-11-22 09:13:33 -0500 Sleep  Entering Sleep state due to 'Clamshell Sleep' ... (Charge:80%) 910 secs
+
+then spent the day in Deep Idle with DarkWakes every few minutes (`DarkWake from Deep Idle
+[CDNP] ... 45 secs`), and woke at
+
+    2026-11-22 20:31:34 -0500 Wake   DarkWake to FullWake from Deep Idle [CDNVA] : due to UserActivity Assertion
+
+The trace has 99 gaps of more than 30 s between ticks, 9.1 hours in total, the longest 1,078 s.
+
+- **(a) Before sleep, the sleep itself is the spike.** `loadavg1` updates every 5 s and holds
+  between, so a 1 Hz sampler reads each value about five times. Before the 09:13:33 clamshell
+  sleep it read 3.84, 4.17, 4.16 up to 14:13:27Z, then **51.23** at 14:13:29Z, one update later:
+  some 590 runnable threads, the system answering the sleep notification. The last value before
+  the gap was 47.85, and that is what froze. The hibernate below shows the same thing: 201.70,
+  220.62, 236.51, 240.95 in the final seconds. **So the frozen value is mostly the sleep's own
+  storm, not the user's workload.** That is where GOV-38's "40-70 load average" came from.
+- **(b) After waking.** On **69 of 99** gaps the first tick after the gap reads the pre-sleep
+  value **exactly** (47.85 -> 47.85 across 909 s; 186.68 -> 186.68 across 773 s). On the other 30
+  the first tick landed just after a kernel update, and **every one of those moved by at most one
+  update's decay**: the smallest ratio is 0.9199 against e^(-5/60) = 0.9200 (118.99 -> 109.46
+  across 319 s is exactly one step toward an idle machine). A catch-up for the gap would have
+  read e^(-gap/60), 0.585 or less, on every one of them. So the average resumes from where it
+  stopped and decays at its ordinary 1-minute time constant: halving takes ~42 s of awake time,
+  falling from 6.73 per core under this machine's calibrated cut (5.52) takes ~12 s, and falling
+  from the day's 26.3 per core (210.71 / 8) takes ~94 s.
+- **The full wake had a real storm on top.** At 20:31:33 the run queue was 1.51 per core
+  (decaying DarkWake memory); by 20:31:48 it was 7.77, real runnable work, and it decayed back
+  under the climb level by 20:33:22, when the budget was restored. A policy that ignores the run
+  queue at wake would have admitted builds into that.
+- **DarkWakes are busy too.** Load averages of 20 to 210 during the 45-second maintenance
+  wakes, and the controller cut 14 times between 09:13 and 20:31 with nobody at the machine.
+- **(c) Hibernate, measured the same night.** The battery was run down under load and the
+  machine was woken on the charger:
+
+      2026-11-22 22:02:07 -0500 Sleep  Entering Sleep state due to 'Low Power Sleep':TCPKeepAlive=inactive Using Batt (Charge:1%) 302 secs
+      2026-11-22 22:07:09 -0500 Wake   Wake from Hibernate [CDNVA] : due to acattach/UserActivity Assertion Using AC (Charge:2%)
+
+  The trace's gap is 300.96 s (03:02:09Z to 03:07:10Z). Before it, `loadavg1` was 240.95 (30.12
+  per core). The first tick after it read **209.91**: a ratio of 0.871. That is **two** updates on
+  from the frozen value (two allow 0.846 at the least, one allows 0.920), not the gap's worth
+  (e^(-301/60) = 0.0066). So the freeze holds across a restore from the hibernate image too, but
+  entering and leaving hibernate spans two kernel updates where a Deep Idle sleep spans at most
+  one. The restore then had a large real storm: 283.43 one second later, then 313.82, 334.66,
+  379.37, 405.04, 418.89 and a peak of **431.07 (53.9 per core) 32 s after the wake**, decaying
+  from there (339.94 at 61 s). Back-solved, the first post-wake update saw over a thousand
+  runnable threads: everything thawing at once. The daemon running at the time was the
+  pre-GOV-B48 build. It went into the hibernate cut to 1 (21:55:45, run queue 8.30) and stayed
+  there, which on this wake was the right answer for the wrong reason.
+- **On this hardware there is no other route into hibernate.** `pmset -g log` reports
+  `hibmode=3 standbydelaylow=0 standbydelayhigh=0`: a long sleep never becomes a hibernate. Only
+  `Low Power Sleep` at 1% does, which is how both 11-21 and this measurement got there.
+- **Go's monotonic clock does not count sleep.** go1.26's `runtime.nanotime` is
+  `mach_absolute_time` on darwin and `CLOCK_MONOTONIC` on Linux; neither advances during sleep
+  or suspend. `time.Since` between two ticks either side of a twelve-hour sleep reads about one
+  second.
+
+**Detection.** The sampling tick keeps the previous tick's `time.Time` with its monotonic
+reading, and `budget.Away` takes the wall-clock gap minus the monotonic gap. More than
+`SleepGap` (30 s) is a sleep. A wall-clock-only test would also fire on an NTP step; a
+monotonic-only test sees nothing. Each sleep is one `daemon.log` line:
+
+    governor daemon: machine was away 12h2m0s; frozen run queue 6.73, correcting until it decays
+
+so a long silence between budget lines reads as a sleep, not a hold.
+
+**The options, costed in each direction.** "Refused" is a build turned away on a stale reading.
+"Oversubscribed" is a build admitted into a machine that really is busy.
+
+| On wake | Refused on stale numbers | Oversubscribed |
+|---|---|---|
+| nothing (before GOV-B48) | the pre-sleep cut stands; a pre-sleep run queue over the cut cuts again for 12-94 s of decay; recovery then waits for a parked build or 60 idle ticks with no lease held. 2026-11-21: 3+ minutes | no |
+| ignore the run queue for a fixed settle window | no | yes, for the whole window: the 20:31 storm reached 7.77 per core 14 s after wake, and a window long enough to outlast a 26-per-core frozen average (~94 s) admits into all of it |
+| reset to the ceiling, raw readings | barely helps: the frozen value cuts it again on the first tick | no |
+| **reset a held-down budget to the ceiling; hold until the first kernel update; then remove the pre-sleep memory exactly** | no | only until the first update, at most 5 s. The 20:31 storm was at 2.13 per core 4 s after wake, under the cut |
+
+**Chosen: the last row.** The memory is known exactly. After k updates since wake the kernel
+reads `la_k = la_0 * m_k + (1 - m_k) * n̄` with `m_k = e^(-5k/60)`, so
+`n̄ = (la_k - la_0 * m_k) / (1 - m_k)` is the load since wake with the pre-sleep part removed and
+nothing else. `budget.WakeFilter` counts updates by watching the value change, raises the count
+when the result comes out negative (a runnable count cannot be, so that is a missed update:
+the hibernate's two-update transition, which a change count reads as one and which would
+otherwise have read an idle machine on the first tick after the wake), holds the loop
+(`Reading.Stale`: no cut, no climb; thermal still floors) until the first one, gives up waiting
+after 7 ticks (an update that leaves the average unchanged means the runnable count equalled
+it, so the reading was never stale), and hands raw readings back once the pre-sleep share is
+under 0.1 per core. `Reading.Woke` restores a budget held below the ceiling, logged as
+`restore 1->4 cause=wake`. A genuine wake storm then cuts from the ceiling on the first fresh
+reading, as a freshly started daemon would (`start()`).
+
+**DarkWake.** The restore fires only when something holds the budget below the ceiling, so a
+DarkWake that finds it at the ceiling moves nothing and logs only the sleep line. When one
+DarkWake's own load cut the budget and the machine slept on that cut, the next wake clears it.
+That is the stale cut this section exists to remove. The filter runs on every wake, and it only
+makes the reading honest.
+
+**Linux: detection works; correction is a documented no-op.** `CLOCK_MONOTONIC` excludes suspend,
+so `Away` and the log line work unchanged, and the pre-sleep cut is cleared. Whether Linux's
+`calc_global_load` freezes across suspend or catches up has not been measured, and correcting for
+a freeze that does not happen would read a busy machine as idle, which is the oversubscribing
+direction. `signals.LoadavgFrozenAcrossSleep` is therefore false off darwin and the run queue
+passes through uncorrected, as before GOV-B48.
+
+**Found on the way, not changed: leases outlive a sleep.** Lease TTLs run on the monotonic clock,
+so the build lease taken before the 2026-11-21 hibernate was reaped at 13:57:48 with
+`held=5m0.732s`, twelve wall-clock hours after it was granted. That lease was the 1.00 in
+`slots=1.08/1`. A build suspended by sleep is still running when the machine wakes, so the
+monotonic TTL is defensible. With the budget restored to its ceiling it no longer refuses a
+build on its own.
+
 ## 6. Allocation
 
 ### 6.1 Fair share

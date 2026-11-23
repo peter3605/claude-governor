@@ -86,7 +86,7 @@ func TestEveryBudgetChangeIsALineNamingItsCause(t *testing.T) {
 
 	// Capacity 12 puts MaxSlots at 10, so the calibrated b_max is what sets the ceiling.
 	tick := func(rq float64, thermal signals.Thermal, demand bool) {
-		d.step(signals.Sample{RunQueue: rq, Thermal: thermal, CPUCapacity: 12}, demand, false)
+		d.step(signals.Sample{RunQueue: rq, Thermal: thermal, CPUCapacity: 12}, demand, false, 0)
 	}
 	idle := func(n int) {
 		for i := 0; i < n; i++ {
@@ -396,3 +396,53 @@ func TestAReleaseLineIsWrittenAfterTheReply(t *testing.T) {
 type writerFunc func([]byte) (int, error)
 
 func (f writerFunc) Write(p []byte) (int, error) { return f(p) }
+
+// TestASleepIsOneLineAndClearsAPreSleepCut is GOV-B48 clause 2, through the daemon's own tick:
+// a gap between ticks that the monotonic clock did not see is written as one line naming how
+// long the machine was away, so a long silence between budget lines reads as a sleep and not
+// as a hold, and the cut made before it is restored.
+func TestASleepIsOneLineAndClearsAPreSleepCut(t *testing.T) {
+	var log lockedBuffer
+	d := newDaemon(4, &log)
+	d.loop = &budget.Controller{Max: 4, RunQueueMax: 5.52}
+	d.calibratedBMax = 4 // capacity 12 derives 10 slots; the calibration caps it at 4
+	tick := func(rq float64, away time.Duration) {
+		d.step(signals.Sample{RunQueue: rq, Thermal: signals.Nominal, CPUCapacity: 12}, false, true, away)
+	}
+	tick(6.73, 0) // 4 -> 2
+	tick(6.73, 0) // 2 -> 1
+	tick(6.73, 12*time.Hour+2*time.Minute)
+	tick(6.73, 0)
+	tick(6.73, 0)
+
+	want := []string{
+		"cut 4->2 cause=run-queue rq=6.73 cut=5.52 ceiling=4",
+		"cut 2->1 cause=run-queue rq=6.73 cut=5.52 ceiling=4",
+		"restore 1->4 cause=wake ceiling=4",
+	}
+	if !signals.LoadavgFrozenAcrossSleep {
+		// No correction off darwin: the frozen 6.73 is passed through and cuts the restored
+		// budget on the same tick and the next. The restore is still its own line, not folded
+		// into the cut as `cut 1->2` (which is what CI on Linux caught).
+		want = append(want,
+			"cut 4->2 cause=run-queue rq=6.73 cut=5.52 ceiling=4",
+			"cut 2->1 cause=run-queue rq=6.73 cut=5.52 ceiling=4")
+	}
+	if got := budgetMoves(log.String()); strings.Join(got, "\n") != strings.Join(want, "\n") {
+		t.Fatalf("budget lines:\n  %s\nwant:\n  %s\nwhole log:\n%s",
+			strings.Join(got, "\n  "), strings.Join(want, "\n  "), log.String())
+	}
+	var slept []string
+	for _, l := range strings.Split(log.String(), "\n") {
+		if i := strings.Index(l, "governor daemon: machine was away"); i >= 0 {
+			slept = append(slept, l[i:])
+		}
+	}
+	wantSlept := "governor daemon: machine was away 12h2m0s; frozen run queue 6.73, correcting until it decays"
+	if !signals.LoadavgFrozenAcrossSleep {
+		wantSlept = "governor daemon: machine was away 12h2m0s; frozen run queue 6.73, not correcting (unmeasured on this platform; design.md section 5.6d)"
+	}
+	if len(slept) != 1 || slept[0] != wantSlept {
+		t.Fatalf("sleep lines %q, want exactly [%q]\nwhole log:\n%s", slept, wantSlept, log.String())
+	}
+}

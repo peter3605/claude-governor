@@ -619,6 +619,9 @@ type daemon struct {
 	// rather than in the Sample because an average is a property of the series, not of any
 	// one reading in it.
 	cpuAvg *signals.EWMA
+	// wake corrects the run queue across a sleep (GOV-B48, design.md section 5.6d). Only the
+	// sampling goroutine touches it, under signalsMu like the loop it feeds.
+	wake budget.WakeFilter
 }
 
 // machineTTL is how long the daemon reuses its reading of this host's live sessions.
@@ -1148,6 +1151,10 @@ func (d *daemon) sample(ctx context.Context) {
 	}
 	t := time.NewTicker(sampleInterval)
 	defer t.Stop()
+	// prev is the previous tick's time WITH its monotonic reading, which is what lets the
+	// tick tell a sleep from a hold (GOV-B48): across a sleep the wall clock advances and
+	// the monotonic clock does not.
+	prev := time.Now()
 
 	// The first reading is a priming read — NewSampler's contract says CPU and every
 	// process-tree rate come back zero because they are differences against a tick that does
@@ -1178,7 +1185,10 @@ func (d *daemon) sample(ctx context.Context) {
 				fmt.Fprintf(d.diag, "governor daemon: sample: %v\n", err)
 				continue
 			}
-			d.step(s, demand, inUse)
+			now := time.Now()
+			away := budget.Away(now.Round(0).Sub(prev.Round(0)), now.Sub(prev))
+			prev = now
+			d.step(s, demand, inUse, away)
 		}
 	}
 }
@@ -1186,9 +1196,16 @@ func (d *daemon) sample(ctx context.Context) {
 // step publishes one reading and steps the control loop with it, logging the budget if it
 // moved. It is the body of sample's tick, separate so a test can drive the loop through each
 // cause with scripted readings instead of waiting a real second per tick (GOV-B29).
-func (d *daemon) step(s signals.Sample, demand, inUse bool) {
-	var moved string
+//
+// away is how long the machine slept before this tick, zero when it did not (budget.Away).
+func (d *daemon) step(s signals.Sample, demand, inUse bool, away time.Duration) {
+	var moved, slept string
 	d.signalsMu.Lock()
+	d.wake.Frozen = signals.LoadavgFrozenAcrossSleep
+	rq, fresh := d.wake.Observe(s.RunQueue, away)
+	if away > 0 {
+		slept = sleptLine(away, d.wake.Before(), d.wake.Waking())
+	}
 	d.latest, d.latestOK = s, true
 	if d.cpuAvg == nil {
 		d.cpuAvg = signals.NewEWMA(signals.DefaultCPUWindow)
@@ -1202,10 +1219,12 @@ func (d *daemon) step(s signals.Sample, demand, inUse bool) {
 		d.loop.Max = d.ceiling(s.CPUCapacity)
 		to := d.loop.Step(budget.Reading{
 			CPU:           avg,
-			RunQueue:      s.RunQueue,
+			RunQueue:      rq,
 			ThermalSevere: s.Thermal.Severe(),
 			DemandWaiting: demand,
 			InUse:         inUse,
+			Woke:          away > 0,
+			Stale:         !fresh,
 		})
 		// Formatted under the lock, because it reads the controller. Written after it,
 		// because liveBudget takes this lock on every acquire and a file write does not
@@ -1216,11 +1235,25 @@ func (d *daemon) step(s signals.Sample, demand, inUse bool) {
 			// Budget() had been answering start() from the old ceiling.
 			cause = budget.MovedCeiling
 		}
-		moved = budgetLine(from, to, cause, d.loop, s.RunQueue, string(s.Thermal), ceilingFrom)
+		if woke, ok := d.loop.Woke(); ok && cause != budget.MovedWake {
+			// Restored and then moved again on the same tick (GOV-B48): two lines, so the
+			// restore is not reported under the cause of the move that followed it.
+			moved = budgetLine(from, woke, budget.MovedWake, d.loop, rq, string(s.Thermal), ceilingFrom)
+			if next := budgetLine(woke, to, cause, d.loop, rq, string(s.Thermal), ceilingFrom); next != "" {
+				moved += "\n" + next
+			}
+		} else {
+			moved = budgetLine(from, to, cause, d.loop, rq, string(s.Thermal), ceilingFrom)
+		}
 	}
 	d.signalsMu.Unlock()
+	if slept != "" {
+		fmt.Fprintf(d.diag, "governor daemon: %s\n", slept)
+	}
 	if moved != "" {
-		d.event("%s", moved)
+		for _, l := range strings.Split(moved, "\n") {
+			d.event("%s", l)
+		}
 	}
 }
 
