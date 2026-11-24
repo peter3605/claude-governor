@@ -141,6 +141,20 @@ type request struct {
 	PID          int    `json:"pid"`
 	PIDStartedAt int64  `json:"pid_started_at"`
 
+	// acquire, release (GOV-B56, design.md section 5.6g)
+	//
+	// Resume is the agent_id a SendMessage resume targets, sent by the gate on that acquire
+	// only, so its tentative lease binds to that subagent's SubagentStart and FIFO passes
+	// over it. BackgroundAgent and Running are read off a SubagentStop's background_tasks:
+	// the first says the list names the stopping agent itself, which only a background
+	// subagent's does and which means its tasks outlive the stop; the second is the ids of
+	// the tasks listed as running. All three are additive: an older client sends none and
+	// is handled as before, and an older daemon ignores them. Each key was checked against
+	// every other message on this connection, and none of them uses it.
+	Resume          string   `json:"resume,omitempty"`
+	BackgroundAgent bool     `json:"background_agent,omitempty"`
+	Running         []string `json:"running,omitempty"`
+
 	// session
 	Action string `json:"action"`
 	Weight int    `json:"weight"`
@@ -1510,6 +1524,11 @@ func leaseRequestFor(req request) lease.Request {
 		// but its release comes from SubagentStop with no tool_use_id at all, so indexing it
 		// here would build an index nothing can ever look up.
 		r.ToolUseID = req.ToolUseID
+	} else if agentIDShape.MatchString(req.Resume) {
+		// The subagent a SendMessage resume targets (GOV-B56). Checked against the measured
+		// id shape because it came off the wire and is used as a key; anything else is a
+		// plain FIFO lease, which is what an older gate gets.
+		r.Resume = req.Resume
 	}
 	return r
 }
@@ -1879,6 +1898,15 @@ func (d *daemon) confirm(req request) any {
 			d.event("confirm-late session=%s lease=%s agent=%s lapsed=%s ago", l.Session, l.ID, l.AgentID, late)
 		}}
 	}
+	if l.Woken {
+		// A subagent this daemon already governed, woken with no PreToolUse after its idle
+		// SubagentStop released its lease (GOV-B56, design.md section 5.6g). Said on the wire
+		// and in daemon.log for the same reason "late" is.
+		reply := ackReply{V: d.speaks, OK: true, Reason: "wake", Lease: l.ID, InUse: d.table.InUse()}
+		return loggedReply{reply: reply, after: func() {
+			d.event("confirm-wake session=%s lease=%s agent=%s", l.Session, l.ID, l.AgentID)
+		}}
+	}
 	return ackReply{V: d.speaks, OK: true, Lease: l.ID, InUse: d.table.InUse()}
 }
 
@@ -1894,7 +1922,16 @@ func (d *daemon) release(req request) (ackReply, []lease.Released) {
 	// Done whether or not the agent held a lease of its own: a subagent resumed by
 	// SendMessage reaches the CPU with no lease (section 4.3), yet its builds took leases
 	// like any other.
-	bg := d.table.ReleaseBackgroundOf(req.Session, req.AgentID)
+	//
+	// Not the ones still running under a BACKGROUND subagent, though (GOV-B56). Its
+	// SubagentStop fires every time it goes idle, and its tasks run on through it and wake it
+	// again (hook-surface.md section 29). Those leases are left to the task-file Liveness and
+	// to the stop that no longer lists them.
+	var keep []string
+	if req.BackgroundAgent {
+		keep = req.Running
+	}
+	bg := d.table.ReleaseBackgroundOf(req.Session, req.AgentID, keep)
 	if ok || len(bg) > 0 {
 		// The slot that just came free belongs to whoever has waited longest for it.
 		d.pump()

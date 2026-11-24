@@ -2787,3 +2787,198 @@ interleaving question.
 - Whether a message that ends in prose after its Agent calls delays them further. It would,
   if consequence 1 is the whole mechanism.
 - Linux.
+
+## 29. A background subagent goes idle, and its own task wakes it (GOV-B56)
+
+§28.4 consequence 6 noted a subagent with six `SubagentStart`s, all after its first answered
+`no_pending_lease`. This section measures what those starts are. **A background subagent
+(`run_in_background: true` on the `Agent` call) fires `SubagentStop` every time it ends a turn,
+not only when it is finished. A background task it left running survives that stop, and the
+task's end wakes it: a second `SubagentStart` with the same `agent_id` and no `PreToolUse`
+anywhere.** The idle stop has already released its lease, so before GOV-B56 the woken subagent
+ran with none. A foreground subagent behaves as §26 measured: its tasks are killed at its stop
+and nothing wakes it.
+
+### 29.0 Provenance
+
+| | |
+|---|---|
+| Claude Code | **2.1.331** for the probes; 2.1.316 to 2.1.330 in the transcripts |
+| Host | macOS 25.4.0, darwin/arm64 |
+| Measured | 2026-11-23 |
+| Model | `sonnet` |
+| Story | GOV-B56 |
+
+### 29.1 Method
+
+**Transcripts.** Every `projects/<slug>/<session>/subagents/agent-<id>.jsonl` on the machine
+records each `SubagentStart` and `SubagentStop` hook as an attachment carrying the governor's
+own stderr (`governor confirm: ok=... reason=...`, `governor release: ok=...`), and the
+`.meta.json` beside it says whether the spawn was `requestShape: "background"` or
+`"foreground"`. A wake's trigger is the user record just before its `SubagentStart`.
+
+**Probes.** A scratch git repo, `--settings <probe>/settings.json --setting-sources ""`,
+`--model sonnet`, `--allowedTools "Bash Agent"`. A capture hook on `PreToolUse` and
+`PostToolUse` (`matcher: "*"`), `SubagentStart`, `SubagentStop`, `Stop`, `UserPromptSubmit` and
+`SessionEnd` writes each payload to **its own file** named by arrival time. (A single appended
+log interleaved concurrent hooks' writes into one line in the first run.) The subagent is told
+to run, with `run_in_background: true`, a heartbeat that writes its PID and then a timestamp
+every 0.5 s, 40 times (20 s), then reply `launched` and end its turn without waiting, and reply
+`finished` if told the command finished. A count of 40 heartbeats means the task was never
+killed.
+
+**`-p` cannot show the wake; a held-open stream-json session can.** In plain `claude -p` the
+session ends with the main thread's turn and kills the task (W1, 15 of 40 beats). Keeping the
+main thread busy does not help either: with a foreground wait on the main thread (W1c, W1d) the
+task ran to 40 beats, but the subagent's completion notification was appended to its transcript
+only at session end (03:34:35 for a task that ended at 03:33:59) and the subagent never ran
+again. What reproduces an interactive session is a main thread that is **idle** between turns:
+`claude -p --input-format stream-json --output-format stream-json --verbose` with one user
+message and stdin held open for 70 s. The main thread spawns the agent, replies `spawned` and
+ends its turn. (A plain foreground `sleep 45` on the main thread is refused by Claude Code itself
+as a standalone sleep; W1b.)
+
+| Probe | Mode | `Agent` call | Shape |
+|---|---|---|---|
+| S1 | default | `run_in_background: true` | stream-json, held 70 s |
+| S2 | auto | `run_in_background: true` | stream-json, held 70 s |
+| S3 | default | foreground | stream-json, held 70 s |
+
+### 29.2 Transcripts
+
+375 subagents on this machine ran under the governor's hooks: 130 background spawns and 245
+foreground.
+
+| | subagents | more than one `SubagentStart` |
+|---|---|---|
+| background | 130 | **17** |
+| foreground | 245 | **0** |
+
+Those 17 subagents had 37 wakes between them, in earbrief, edgefinder, stepstool and this repo,
+2026-11-14 to 11-23:
+
+| What came just before the wake | Wakes | Confirm answered |
+|---|---|---|
+| `[SYSTEM NOTIFICATION ...] automated background-task event`, no parent tool call | **36** | `no_pending_lease`, all 36 |
+| the parent's `SendMessage` (`The coordinator sent a message while you were working`) | 1 | `ok=true lease="L-0037"` |
+
+16 of the 17 started leased; the 17th is `a840d0d9`, whose first start was the lapsed spawn of
+§28.2. Every `SubagentStart` after the first is preceded by a `SubagentStop`. The idle gap from
+that stop to the wake had p50 129 s and max 4,245 s (71 min). The woken subagents then worked
+with no lease for 5,374 s in all (1.5 h), counted from each unleased wake to the next stop.
+
+`a3a16c4a` (edgefinder `b961a293`, Claude Code 2.1.330) shows the whole mechanism:
+
+```
+20:16:07.683  SubagentStart   governor confirm: ok=true reason="" lease="L-0056" in_use=2
+20:26:52.943  Bash sleep 40, run_in_background: true          -> task boczi41py
+20:26:54.947  "Waiting for the build slot before running tests."   (turn ends)
+20:26:55.578  SubagentStop    governor release: ok=true reason="" lease="" in_use=2
+20:27:23.208  [SYSTEM NOTIFICATION - NOT USER INPUT] ... automated background-task event
+20:27:23.328  SubagentStart   governor confirm: ok=false reason="no_pending_lease" lease="" in_use=2
+20:27:29.787  SubagentStop    governor release: ok=false reason="no_lease"
+20:27:33.877  SubagentStart   governor confirm: ok=false reason="no_pending_lease"
+   ... two more idle/wake cycles, then pytest, all of it unleased, to 20:34:41
+```
+
+The one leased wake is the exception that proves the rule. `ab6d2584`'s second start at
+18:27:32.677 followed the parent's `SendMessage` at 18:27:32.298, whose `PreToolUse` the gate
+answered `granted lease L-0037 (5/4 in use)`. A resume through `SendMessage` is governed
+(§8.3); a wake by a task is not, because nothing fires before it but `SubagentStart`.
+
+### 29.3 Probes
+
+Times from the session's first event.
+
+**S1, background agent, default mode:**
+
+```
++  2.890 PreToolUse       Agent                               (main)
++  2.933 SubagentStart    agent=ae7683e44cec32a5f
++  2.933 PostToolUse      Agent  resp={"isAsync":true,"status":"async_launched","agentId":"ae7683e44cec32a5f"}
++  4.010 Stop             bg=[subagent running ae7683e44cec32a5f]   last='spawned'
++  5.180 PreToolUse       Bash   agent=ae7683e44cec32a5f
++  5.288 PostToolUse      Bash   agent=ae7683e44cec32a5f  resp={"backgroundTaskId":"br8i8xjdp"}
++  6.416 SubagentStop     agent=ae7683e44cec32a5f  bg=[subagent running ae7683e44cec32a5f, shell running br8i8xjdp]  last='launched'
++  6.497 UserPromptSubmit <task-notification><task-id>ae7683e44cec32a5f</task-id><tool-use-id>toolu_014X...
++  7.885 Stop             bg=[shell running br8i8xjdp]
+         (the task ends near +25.3 s)
++ 25.811 SubagentStart    agent=ae7683e44cec32a5f
++ 26.802 SubagentStop     agent=ae7683e44cec32a5f  bg=[subagent running ae7683e44cec32a5f]  last='finished'
++ 26.837 UserPromptSubmit <task-notification><task-id>ae7683e44cec32a5f</task-id><output-file>...
++ 28.293 Stop             bg=[]
++ 69.424 SessionEnd
+beats = 40
+```
+
+**S2, background agent, auto mode:** the same sequence. In auto mode the subagent ends each
+turn with a `SubagentHandback` tool call (`{"message":"launched"}`), and the parent receives an
+`<agent-message from="acc693a107e281c8f"> [Subagent hand-back]` prompt. The `SubagentStop` after
+the hand-back still lists the shell task running, and the task's end wakes the subagent at
++26.561 for a second hand-back (`finished`). 40 beats.
+
+**S3, foreground agent, default mode:**
+
+```
++  2.843 PreToolUse       Agent                               (main)
++  2.889 SubagentStart    agent=ab57e784fce4848cb
++  4.951 PostToolUse      Bash   agent=ab57e784fce4848cb  resp={"backgroundTaskId":"b4i5nu3jd"}
++  5.715 SubagentStop     agent=ab57e784fce4848cb  bg=[shell running b4i5nu3jd]  last='launched'
++  5.821 PostToolUse      Agent  resp={"status":"completed","agentId":"ab57e784fce4848cb"}
++  7.691 Stop             bg=[]
++ 78.545 SessionEnd
+beats = 2
+```
+
+The payloads, verbatim apart from paths (S1):
+
+```json
+{"session_id":"8bec3c8f-1f2d-4ada-ac78-17f4d4c90330","cwd":"<P>/S1","prompt_id":"73d78ffc-ee69-4e41-8283-c3bf7cb28d5b","agent_id":"ae7683e44cec32a5f","agent_type":"general-purpose","hook_event_name":"SubagentStart"}
+{"session_id":"8bec3c8f-1f2d-4ada-ac78-17f4d4c90330","cwd":"<P>/S1","prompt_id":"73d78ffc-ee69-4e41-8283-c3bf7cb28d5b","permission_mode":"default","agent_id":"ae7683e44cec32a5f","agent_type":"general-purpose","effort":{"level":"medium"},"hook_event_name":"SubagentStop","stop_hook_active":false,"last_assistant_message":"launched","background_tasks":[{"id":"ae7683e44cec32a5f","type":"subagent","status":"running","description":"Run background heartbeat command","agent_type":"general-purpose"},{"id":"br8i8xjdp","type":"shell","status":"running","description":"Run background heartbeat loop","command":"echo $$ > <P>/S1/pid; for i in $(seq 1 40); do date +%s >> <P>/S1/beats; sleep 0.5; done; echo finished"}],"session_crons":[]}
+{"session_id":"8bec3c8f-1f2d-4ada-ac78-17f4d4c90330","cwd":"<P>/S1","prompt_id":"b1f58766-d911-4044-8a08-9a7d2c03c90d","agent_id":"ae7683e44cec32a5f","agent_type":"general-purpose","hook_event_name":"SubagentStart"}
+{"session_id":"8bec3c8f-1f2d-4ada-ac78-17f4d4c90330","cwd":"<P>/S1","prompt_id":"b1f58766-d911-4044-8a08-9a7d2c03c90d","permission_mode":"default","agent_id":"ae7683e44cec32a5f","agent_type":"general-purpose","effort":{"level":"medium"},"hook_event_name":"SubagentStop","stop_hook_active":false,"last_assistant_message":"finished","background_tasks":[{"id":"ae7683e44cec32a5f","type":"subagent","status":"running","description":"Run background heartbeat command","agent_type":"general-purpose"}],"session_crons":[]}
+```
+
+### 29.4 Consequences
+
+1. **A background subagent's `SubagentStop` means "this turn ended", not "this agent ended".**
+   It fires at every idle point (S1, S2, and every one of the 17 transcripts), and the parent is
+   sent a `<task-notification>` for the agent with its interim result each time.
+2. **A background subagent's tasks are not killed at its stop** (S1, S2: 40 of 40 beats). This
+   is the opposite of §26 consequence 6, which measured foreground subagents and still holds for
+   them on 2.1.331 (S3: 2 beats, no wake). GOV-B41's `ReleaseBackgroundOf` releases a background
+   subagent's backgrounded builds at its first idle stop while they are still running.
+3. **The task's end wakes the subagent with a `SubagentStart` and nothing else.** The same
+   `agent_id`, a new `prompt_id`, no `PreToolUse`, no `SendMessage`. The two `SubagentStart`
+   payloads have the same shape; only an `agent_id` already seen tells a wake from a spawn.
+4. **`background_tasks` tells a background subagent's stop from a foreground one's.** A
+   background subagent lists **itself** (`type: "subagent"`, `id` equal to its `agent_id`) in
+   every `SubagentStop`, idle or final. A foreground one does not. The tasks listed beside it as
+   `running` at an idle stop are the ones that will wake it. Because the final stop lists itself
+   too, it **cannot** tell idle from finished; only "a task is still listed as running" can.
+5. **Nothing a hook sees marks the final stop of a background agent as final.** Its last
+   `SubagentStop` and an idle one differ only in whether a task is still listed. A subagent
+   waiting on something that is not a background task would look final and might still be
+   woken; it would then be a known `agent_id` too.
+6. **In `-p` without a held-open stdin, an idle background subagent is never woken.** Its
+   notification waits until the session ends. Every wake measured here and in the transcripts
+   came from a session whose main thread was idle between turns.
+
+### 29.5 Folded into design.md
+
+§5.6g records the decision. The daemon remembers every `agent_id` it has confirmed in a session;
+a `SubagentStart` for one of them with no live lease is a wake, and it is leased again,
+unadmitted, without popping the FIFO. A `SendMessage` resume's acquire names its target, so its
+lease binds to that agent alone. `release` reads `background_tasks`: when it lists the stopping
+agent itself, the agent's backgrounded builds listed as running are kept. §4.3's lifecycle and
+hazard list, §7's `acquire`, `confirm` and `release`, and §10.3 are updated.
+
+### 29.6 Still unmeasured
+
+- An interactive session driven by a person rather than a held-open stream-json stdin. The 17
+  transcripts are interactive and show the same sequence, which is the evidence it holds.
+- A background subagent woken by a `Monitor` event rather than a shell task's end
+  (`a3a16c4a` had both running). The task list's `type` for a monitor was not captured.
+- Whether `background_tasks` on a background subagent's `SubagentStop` lists other agents'
+  tasks. Each probe ran one subagent, and every entry it listed was its own.
+- Linux.
