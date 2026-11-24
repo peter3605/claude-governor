@@ -27,6 +27,13 @@ type Options struct {
 	// Announce receives one line before anything that will be felt on the machine, so the
 	// probe is never a surprise. Nil is silent, which is what a test wants.
 	Announce func(string)
+	// Basis is what this host measured before, which the probe's answer is checked against
+	// (ProbeMaxShortfall). The zero value is no bound.
+	Basis Basis
+	// Repetition replaces one three-phase repetition of the probe. Nil is the real
+	// measurement; a test stages readings through it, so that what the command does with an
+	// implausible answer can be checked without a machine that produces one on demand.
+	Repetition func(ctx context.Context, workers int, d time.Duration) (eff, drift float64, ok bool)
 }
 
 func (o Options) ambientSamples() int {

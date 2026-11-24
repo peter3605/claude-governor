@@ -4,10 +4,13 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/peter3605/claude-governor/internal/budget"
 	"github.com/peter3605/claude-governor/internal/config"
@@ -364,5 +367,138 @@ func TestACalibrationWithoutAProbeKeepsTheStoredCeiling(t *testing.T) {
 	}
 	if !strings.Contains(stdout.String(), "kept from 2026-11-01T19:34:07Z") {
 		t.Errorf("the report does not tell the person the ceiling was kept:\n%s", stdout.String())
+	}
+}
+
+// stageProbe makes every repetition of the probe read from effs in turn, past the drift check,
+// for the rest of the test.
+func stageProbe(t *testing.T, effs ...float64) {
+	t.Helper()
+	var i int
+	stagedRepetition = func(context.Context, int, time.Duration) (float64, float64, bool) {
+		e := effs[i%len(effs)]
+		i++
+		return e, 0.01, true
+	}
+	t.Cleanup(func() { stagedRepetition = nil })
+}
+
+// readCalibrated is the three fields GOV-B59 is about, read back off disk.
+func readCalibrated(t *testing.T, path string) (bmax int, eff float64, from string) {
+	t.Helper()
+	var doc struct {
+		BMax           int     `json:"b_max"`
+		Eff            float64 `json:"probe_effective_cores"`
+		CalibratedFrom string  `json:"calibrated_from"`
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(raw, &doc); err != nil {
+		t.Fatal(err)
+	}
+	return doc.BMax, doc.Eff, doc.CalibratedFrom
+}
+
+func skipIfProbeSkipped(t *testing.T, out string) {
+	t.Helper()
+	if strings.Contains(out, "already loaded") {
+		t.Skip("this machine is past ProbeSkipAbove, so the probe did not run and there is nothing to judge")
+	}
+}
+
+// TestAnImplausibleReadingLeavesTheStoredCeiling is GOV-B59 clause 2 at the command: a staged
+// probe whose repetitions agree with each other perfectly well and sit 41% below this host's
+// recorded 5.64 — the 2026-11-24 reading — leaves config.json's b_max exactly as it was, and
+// the output names the value kept, when it was measured, and how to accept a slower machine.
+func TestAnImplausibleReadingLeavesTheStoredCeiling(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv(transport.StateDirEnv, dir)
+	path := filepath.Join(dir, config.File)
+	writeConfig(t, path, map[string]any{
+		"schema":                config.Schema,
+		"b_max":                 4,
+		"run_queue_max":         4.72,
+		"calibrated_at":         "2026-11-01T19:34:07Z",
+		"probe_effective_cores": 5.64,
+	})
+	stageProbe(t, 3.40, 3.31, 3.25, 3.20, 3.10)
+
+	var stdout, stderr bytes.Buffer
+	if code := runCalibrate(nil, &stdout, &stderr); code != 0 {
+		t.Fatalf("calibrate exit %d: %s", code, stderr.String())
+	}
+	out := stdout.String()
+	skipIfProbeSkipped(t, out)
+
+	bmax, eff, from := readCalibrated(t, path)
+	if bmax != 4 || eff != 5.64 {
+		t.Errorf("b_max %d, basis %.2f after an implausible reading; want the stored 4 and 5.64", bmax, eff)
+	}
+	if !strings.Contains(from, "b_max 4 kept from the calibration of 2026-11-01T19:34:07Z") {
+		t.Errorf("provenance does not record the kept value: %s", from)
+	}
+	for _, want := range []string{"measuring once more", "kept from 2026-11-01T19:34:07Z", "41% below the 5.64", "--accept-lower"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("output does not say %q:\n%s", want, out)
+		}
+	}
+
+	// Clause 4: the person who knows the machine is slower now can say so, and it is lowered.
+	stdout.Reset()
+	if code := runCalibrate([]string{"--accept-lower"}, &stdout, &stderr); code != 0 {
+		t.Fatalf("calibrate --accept-lower exit %d: %s", code, stderr.String())
+	}
+	skipIfProbeSkipped(t, stdout.String())
+	if bmax, eff, _ := readCalibrated(t, path); bmax != 2 || eff != 3.31 {
+		t.Errorf("--accept-lower wrote b_max %d, basis %.2f; want 2 and 3.31", bmax, eff)
+	}
+}
+
+// TestAnUpgradedConfigIsCheckedAgainstItsProvenance: a config written before
+// probe_effective_cores existed carries its reading only in the note. The first calibrate after
+// an upgrade is the one install runs unattended, so that one must already be bounded — and a
+// trusted reading then records the key.
+func TestAnUpgradedConfigIsCheckedAgainstItsProvenance(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv(transport.StateDirEnv, dir)
+	path := filepath.Join(dir, config.File)
+	note := fmt.Sprintf("governor calibrate 2026-11-01T19:34:07Z; %d cores (4 performance, 4 efficiency); "+
+		"probe measured 5.64 effective cores of 8 (second-highest of 5 usable of 5 reps)", runtime.NumCPU())
+	writeConfig(t, path, map[string]any{
+		"schema": config.Schema, "b_max": 4, "run_queue_max": 4.72,
+		"calibrated_at": "2026-11-01T19:34:07Z", "calibrated_from": note,
+	})
+
+	stageProbe(t, 3.40, 3.31, 3.25, 3.20, 3.10)
+	var stdout, stderr bytes.Buffer
+	if code := runCalibrate(nil, &stdout, &stderr); code != 0 {
+		t.Fatalf("calibrate exit %d: %s", code, stderr.String())
+	}
+	skipIfProbeSkipped(t, stdout.String())
+	if bmax, _, _ := readCalibrated(t, path); bmax != 4 {
+		t.Fatalf("b_max %d: an upgraded config's first calibrate was not bounded by its note", bmax)
+	}
+
+	stageProbe(t, 5.80, 5.62, 5.58, 5.50, 5.41)
+	if code := runCalibrate(nil, &stdout, &stderr); code != 0 {
+		t.Fatalf("calibrate exit %d: %s", code, stderr.String())
+	}
+	if bmax, eff, _ := readCalibrated(t, path); bmax != 4 || eff != 5.62 {
+		t.Errorf("after a trusted reading: b_max %d, basis %.2f; want 4 and the new 5.62", bmax, eff)
+	}
+}
+
+// TestAnotherMachinesHistoryIsNoBasis: a note from a host with a different core count — a
+// config synced or copied across — is not this machine's history. Its far lower reading is
+// expected there, and must not need --accept-lower to be believed.
+func TestAnotherMachinesHistoryIsNoBasis(t *testing.T) {
+	c := config.Config{
+		CalibratedFrom:      fmt.Sprintf("governor calibrate x; %d cores (no split); probe measured 9.00 effective cores", runtime.NumCPU()+4),
+		ProbeEffectiveCores: 9,
+	}
+	if b := probeBasis(c); b.EffectiveCores != 0 {
+		t.Errorf("basis %.2f from a %d-core machine's note on a %d-core host", b.EffectiveCores, runtime.NumCPU()+4, runtime.NumCPU())
 	}
 }

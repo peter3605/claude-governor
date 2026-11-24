@@ -61,6 +61,7 @@ const (
 	keyCalibratedAt   = "calibrated_at"
 	keyCalibratedFrom = "calibrated_from"
 	keyWaitMaxMS      = "wait_max_ms"
+	keyProbeEffective = "probe_effective_cores"
 )
 
 // document is the typed view of the known keys. Every field is a pointer so that "absent"
@@ -75,6 +76,7 @@ type document struct {
 	CalibratedAt   *string  `json:"calibrated_at"`
 	CalibratedFrom *string  `json:"calibrated_from"`
 	WaitMaxMS      *int     `json:"wait_max_ms"`
+	ProbeEffective *float64 `json:"probe_effective_cores"`
 }
 
 func (s *FileStore) targetSchema() int {
@@ -173,6 +175,9 @@ func (s *FileStore) Load(ctx context.Context) (Config, error) {
 	if typed.WaitMaxMS != nil {
 		c.WaitMaxMS = *typed.WaitMaxMS
 	}
+	if typed.ProbeEffective != nil {
+		c.ProbeEffectiveCores = *typed.ProbeEffective
+	}
 	c.Unknown = s.unknown(doc)
 	return c, nil
 }
@@ -235,7 +240,7 @@ func (s *FileStore) unknown(doc map[string]json.RawMessage) map[string]any {
 	for k := range doc {
 		switch k {
 		case keySchema, keyEndpoint, keySetpoint, keyBMax, keyWaitMaxMS,
-			keyRunQueueMax, keyCalibratedAt, keyCalibratedFrom:
+			keyRunQueueMax, keyCalibratedAt, keyCalibratedFrom, keyProbeEffective:
 			continue
 		}
 		names = append(names, k)
@@ -279,6 +284,11 @@ func (s *FileStore) Save(ctx context.Context, c Config) error {
 		keyCalibratedAt:   c.CalibratedAt,
 		keyCalibratedFrom: c.CalibratedFrom,
 		keyWaitMaxMS:      c.WaitMaxMS,
+	}
+	if c.ProbeEffectiveCores > 0 {
+		// Written only once a probe has been trusted, so a config that never had one round-
+		// trips byte-identical rather than growing a key that says nothing.
+		doc[keyProbeEffective] = c.ProbeEffectiveCores
 	}
 	for k, v := range c.Unknown {
 		if _, clash := doc[k]; clash {

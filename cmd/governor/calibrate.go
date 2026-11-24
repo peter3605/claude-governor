@@ -5,6 +5,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"runtime"
 	"time"
 
 	"github.com/peter3605/claude-governor/internal/calibrate"
@@ -47,6 +48,8 @@ func calibrateCommand(args []string, stdout, stderr io.Writer, checkDaemon bool)
 	fs.SetOutput(stderr)
 	dryRun := fs.Bool("dry-run", false, "measure and print, but write nothing")
 	noProbe := fs.Bool("no-probe", false, "skip the load probe; b_max keeps its stored value")
+	acceptLower := fs.Bool("accept-lower", false,
+		"accept a probe reading far below this host's last one: for a machine that really is slower now")
 	quiet := fs.Bool("quiet", false, "print only what changed")
 	if err := fs.Parse(args); err != nil {
 		return 2
@@ -74,7 +77,8 @@ func calibrateCommand(args []string, stdout, stderr io.Writer, checkDaemon bool)
 		return 1
 	}
 
-	opts := calibrate.Options{NoProbe: *noProbe}
+	opts := calibrate.Options{NoProbe: *noProbe, Basis: probeBasis(before), Repetition: stagedRepetition}
+	opts.Basis.Waived = *acceptLower
 	if !*quiet {
 		opts.Announce = func(s string) { fmt.Fprintf(stdout, "%s\n", s) }
 	}
@@ -90,6 +94,13 @@ func calibrateCommand(args []string, stdout, stderr io.Writer, checkDaemon bool)
 	if !*quiet {
 		fmt.Fprint(stdout, calibrate.Report(m, o, prev))
 	}
+	if m.Probe.BelowBasis {
+		// Printed even with --quiet: it is the one way a machine that really has become
+		// slower gets a lower ceiling, and an install may scroll the report past.
+		fmt.Fprintf(stdout, "\nb_max was not lowered on one reading. If this machine really is slower now "+
+			"(different hardware, a degraded battery, a thermal fault), accept the lower figure with:\n  %s\n",
+			governorCommand("calibrate --accept-lower"))
+	}
 
 	if *dryRun {
 		fmt.Fprintf(stdout, "\nnothing written (--dry-run). Would write %s\n", path)
@@ -104,6 +115,11 @@ func calibrateCommand(args []string, stdout, stderr io.Writer, checkDaemon bool)
 	after.BMax = o.BMax
 	after.CalibratedAt = m.At.UTC().Format(time.RFC3339)
 	after.CalibratedFrom = calibrate.Provenance(m, o)
+	if m.Probe.OK {
+		// The basis the next calibration is checked against. Only a trusted reading replaces
+		// it; a kept b_max keeps the reading it was derived from.
+		after.ProbeEffectiveCores = m.Probe.EffectiveCores
+	}
 
 	if err := store.Save(ctx, after); err != nil {
 		fmt.Fprintf(stderr, "governor calibrate: %v\n", err)
@@ -162,6 +178,31 @@ func noteDaemonDrift(stdout io.Writer) {
 // runs this binary rather than whatever bare `governor` resolves to (GOV-43/GOV-45/GOV-46).
 func calibrateFix() string {
 	return governorCommand("install")
+}
+
+// stagedRepetition replaces the probe's measurement in a test. Nil, the real probe, outside one.
+var stagedRepetition func(ctx context.Context, workers int, d time.Duration) (eff, drift float64, ok bool)
+
+// probeBasis is what this host measured before, for the probe's answer to be checked against
+// (GOV-B59).
+//
+// The recorded key first, then the provenance note of a config written before the key existed
+// — which is every config on the first calibrate after an upgrade, and that is the run install
+// makes unattended. A note from a machine with a different core count is not this host's
+// history and yields no basis: a different machine is the one case where a far lower reading
+// is expected, and it should not need --accept-lower to be believed.
+func probeBasis(c config.Config) calibrate.Basis {
+	if cores, ok := coresInProvenance(c.CalibratedFrom); ok && cores != runtime.NumCPU() {
+		return calibrate.Basis{}
+	}
+	eff := c.ProbeEffectiveCores
+	if eff <= 0 {
+		eff, _ = calibrate.EffectiveCoresInProvenance(c.CalibratedFrom)
+	}
+	if eff <= 0 {
+		return calibrate.Basis{}
+	}
+	return calibrate.Basis{EffectiveCores: eff, At: c.CalibratedAt}
 }
 
 // keptNote is the --quiet line's admission that a number was carried forward, not measured.
