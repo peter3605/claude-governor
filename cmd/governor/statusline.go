@@ -212,11 +212,21 @@ func runStatusline(_ []string, stdout, stderr io.Writer) int {
 // that never answers — and both of those are behind us by the time the line is printed.
 //
 // rate_limits.json is written here too, and for every reason above (GOV-B57).
+//
+// THE PROCESS IS STILL KILLABLE HERE, and GOV-33 assumed it was not. Claude Code sends SIGTERM to
+// a status line still running when the next refresh starts (GOV-B58, hook-surface.md §14.4), so
+// the writes run under statuslineWriting: a signal waits for a write in flight before the process
+// exits. The stale-temp sweep after them covers the SIGKILL that cannot be waited for.
 func statuslineCommand(stdin io.Reader, stdout, stderr io.Writer, dialer transport.Dialer, budget time.Duration, width int) int {
 	line, pending, rates := statusline(stdin, stderr, dialer, budget, width)
 	fmt.Fprintln(stdout, line)
+	statuslineWriting.Lock()
+	defer statuslineWriting.Unlock()
 	if pending != nil {
 		writeCache(stderr, *pending)
+		if path, ok := statuslineCachePath(); ok {
+			sweepStaleStatuslineTemps(filepath.Dir(path), time.Now())
+		}
 	}
 	if rates != nil {
 		writeRateLimits(stderr, *rates, time.Now())
@@ -837,6 +847,7 @@ func writeCache(diag io.Writer, c cachedStatus) {
 		return
 	}
 	defer os.Remove(tmp.Name())
+	stallStatuslineWriteForTest()
 	if _, err := tmp.Write(raw); err != nil {
 		tmp.Close()
 		fmt.Fprintf(diag, "governor statusline: write cache: %v\n", err)

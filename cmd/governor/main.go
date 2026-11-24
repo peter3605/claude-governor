@@ -70,6 +70,11 @@ var commands = []command{
 }
 
 func main() {
+	// Here and not in runStatusline, which tests call in-process: a test binary must never
+	// have its signals redirected (GOV-B58, statusline_signals.go).
+	if len(os.Args) > 1 && os.Args[1] == "statusline" {
+		guardStatuslineSignals()
+	}
 	os.Exit(run(os.Args[1:], os.Stdout, os.Stderr))
 }
 
