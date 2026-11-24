@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -451,8 +452,9 @@ func TestAnImplausibleReadingLeavesTheStoredCeiling(t *testing.T) {
 		t.Fatalf("calibrate --accept-lower exit %d: %s", code, stderr.String())
 	}
 	skipIfProbeSkipped(t, stdout.String())
-	if bmax, eff, _ := readCalibrated(t, path); bmax != 2 || eff != 3.31 {
-		t.Errorf("--accept-lower wrote b_max %d, basis %.2f; want 2 and 3.31", bmax, eff)
+	want := budget.MaxSlots(math.Min(3.31, float64(runtime.NumCPU())))
+	if bmax, eff, _ := readCalibrated(t, path); bmax != want || eff != 3.31 {
+		t.Errorf("--accept-lower wrote b_max %d, basis %.2f; want %d and 3.31", bmax, eff, want)
 	}
 }
 
@@ -485,8 +487,10 @@ func TestAnUpgradedConfigIsCheckedAgainstItsProvenance(t *testing.T) {
 	if code := runCalibrate(nil, &stdout, &stderr); code != 0 {
 		t.Fatalf("calibrate exit %d: %s", code, stderr.String())
 	}
-	if bmax, eff, _ := readCalibrated(t, path); bmax != 4 || eff != 5.62 {
-		t.Errorf("after a trusted reading: b_max %d, basis %.2f; want 4 and the new 5.62", bmax, eff)
+	// b_max is whatever 5.62 derives to on this runner's cores; the claim here is that the
+	// trusted reading was used and became the basis, not what it derives to.
+	if bmax, eff, from := readCalibrated(t, path); eff != 5.62 || bmax == 0 || strings.Contains(from, "kept") {
+		t.Errorf("after a trusted reading: b_max %d, basis %.2f, provenance %q; want it used and 5.62 recorded", bmax, eff, from)
 	}
 }
 
