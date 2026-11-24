@@ -49,6 +49,49 @@ config schema 1      the "schema" key in ~/.claude/governor/config.json
 Releases are fixed by a new patch version and never by moving a tag. [0.1.1](#011---2026-10-29)
 is the first example.
 
+## [0.1.9] - 2026-11-24
+
+Protocol and config schema are unchanged (`protocol 1`, `config schema 1`), and no hook is
+added or removed. Upgrading takes the usual step only: rerun the install one-liner, or
+`brew upgrade governor` followed by `$(brew --prefix)/opt/governor/bin/governor install`.
+Open Claude Code sessions do not need restarting.
+
+### Added
+
+- **The status line exports your account's usage windows.** Claude Code gives the status
+  line your 5-hour and weekly usage, and gives no hook any of it. The governor now writes those
+  figures to `~/.claude/governor/rate_limits.json` after printing the line, so another plugin
+  can read them; it does not show them in its own line. A window your plan does not report is
+  left out, never written as 0. An unchanged file is rewritten at most every 30 seconds, and
+  uninstall removes it. ([#117](https://github.com/peter3605/claude-governor/pull/117))
+- **Memory pressure now cuts the budget.** When the machine starts swapping in hard, the
+  budget is halved and held until swap-in has stayed low for 30 seconds. `governor status`,
+  `governor doctor` and a refused build all name `memory` as the cause. On macOS the swap-in
+  rate was never actually read before; it now comes from a sysctl that needs no privileges.
+  Ordinary use with Docker Desktop running did not trip it in a 35-minute measurement.
+  ([#114](https://github.com/peter3605/claude-governor/pull/114))
+
+### Fixed
+
+- **Long-running subagents keep their slot.** An agent lease expired after 30 minutes even
+  while the subagent was still working, so the budget undercounted what was running. It is
+  now renewed at the 30-minute mark when the subagent's transcript shows it is still active,
+  and expires as before when there is no such evidence.
+  ([#112](https://github.com/peter3605/claude-governor/pull/112))
+- **Subagents spawned in auto permission mode are no longer left unleased.** In auto mode
+  Claude Code starts a message's subagents only once the whole message has been written, which
+  could be more than the 30 seconds a spawn's lease is held for. A subagent that starts late
+  now picks its lease back up. ([#115](https://github.com/peter3605/claude-governor/pull/115))
+- **A background subagent woken by its own background task is leased again.** It used to run
+  ungoverned after its first idle stop, and the builds it had left running were released early.
+  Both are fixed, and a subagent resumed with `SendMessage` is now matched to the right lease.
+  ([#116](https://github.com/peter3605/claude-governor/pull/116))
+- **`governor doctor` no longer calls a session "ungoverned" just because it loaded an older
+  set of the governor's hooks.** Such a session is governed. Doctor now warns instead of
+  failing, names the hooks it lacks, and says a restart picks them up. A session that started
+  before any hook was installed is still reported as ungoverned.
+  ([#113](https://github.com/peter3605/claude-governor/pull/113))
+
 ## [0.1.8] - 2026-11-23
 
 Protocol and config schema are unchanged (`protocol 1`, `config schema 1`), and no hook is
