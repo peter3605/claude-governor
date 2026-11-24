@@ -329,6 +329,7 @@ There are two, because the two gated tools give the governor completely differen
 ```
 PreToolUse    → acquire TENTATIVE lease   ttl 30s, keyed by session_id
 SubagentStart → CONFIRM lease             bind agent_id + owning pid
+                (none pending: reinstate a tentative lease lapsed < 10 min ago,   GOV-B55, §5.6f)
 SubagentStop  → release
 SessionEnd    → release all for session
 reaper (2s)   → drop leases past ttl, whose SESSION is gone, or whose owning pid is gone
@@ -1723,7 +1724,7 @@ running across it. There were 25 releases: 2, 1, 1, 7, 12 and 2 on 11-15, 11-16,
 | **still running at the TTL, released too early** | **22** | lived 30.1 to 78.2 min awake (19), or 164 to 257 wall-clock min across a sleep (3). In **22 of 22** its `SubagentStop` fired later and the governor answered `ok=false reason="no_lease"` |
 | ended without a `SubagentStop`: **sleep** | 1 | 11-19, `1becacfd`: "Fix round 1 for T-038" started 01:38:50 and ended 04:22 with "API Error: Your computer went to sleep mid-response". No `SubagentStop` in its transcript. Reaped at 10:15:54 after 30 awake minutes |
 | ended without a `SubagentStop`: killed session, hook not firing | 0 | — |
-| *tentative* TTL (30 s), not this question | 2 | 11-16: `PreToolUse` granted, then the auto-mode classifier errored and the Agent call never ran. Correct. 11-23: an `isolation: worktree` agent's `SubagentStart` came 35 s after its `PreToolUse`, so it confirmed nothing and ran unleased (GOV-B55) |
+| *tentative* TTL (30 s), not this question | 2 | 11-16: `PreToolUse` granted, then the auto-mode classifier errored and the Agent call never ran. Correct. 11-23: an `isolation: worktree` agent's `SubagentStart` came 35 s after its `PreToolUse`, so it confirmed nothing and ran unleased (GOV-B55). The cause was auto mode, not the worktree (§5.6f) |
 
 So the hooks were not the problem. `SubagentStop` fired for every subagent that ended normally,
 and the one lost was a subagent killed by sleep. The problem was the TTL. Across all 360
@@ -1764,6 +1765,60 @@ tick would only shorten the 11-19 kind of leak, at the cost of a glob per agent 
 
 `TestAStillWorkingSubagentKeepsItsLeasePastTheTTL` replays `1becacfd`'s 78 min "Fix round 2
 for T-047". With the renewal disabled, it fails at 30m0s with `Why: expired`.
+
+### 5.6f A spawn that starts after its tentative lease lapsed (GOV-B55, decided 2026-11-23)
+
+**The question.** GOV-B50 found an `isolation: worktree` subagent whose `SubagentStart` came
+34.9 s after its `PreToolUse`. The 30 s tentative TTL had already reaped the lease, FIFO bound
+the burst's other two confirms, and one subagent ran with no lease.
+
+**Measured (`hook-surface.md` §28): it is the permission mode, not the worktree.** In `auto`
+mode `PreToolUse` fires as each Agent block finishes streaming, and the tool itself (worktree,
+`SubagentStart`, result) waits until the whole message has finished. A batch of three spawns
+with ~3.4k-character prompts delayed the first by 18.4 to 20.0 s on Sonnet, with or without
+`isolation` (runs G, G2, H, H2). With 4 to 6k on Opus it was 35 s. In the default and
+`acceptEdits` modes every spawn of the same batch started within 0.35 s. A worktree on its own
+costs 0.25 s with 1 tracked file and 2.4 to 3.5 s with 20,000. The delay is the time to write
+the rest of the message, so **no fixed TTL bounds it**. It has happened twice on this machine,
+in two of the three multi-Agent messages it has ever seen (the 18:13 and 20:15 bursts of
+`b961a293`).
+
+**The options, and what each costs:**
+
+| | Late spawn left unleased | A refused or abandoned spawn's leak (11-16: classifier refused the Agent call after its gate granted) |
+|---|---|---|
+| **raise `DefaultTentativeTTL`** | any delay past the new TTL. Five Opus spawns would pass a minute | every refused spawn holds its 0.08 slot for the whole new TTL, in every mode |
+| **longer TTL from `tool_input.isolation`** | **all of them.** H and H2 had no isolation and were delayed as much as G | as above, for worktree spawns only. Keyed on the wrong field |
+| **longer TTL when `permission_mode == "auto"`** | any delay past the new TTL. Still a guess at a bound that does not exist | every refused auto-mode spawn holds its slot for the longer TTL. 11-16 was auto mode |
+| **confirm late: a confirm that finds nothing pending reinstates a lapsed lease** | none inside the window (10 min, thirty times the worst measured) | unchanged: the lease is still reaped at 30 s. What waits is a record with **no weight**, swept at 10 min |
+
+**Decided: confirm late.** When the reaper expires a *tentative Agent* lease in a session that
+is not dead, it keeps a lapse: the lease's request and when it lapsed, holding no budget. A
+confirm that finds no pending lease takes the session's oldest lapse younger than
+`lateConfirmWindow` (10 min), mints a lease from it, and confirms that. Admission is not asked
+again: the gate admitted this spawn, the spawn has started, and `SubagentStart` cannot refuse
+it. The reply says `ok=true reason="late"`, which lands in the subagent's transcript, and
+`daemon.log` gets `budget confirm-late session=... lease=... agent=... lapsed=... ago`.
+
+What it keeps:
+
+- **The 30 s tentative TTL still does its job (GOV-09).** A spawn that never happened returns
+  its slot at 30 s as before. Only the zero-weight record waits.
+- **A resumed subagent is still ungoverned (§4.3).** A confirm with nothing pending and nothing
+  lapsed answers `no_pending_lease` exactly as before.
+- **Lapses are per session.** One session's confirm never claims another's.
+- **A lapse goes when its session goes**: SessionEnd, or the reaper finding the session dead.
+
+What it risks, accepted: within a session, a confirm that should have found nothing — a
+subagent woken by its own background task (`hook-surface.md` §28.4 consequence 6), or a spawn
+the classifier refused after its gate granted — can claim a lapse left by another spawn. That
+governs a subagent that is running and would otherwise run free. Its `SubagentStop`, or the
+confirmed TTL, releases it. The budget can be exceeded by a reinstated lease, by at most one
+lease per spawn the gate already admitted, which is what an on-time confirm would have held.
+
+`TestAConfirmLaterThanTheTentativeTTLStillLeasesEverySpawn` replays the 18:13 burst against
+the real 30 s TTL with the reaper ticking every 2 s. Before this change, 2 of its 3 subagents
+end up leased. `TestALateConfirmReinstatesTheLapsedLease` checks the same over the wire.
 
 ## 6. Allocation
 
@@ -2764,8 +2819,11 @@ never echoed back by `SubagentStart`.
 Named so they are not mistaken for settled:
 
 - The default hook timeout's true ceiling (only that it exceeds 150 s).
-- Whether the observed `PreToolUse`/`SubagentStart` interleaving holds under machine load
-  heavy enough to slow the harness itself. Phase 0's traces are the place to watch for it.
+- Whether interactive `default` mode, `plan` or `dontAsk` hold a message's tools until it
+  ends, as `auto` does (`hook-surface.md` §28.6). Confirm-late covers it either way.
+- A subagent woken by its own background task fires `SubagentStart` again and is answered
+  `no_pending_lease` (`hook-surface.md` §28.4 consequence 6). How often, and whether it should
+  be governed, is not yet measured.
 - Whether `SubagentStart` fires for a subagent restored by session resume.
 - Whether a user **declining the permission prompt interactively** behaves like the refusal
   §25 measured headlessly: there, a `Bash` call refused permission raised `PreToolUse` and
@@ -2786,6 +2844,12 @@ Named so they are not mistaken for settled:
   resumed with `SendMessage` (hook-surface.md §27.4). All 370 on this machine are depth 1.
   `Working` reads "not found" as "not working", so the cost of being wrong is today's TTL.
 - Linux: every measurement above is macOS. Re-run the probe on Linux before trusting §10 there.
+
+**No longer on this list, measured 2026-11-23 on 2.1.331 for GOV-B55** (`hook-surface.md`
+§28): the `PreToolUse`/`SubagentStart` interleaving does not hold in `auto` permission mode.
+Every `PreToolUse` of a multi-Agent message comes first, as its blocks stream, and every
+`SubagentStart` comes after the message ends. In the default and `acceptEdits` modes they
+interleave as GOV-01 measured.
 
 **No longer on this list, measured 2026-11-23 on 2.1.310 to 2.1.330 for GOV-B50**
 (`hook-surface.md` §27): `SubagentStop` fires for a subagent that ends normally however long

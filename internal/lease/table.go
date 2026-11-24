@@ -53,6 +53,30 @@ const (
 	DefaultConfirmedTTL = 30 * time.Minute
 )
 
+// lateConfirmWindow is how long a lapsed tentative Agent lease can still be claimed by a late
+// SubagentStart (GOV-B55, design.md section 5.6f).
+//
+// IN AUTO PERMISSION MODE A SPAWN STARTS WHEN ITS MESSAGE HAS FINISHED STREAMING, NOT WHEN
+// ITS PreToolUse RAN (hook-surface.md section 28). The gap is the time to write the rest of
+// the message: 18-20 s for three 3.4k-character prompts on Sonnet, 35 s for 4-6k on Opus, and
+// nothing bounds it. So the tentative TTL keeps its job, reclaiming a spawn that never
+// happened within 30 s, and a spawn that did happen late reinstates its lease here instead.
+//
+// A lapse holds no budget while it waits, so the window costs nothing in slots. What it
+// risks is misattribution: a confirm that should have found nothing — a subagent woken
+// again, a spawn the classifier refused after its gate granted — may claim a lapse left by a
+// different spawn in the same session. That governs a running subagent which would
+// otherwise run free, and its SubagentStop or the TTL releases it. Ten minutes is thirty
+// times the delay measured, which is far longer than any message takes to write.
+const lateConfirmWindow = 10 * time.Minute
+
+// lapse is a tentative Agent lease the reaper collected at its TTL, kept so that a late
+// SubagentStart can reinstate it (lateConfirmWindow).
+type lapse struct {
+	req Request
+	at  time.Time
+}
+
 // demandWindow is how long a refusal keeps a session counted as contending for fair share
 // (design.md section 6.1), once it is no longer the one asking.
 //
@@ -152,11 +176,14 @@ type Options struct {
 // than a shortcut (section 12.2): a restart loses every lease and the reaper cleans up in
 // seconds, where durable lease state would buy consistency the failure mode does not need.
 type Table struct {
-	mu       sync.Mutex
-	byID     map[string]*Lease
-	byAgent  map[string]string   // agent_id -> lease ID, confirmed leases only
-	byTool   map[string]string   // tool_use_id -> lease ID, Build leases only
-	pending  map[string][]string // session -> FIFO of tentative lease IDs
+	mu      sync.Mutex
+	byID    map[string]*Lease
+	byAgent map[string]string   // agent_id -> lease ID, confirmed leases only
+	byTool  map[string]string   // tool_use_id -> lease ID, Build leases only
+	pending map[string][]string // session -> FIFO of tentative lease IDs
+	// lapsed is, per session, the FIFO of tentative Agent leases reaped at their TTL whose
+	// SubagentStart may yet arrive (GOV-B55). It holds no weight. Swept by Reap.
+	lapsed   map[string][]lapse
 	sessions map[string]Session
 	// demanding remembers when a session was last refused, which is how a session that is
 	// not the current caller still counts as contending for fair share. Swept by Reap.
@@ -188,6 +215,7 @@ func NewTable(opt Options) *Table {
 		byAgent:   map[string]string{},
 		byTool:    map[string]string{},
 		pending:   map[string][]string{},
+		lapsed:    map[string][]lapse{},
 		sessions:  map[string]Session{},
 		demanding: map[string]time.Time{},
 		opt:       opt,
@@ -739,6 +767,10 @@ func (t *Table) BackgroundTasks(session string) []string {
 //   - A resumed subagent reaches the CPU with no PreToolUse at all, so a confirm with an
 //     empty pending queue is dropped quietly. It is not an error and must not be logged as
 //     one; v1 simply does not govern that spawn.
+//   - Unless the session has a lapse (GOV-B55, design.md section 5.6f). In auto permission
+//     mode a spawn starts only when its message has finished streaming, which can be after
+//     the tentative TTL reaped its lease. Then the oldest lapse inside lateConfirmWindow is
+//     reinstated and confirmed, and the lease says when it lapsed (Lease.LapsedAt).
 //
 // leaseID is honoured when it names a tentative lease of this session, and ignored
 // otherwise. It costs nothing to prefer an exact answer when the wire happens to carry one,
@@ -762,11 +794,22 @@ func (t *Table) Confirm(session, leaseID, agentID string, pid int, pidStarted ti
 	}
 
 	id := t.takePendingLocked(session, leaseID)
+	var lapsedAt time.Time
 	if id == "" {
-		return Lease{}, false
+		// Nothing pending, so either this spawn's tentative lease was reaped before its
+		// SubagentStart arrived (auto mode, GOV-B55) or there never was one (a resumed
+		// subagent). A lapse in this session says it was the first: reinstate it, unadmitted,
+		// because the gate already admitted this spawn and SubagentStart cannot refuse it.
+		lp, ok := t.takeLapseLocked(session)
+		if !ok {
+			return Lease{}, false
+		}
+		id, lapsedAt = t.grantLocked(lp.req, normalWeight(lp.req.Weight)).ID, lp.at
+		t.takePendingLocked(session, id)
 	}
 	now := t.opt.Now()
 	l := t.byID[id]
+	l.LapsedAt = lapsedAt
 	l.State = Confirmed
 	l.AgentID = agentID
 	l.OwnerPID = pid
@@ -808,6 +851,27 @@ func (t *Table) takePendingLocked(session, want string) string {
 		t.pending[session] = append([]string(nil), keep...)
 	}
 	return found
+}
+
+// takeLapseLocked removes and returns the session's oldest lapse still inside
+// lateConfirmWindow, discarding older ones as it passes them.
+func (t *Table) takeLapseLocked(session string) (lapse, bool) {
+	q := t.lapsed[session]
+	now := t.opt.Now()
+	for len(q) > 0 && now.Sub(q[0].at) > lateConfirmWindow {
+		q = q[1:]
+	}
+	if len(q) == 0 {
+		delete(t.lapsed, session)
+		return lapse{}, false
+	}
+	lp := q[0]
+	if len(q) == 1 {
+		delete(t.lapsed, session)
+	} else {
+		t.lapsed[session] = append([]lapse(nil), q[1:]...)
+	}
+	return lp, true
 }
 
 // Release returns a confirmed lease to the pool at SubagentStop.
@@ -869,6 +933,7 @@ func (t *Table) ReleaseSession(session string) []Released {
 	}
 	delete(t.sessions, session)
 	delete(t.pending, session)
+	delete(t.lapsed, session)
 	return out
 }
 
@@ -946,6 +1011,15 @@ func (t *Table) Reap() []Released {
 				continue
 			}
 			why = "expired"
+			if l.Kind == Agent && l.State == Tentative && !dead[l.Session] {
+				// Its spawn may only be late, not abandoned (GOV-B55): keep enough to
+				// reinstate it, at no weight, for a SubagentStart still to come.
+				t.lapsed[l.Session] = append(t.lapsed[l.Session], lapse{
+					req: Request{Session: l.Session, Depth: l.Depth, Kind: l.Kind,
+						Weight: l.Weight, ToolUseID: l.ToolUseID, Class: l.Class},
+					at: now,
+				})
+			}
 		case dead[l.Session]:
 			why = "session-dead"
 		case l.State == Confirmed && t.opt.Liveness != nil && !t.opt.Liveness.Alive(*l):
@@ -966,7 +1040,20 @@ func (t *Table) Reap() []Released {
 	for id := range dead {
 		delete(t.sessions, id)
 		delete(t.pending, id)
+		delete(t.lapsed, id)
 		delete(t.demanding, id)
+	}
+	// Lapses nobody claimed in time: a spawn that really was abandoned. Swept here so the
+	// map does not grow with every refused Agent call this daemon ever saw.
+	for id, q := range t.lapsed {
+		for len(q) > 0 && now.Sub(q[0].at) > lateConfirmWindow {
+			q = q[1:]
+		}
+		if len(q) == 0 {
+			delete(t.lapsed, id)
+		} else {
+			t.lapsed[id] = q
+		}
 	}
 	// Expired demand marks, for the same reason denyLog is swept from the reaper: otherwise
 	// this map grows with every session that was ever refused and never shrinks.

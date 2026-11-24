@@ -2648,9 +2648,10 @@ Consequences:
 3. **The confirmed TTL's bound was wrong by two orders of magnitude.** Over the 360 governed
    subagents (those whose `SubagentStop` ran `governor release`), life is p50 6.4 min, p90
    30.2 min, p99 223.0 min, max 731.6 min. 10.3% outlive 30 min, 1.9% outlive 2 h.
-4. **The tentative TTL is shorter than a worktree's setup.** 35 s from `PreToolUse` to
+4. **The tentative TTL is shorter than the gap to a late `SubagentStart`.** 35 s from `PreToolUse` to
    `SubagentStart` for an `isolation: worktree` agent, against a 30 s tentative TTL. This is
-   not this story's question; it is GOV-B55.
+   not this story's question; it is GOV-B55. **Corrected by §28:** the gap is auto mode holding
+   every tool until its message has finished streaming, not the worktree.
 
 ### 27.4 Folded into design.md
 
@@ -2667,4 +2668,122 @@ grant or last renewal. §5.6's opening states it. §10.3 gains the unmeasured ca
   again. If it does not, a resumed agent past its TTL is reaped as today.
 - **A session started with a `CLAUDE_CONFIG_DIR` other than the daemon's.** Not found, so the
   TTL applies, as above.
+- Linux.
+
+---
+
+## 28. When a spawn starts: auto mode holds every tool until its message ends (GOV-B55)
+
+### 28.0 Provenance
+
+| | |
+|---|---|
+| Claude Code | 2.1.331 for the probes; 2.1.310 to 2.1.330 in the transcripts |
+| Measured | 2026-11-23 |
+| Story | GOV-B55 |
+
+§27.3 consequence 4 recorded an `isolation: worktree` agent whose `SubagentStart` came 34.9 s
+after its `PreToolUse`, past the 30 s tentative TTL, so it ran with no lease. That section
+supposed the gap was worktree creation. **It was not.** The gap is the permission mode.
+
+### 28.1 Method
+
+**Transcripts.** Every `projects/<slug>/<session>/subagents/agent-<id>.meta.json` on the
+machine names its spawn's `toolUseId`. `t0` is the parent transcript's `PreToolUse:Agent` hook
+attachment for that id; `t1` is the first `SubagentStart` hook attachment in the subagent's own
+`.jsonl`. 369 of 370 subagents had both (one lacked the `PreToolUse` attachment). Spawns were
+then grouped by the parent's assistant `message.id`, to find several Agent calls in one message.
+
+**Probes.** §12's harness: the `cat > file` hook on `PreToolUse`/`PostToolUse` (matcher
+`Agent`), `SubagentStart` and `SubagentStop`, in a scratch git repo, with
+`--settings <probe>/settings.json --setting-sources ""`, `--model sonnet`, and every subagent
+told to reply "done" and use no tools. Two repos: *small* (1 tracked file) and *large* (20,000
+tracked files in 200 directories). A batch is three Agent calls the transcript shows in one
+assistant message, each with a freshly written ~3,400-character prompt, `run_in_background`
+as stated. `--permission-mode bypassPermissions` was refused by the session's own auto-mode
+classifier, so the default mode stands in for it.
+
+### 28.2 Transcripts
+
+| | n | p50 | p90 | max | > 30 s |
+|---|---|---|---|---|---|
+| no isolation | 360 | 0.12 s | 0.32 s | 3.31 s | 0 |
+| `isolation: worktree` | 8 | 15.16 s | 32.57 s | 35.05 s | 2 |
+
+Taken alone this table blames the worktree, and §27.3 did. But **only three messages on the
+whole machine carried more than one Agent call**, all three in edgefinder session `b961a293`,
+all `isolation: worktree`, all background, all in `permissionMode: auto`. Every one of the 360
+others was a single Agent call. In each of the three bursts the `PreToolUse` hooks ran ~16 s
+apart, about 50 ms after each tool_use block was written while the message streamed. Then every
+`SubagentStart` and every tool result came together, 0.6 to 0.75 s after the **last**
+`PreToolUse`:
+
+| Burst (UTC) | `PreToolUse` | `SubagentStart` | Delay | Confirm |
+|---|---|---|---|---|
+| 17:43 | 17:43:17.5, 17:43:32.6 | 17:43:33.3 | 15.8, 0.7 s | ok, ok |
+| 18:13 | 18:13:31.1, 18:13:47.9, 18:14:05.0 | 18:14:05.8 to 06.1 | 35.0, 18.1, 0.8 s | `no_pending_lease`, ok, ok |
+| 20:15 | 20:15:35.1, 20:15:53.2, 20:16:07.1 | 20:16:07.7 | 32.6, 14.5, 0.6 s | ok, ok, `no_pending_lease` |
+
+The 20:15 burst lost a lease too, which §27.3 missed: `daemon.log` has L-0055 released at
+20:16:05 UTC, `held=30.182s by=reaper:expired`, two seconds before its burst started. Which
+subagent ran unleased is FIFO's choice, not the lapsed lease's: in both bursts the refused
+confirm was not the spawn whose lease lapsed.
+
+### 28.3 Probes
+
+Delay from each spawn's `PreToolUse` to its `SubagentStart`, in spawn order:
+
+| Run | Mode | Repo | Shape | Delays |
+|---|---|---|---|---|
+| A, A2, A3 | default | small | 1 × worktree | 0.261, 0.254, 0.279 s |
+| B, B2, B3 | default | large | 1 × worktree | 3.538, 2.527, 2.398 s |
+| C | default | large | 1 × no isolation | 0.155 s |
+| D | default | small | batch, no isolation, background | 0.180, 0.232, 0.062 s |
+| E | default | small | batch, no isolation, foreground | 0.080, 0.071, 0.081 s |
+| F | default | small | batch, worktree, background | 0.314, 0.227, 0.344 s |
+| I | acceptEdits | small | batch, no isolation, background | 0.104, 0.055, 0.052 s |
+| **G** | **auto** | small | batch, **worktree**, background | **19.13, 9.37, 0.41 s** |
+| **G2** | **auto** | small | batch, **worktree**, background | **20.03, 10.27, 0.56 s** |
+| **H** | **auto** | small | batch, **no isolation**, background | **18.43, 8.86, 0.13 s** |
+| **H2** | **auto** | small | batch, **no isolation**, background | **19.04, 9.12, 0.16 s** |
+
+### 28.4 Consequences
+
+1. **In `auto` permission mode a tool runs when its message has finished streaming, not when
+   its `PreToolUse` ran.** `PreToolUse` fires as each tool_use block is complete. The tool, its
+   worktree, its `SubagentStart` and its result all wait for the end of the message. In the
+   default and `acceptEdits` modes each Agent call starts as soon as its block is complete,
+   batch or not. `permission_mode` is on the `PreToolUse` payload.
+2. **So the delay is the time to write the rest of the message, and nothing bounds it.** About
+   9.5 s per ~3.4k-character prompt on Sonnet, about 16 s per 4 to 6k on Opus. The first of
+   three spawns waited 18 to 20 s and 35 s respectively. A fourth or fifth spawn, or prose after
+   the calls, adds more.
+3. **Isolation is not the cause.** G and H differ only in `isolation`, and their delays match
+   to within a second. The control the GOV-B55 traps asked for, a non-worktree spawn in the same
+   repo, starts in 0.155 s (C).
+4. **A worktree costs its checkout, which grows with the repo.** 0.25 to 0.28 s with 1 tracked
+   file, 2.4 to 3.5 s with 20,000. edgefinder tracks 231, so its worktrees were well under a
+   second of its 35.
+5. **The `PreToolUse`/`SubagentStart` interleaving §10.3 listed as unmeasured does not hold in
+   auto mode.** Every `PreToolUse` of the batch comes first, then every `SubagentStart`. FIFO
+   correlation still binds one lease per subagent, and in one session they are interchangeable.
+6. **Found in passing, not this story:** a subagent can record several `SubagentStart`s, up to
+   six in `b961a293`. One subagent's second start came just after its "waiting on its own
+   background work" notification, with no `SendMessage` from the parent, and its confirm
+   answered `no_pending_lease`. A subagent woken by its own background task therefore runs
+   with no lease.
+
+### 28.5 Folded into design.md
+
+§5.6f records the decision: a confirm that finds no pending lease reinstates the session's
+oldest tentative Agent lease that the reaper lapsed within the last 10 min. §10.3 loses the
+interleaving question.
+
+### 28.6 Still unmeasured
+
+- Interactive `default` mode (only `-p` default was probed). The edgefinder session was
+  interactive and auto; whether interactive default defers tools has not been seen.
+- `plan` and `dontAsk` modes.
+- Whether a message that ends in prose after its Agent calls delays them further. It would,
+  if consequence 1 is the whole mechanism.
 - Linux.

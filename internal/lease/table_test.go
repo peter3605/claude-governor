@@ -253,16 +253,25 @@ func TestReaperCollectsExpiredTentativeLeases(t *testing.T) {
 		t.Fatalf("reaped %d leases inside the TTL, want 0", n)
 	}
 	c.advance(2 * time.Second)
-	if n := len(tbl.Reap()); n != 1 {
+	reaped := tbl.Reap()
+	if n := len(reaped); n != 1 {
 		t.Fatalf("reaped %d leases past the TTL, want 1", n)
 	}
 	if tbl.InUse() != 0 {
 		t.Fatalf("in use %d after reaping, want 0 — an abandoned spawn must not hold a slot forever", tbl.InUse())
 	}
 	// The reaped lease must leave the pending queue with it, or the next confirm binds a
-	// lease that is no longer in the table.
-	if _, ok := tbl.Confirm("s1", "", "ag_1", 1, time.Time{}); ok {
-		t.Fatal("confirm bound a reaped lease")
+	// lease that is no longer in the table. A late confirm now reinstates the spawn (GOV-B55),
+	// so what is checked is that it gets a NEW lease the table holds, not the reaped one.
+	l, ok := tbl.Confirm("s1", "", "ag_1", 1, time.Time{})
+	if !ok {
+		t.Fatal("a confirm inside the late-confirm window was not reinstated")
+	}
+	if l.ID == reaped[0].ID {
+		t.Fatalf("confirm bound the reaped lease %s", l.ID)
+	}
+	if got := tbl.Leases(); len(got) != 1 || got[0].ID != l.ID || got[0].State != Confirmed {
+		t.Fatalf("table holds %+v, want only the reinstated confirmed lease %s", got, l.ID)
 	}
 }
 
