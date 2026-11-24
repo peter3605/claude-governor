@@ -517,8 +517,10 @@ func TestStatuslineRendersWithoutTouchingTheDisk(t *testing.T) {
 	endpoint, _, _ := statusDaemon(t, statusReply{V: protocolVersion, Budget: 4, InUse: 1, Slots: 1, Thermal: "nominal"})
 	t.Setenv(transport.EndpointEnv, endpoint)
 
+	// The payload carries rate_limits (GOV-B57), so the export is in play too: it must come
+	// out of the renderer as a value, exactly as the cache entry does, and not as a file.
 	var stderr bytes.Buffer
-	line, pending := statusline(strings.NewReader(sampleStatusLinePayload), &stderr, transport.Dial{}, statuslineBudget, 0)
+	line, pending, rates := statusline(strings.NewReader(sampleRateLimitsPayload), &stderr, transport.Dial{}, statuslineBudget, 0)
 
 	if line == "" {
 		t.Fatal("rendered nothing; the case is only meaningful if the render succeeded")
@@ -527,6 +529,9 @@ func TestStatuslineRendersWithoutTouchingTheDisk(t *testing.T) {
 	// also pass for a statusline that had simply stopped working.
 	if pending == nil {
 		t.Fatal("statusline returned nothing to cache after a live daemon answered it")
+	}
+	if rates == nil {
+		t.Fatal("statusline returned no usage windows for a payload that carried rate_limits")
 	}
 
 	entries, err := os.ReadDir(dir)
@@ -620,23 +625,27 @@ func ageCache(t *testing.T, dir string, d time.Duration) {
 // a machine where the governor is not installed should not acquire governor state because
 // somebody wired the statusline up by hand.
 func TestStatuslineNeverCreatesTheStateDirectory(t *testing.T) {
-	absent := filepath.Join(t.TempDir(), "never-created")
-	t.Setenv(transport.StateDirEnv, absent)
-	t.Setenv(transport.EndpointEnv, "unix://"+filepath.Join(sockDir(t), "absent"))
+	// The second payload carries rate_limits, so writeRateLimits (GOV-B57) is in play as
+	// well as writeCache, and it is held to the same rule.
+	for _, payload := range []string{sampleStatusLinePayload, sampleRateLimitsPayload} {
+		absent := filepath.Join(t.TempDir(), "never-created")
+		t.Setenv(transport.StateDirEnv, absent)
+		t.Setenv(transport.EndpointEnv, "unix://"+filepath.Join(sockDir(t), "absent"))
 
-	// Through the command, not the renderer: writeCache is the only thing here that could
-	// create the directory, and since GOV-33 it runs in the command. Calling statusline
-	// alone would assert that a function which no longer touches the disk does not touch
-	// the disk.
-	var stdout, stderr bytes.Buffer
-	statuslineCommand(strings.NewReader(sampleStatusLinePayload), &stdout, &stderr, transport.Dial{}, statuslineBudget, 0)
-	line := strings.TrimSuffix(stdout.String(), "\n")
+		// Through the command, not the renderer: the writers are the only things here that
+		// could create the directory, and since GOV-33 they run in the command. Calling
+		// statusline alone would assert that a function which no longer touches the disk
+		// does not touch the disk.
+		var stdout, stderr bytes.Buffer
+		statuslineCommand(strings.NewReader(payload), &stdout, &stderr, transport.Dial{}, statuslineBudget, 0)
+		line := strings.TrimSuffix(stdout.String(), "\n")
 
-	if !strings.Contains(line, "daemon not running") {
-		t.Errorf("line = %q, want it to report the daemon is down", line)
-	}
-	if _, err := os.Stat(absent); !os.IsNotExist(err) {
-		t.Errorf("state directory %s exists after a statusline run; err = %v", absent, err)
+		if !strings.Contains(line, "daemon not running") {
+			t.Errorf("line = %q, want it to report the daemon is down", line)
+		}
+		if _, err := os.Stat(absent); !os.IsNotExist(err) {
+			t.Errorf("state directory %s exists after a statusline run; err = %v", absent, err)
+		}
 	}
 }
 

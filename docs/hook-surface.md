@@ -675,7 +675,8 @@ against a real capture if any of it ever appears to be wrong.
 ### 14.1 The payload
 
 Every field below is present in the object the harness builds for the statusline. The ones
-GOV-10 relies on are `session_id` and nothing else.
+GOV-10 relies on are `session_id` and nothing else. GOV-B57 also reads `rate_limits` and
+`version`, to export them (§14.3); nothing renders them.
 
 ```jsonc
 {
@@ -702,7 +703,7 @@ GOV-10 relies on are `session_id` and nothing else.
   "fast_mode": false,
   "effort": {"level": "…"},      // optional
   "thinking": {"enabled": true},
-  "rate_limits": {…},            // optional
+  "rate_limits": {…},            // optional; captured in §14.3
   "vim": {"mode": "…"},          // optional
   "agent": {"name": "…"},        // optional
   "remote": {"session_id": "…"}, // optional
@@ -767,6 +768,50 @@ and an unaccepted workspace trust prompt.
 **`COLUMNS` was not observed to be set** for the child process. A statusline that treated an
 absent `COLUMNS` as a width of zero would render as the empty string on every such machine,
 so it is read as "unknown, do not truncate" rather than as a width.
+
+### 14.3 `rate_limits`, captured (GOV-B57)
+
+**This one is an observation, not a reading of the binary.** Captured from Claude Code
+`2.1.331` (`claude --version`), 2026-11-24, on this machine's account. Method:
+the interactive CLI driven under `expect` in a pseudo-terminal, in an empty scratch git repo,
+with `--settings` naming a status line that saved its stdin to a file
+(`{"statusLine":{"type":"command","command":"<dump.sh>","refreshInterval":1}}`) and the
+workspace trust prompt accepted. Two traps for whoever repeats it: the probe must be run with
+the parent session's `CLAUDECODE` / `CLAUDE_CODE_*` variables unset, and the expect script must
+keep reading the pty (an `expect` with a timeout, not `sleep`), or the child blocks writing to
+a full pty and renders nothing. 36 payloads in about 35 s, one message sent.
+
+`rate_limits` as received (verbatim):
+
+```json
+"rate_limits": {
+  "five_hour": {"used_percentage": 27, "resets_at": 1795507200},
+  "seven_day": {"used_percentage": 70, "resets_at": 1795564800}
+}
+```
+
+The last payload of the run, with `transcript_path`, `cwd`, `scratchpad_dir` and `workspace`
+removed:
+
+```json
+{"session_id":"3dd6b0b9-0503-483a-b0c9-3a97a3efa13f","prompt_id":"a60dac96-cf4d-4fea-8a11-d7962bec6cfd","effort":{"level":"medium"},"session_name":"Ok","model":{"id":"claude-haiku-5-5","display_name":"Haiku 5.5"},"version":"2.1.331","output_style":{"name":"default"},"cost":{"total_cost_usd":0.0041946,"total_duration_ms":47513,"total_api_duration_ms":2135,"total_lines_added":0,"total_lines_removed":0},"context_window":{"total_input_tokens":48489,"total_output_tokens":4,"context_window_size":1000000,"current_usage":{"input_tokens":2,"output_tokens":4,"cache_creation_input_tokens":18867,"cache_read_input_tokens":29620},"used_percentage":5,"remaining_percentage":95},"exceeds_200k_tokens":false,"prompt_cache":{"warm":true,"caching_observed":true,"ttl":"1h","expires_at":1795500503,"requests":1,"misses":0,"expected_rebuilds":0,"hit_ratio":0.6108601950957949,"cache_write_tokens":18867,"miss_recache_tokens":0,"last_miss_at":null,"last_miss_cause":null,"miss_causes":{},"recache_tokens_if_cold":48489},"fast_mode":false,"thinking":{"enabled":true},"rate_limits":{"five_hour":{"used_percentage":27,"resets_at":1795507200},"seven_day":{"used_percentage":70,"resets_at":1795564800}}}
+```
+
+What it settles:
+
+1. **The shape matches the Claude Code statusline docs**: `five_hour` and `seven_day`, each
+   `used_percentage` and `resets_at`. `used_percentage` was an integer both times; `resets_at` is
+   Unix seconds (both values fall on the hour, UTC). No `spend_limit` key was sent on this
+   account. The decoder still takes a float, a null window and a window it does not know.
+2. **The key is absent, not null, when there is nothing.** The very first payload (0.5 s after
+   start) had no `rate_limits` key; every later one had it, **before any message was sent**
+   (`total_api_duration_ms` 0). So the figures are fetched at startup, not read off the first
+   response, and an idle session that has sent nothing still exports them.
+3. **`version` is a string** (`"2.1.331"`), carried into the export as `cc_version`.
+
+Not measured here: a Team/Enterprise account (documented to send no `rate_limits`), an Ultra
+account (documented to send `seven_day` only), and the moment a window is dropped after its
+`resets_at` passes.
 
 ---
 

@@ -2518,7 +2518,8 @@ claude-governor/                  the repo
 └── bin/governor                  the binary those hooks run
 
 state  → ~/.claude/governor/      sock, daemon.pid, daemon.log, daemon.log.1, daemon.start, statusline.json,
-                                  statusline.json.*, onboarded, surface.json, surface.json.tmp,
+                                  statusline.json.*, rate_limits.json, rate_limits.json.*,
+                                  onboarded, surface.json, surface.json.tmp,
                                   hooks-history.json, hooks-history.json.tmp,
                                   config.json, samples.jsonl, samples.jsonl.1,
                                   samples.pre-bound-<ts>.jsonl, sampler.lock, sampler.log
@@ -2957,6 +2958,10 @@ Named so they are not mistaken for settled:
 - Several `<task-notification>`s in one prompt. Every one observed arrived alone; `settle`
   reads every `<tool-use-id>` regardless.
 - A background task's output-file layout anywhere but `/tmp/claude-<uid>`, and on Linux at all.
+- The status line's `rate_limits` on a Team/Enterprise account (documented to send none) or an
+  Ultra account (documented to send `seven_day` only), and the moment a window is dropped after
+  its `resets_at`. Only this machine's account was captured (`hook-surface.md` §14.3, GOV-B57);
+  the export treats every window as optional either way.
   The task-file check reads "not found" as "alive", so the cost of being wrong is the TTL.
 - A subagent's `meta.json` for a **nested** subagent (`spawnDepth` 2 or more), and for one
   resumed with `SendMessage` (hook-surface.md §27.4). All 370 on this machine are depth 1.
@@ -3495,6 +3500,8 @@ Uninstall is only verifiable if this list is exhaustive, so it is normative.
 | `~/.claude/governor/daemon.log.1` | daemon, rotating the file above at 4 MiB (GOV-B29) | uninstall |
 | `~/.claude/governor/statusline.json` | `statusline`, when the directory already exists | uninstall |
 | `~/.claude/governor/statusline.json.*` | `statusline`, staging the file above before the rename | uninstall, **by pattern** — see below |
+| `~/.claude/governor/rate_limits.json` | `statusline`, after the line is printed, when the payload carried `rate_limits` and the directory already exists (GOV-B57) | uninstall |
+| `~/.claude/governor/rate_limits.json.*` | `statusline`, staging the file above before the rename | uninstall, **by pattern** |
 | `~/.claude/governor/daemon.start` | the gate, when it lazily starts a daemon and the directory already exists | uninstall |
 | `~/.claude/governor/onboarded` | `session start`, only in the fallback below, and only when the directory already exists | uninstall |
 | `~/.claude/governor/surface.json` | daemon, when it first sees a spawn tool name it has not recorded for that Claude Code version (GOV-30) | uninstall |
@@ -3645,6 +3652,17 @@ inside it is for a person reading the directory, not for the code. Both files ar
 relative to the socket the gate actually failed to reach rather than to the default state
 directory, so a second governor on `GOVERNOR_ENDPOINT` rate-limits beside its own socket
 instead of over the first one's.
+
+`rate_limits.json` is the account's usage windows, exported (GOV-B57). Claude Code gives the
+status line `rate_limits` (the 5-hour and weekly usage percentages) and gives no hook any of it,
+so on a machine where the governor owns the `statusLine` slot it is the only process that sees
+them. It writes them down for another plugin to read; the format is fixed by headroom's
+`docs/design.md` §5.1, which is the source of truth, and the governor neither renders the figures
+nor reads the file back. It follows `statusline.json`'s rules exactly: written only after the line
+is printed, never on the abandonable path, never creating the directory. A window the payload did
+not send is absent from the file, never 0. An unchanged export under 30 s old is left alone, so
+twenty sessions on a 2 s refresh do not rewrite it ten times a second. Its staging name is random,
+because every session writes it, and so it is swept by pattern.
 
 `statusline.json` is a one-second cache of the last status reply (GOV-10). The statusline is
 run on every assistant message in every session, and since GOV-B07 on a two-second timer as

@@ -234,11 +234,29 @@ func TestUninstallLeavesTheMachineByteIdentical(t *testing.T) {
 				t.Fatal("install changed nothing; this test would pass vacuously")
 			}
 
+			// The usage export and a stray from its staging (GOV-B57), planted rather than
+			// provoked: the status line writes the first on every refresh, and the second is
+			// the residue a writer cut off between CreateTemp and Rename would leave. Both are
+			// in the state directory, which is staged outside HOME, so the snapshot cannot see
+			// them and the directory's absence is asserted below instead.
+			mkdirAll(t, p.state)
+			writeFileT(t, filepath.Join(p.state, rateLimitsFile),
+				`{"v":1,"writer":"governor","captured_at":1795496930.024,"cc_version":"2.1.331","windows":{}}`+"\n")
+			writeFileT(t, filepath.Join(p.state, rateLimitsFile+".2849103377"), `{"v":1,"wri`)
+
 			uninstallOK(t)
 
 			if diff := diffSnapshots(before, snapshot(t, p.home)); len(diff) > 0 {
 				t.Errorf("uninstall did not leave %s byte-identical:\n  %s",
 					p.home, strings.Join(diff, "\n  "))
+			}
+			if _, err := os.Lstat(p.state); !os.IsNotExist(err) {
+				left, _ := os.ReadDir(p.state)
+				names := []string{}
+				for _, e := range left {
+					names = append(names, e.Name())
+				}
+				t.Errorf("state directory %s survived uninstall holding %v; err = %v", p.state, names, err)
 			}
 		})
 	}
@@ -270,10 +288,12 @@ func TestUninstallRemovesResidueWhoseNameIsNotFixed(t *testing.T) {
 		filepath.Join(p.state, "statusline.json.1041508460"),
 		filepath.Join(p.state, "statusline.json.109149393"),
 		filepath.Join(p.state, "statusline.json.1982782874"),
+		filepath.Join(p.state, rateLimitsFile+".381774102"),
 	}
 	writeFileT(t, planted[0], "")
 	writeFileT(t, planted[1], `{"at":"2026-09-17T05:25:38`)
 	writeFileT(t, planted[2], `{"at":"2026-09-17T05:25:38.081038-04:00","down":false}`)
+	writeFileT(t, planted[3], `{"v":1,"writer":"governor","captured_at":17`)
 
 	uninstallOK(t)
 
