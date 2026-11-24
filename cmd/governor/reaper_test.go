@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 	"time"
 
@@ -287,6 +288,63 @@ func TestUnconfirmedTentativeLeaseIsReclaimedAtItsTTL(t *testing.T) {
 	if !found {
 		t.Errorf("the session was dropped along with its lease, but its process is still "+
 			"running; status reports %+v", st.Sessions)
+	}
+}
+
+// GOV-B55, over the wire. In auto permission mode a spawn starts only when its message has
+// finished streaming, so its SubagentStart can come after the tentative TTL has reaped the
+// lease its PreToolUse took (hook-surface.md section 28). The confirm must still leave the
+// subagent leased, say "late", and log it — and a session with nothing lapsed must still get
+// no_pending_lease, which is how a resumed subagent has always been answered.
+func TestALateConfirmReinstatesTheLapsedLease(t *testing.T) {
+	pid, startedAt, _ := killableSession(t)
+
+	const ttl = 300 * time.Millisecond
+	log := &lockedBuffer{}
+	endpoint, d := startTestDaemonConfigured(t, 4, lease.Options{TentativeTTL: ttl},
+		func(d *daemon) { d.diag = log })
+
+	const session = "S-auto-mode"
+	if r := call(t, endpoint, sessionStartReq(session, pid, startedAt)); r.OK == nil || !*r.OK {
+		t.Fatalf("session start: %+v", r)
+	}
+	// The first spawn's PreToolUse, then the rest of the message takes longer than the TTL.
+	if r := call(t, endpoint, acquireReq(session)); r.OK == nil || !*r.OK {
+		t.Fatalf("acquire 1 refused: %+v", r)
+	}
+	waitForInUse(t, endpoint, 0, ttl+reapInterval+2*time.Second)
+	for i := 2; i <= 3; i++ {
+		if r := call(t, endpoint, acquireReq(session)); r.OK == nil || !*r.OK {
+			t.Fatalf("acquire %d refused: %+v", i, r)
+		}
+	}
+
+	// The message ends and all three SubagentStarts arrive together.
+	late := 0
+	for i := 1; i <= 3; i++ {
+		r := call(t, endpoint, confirmReq(session, "", fmt.Sprintf("agent-%d", i), pid, startedAt))
+		if r.OK == nil || !*r.OK {
+			t.Fatalf("confirm %d answered %+v: a spawn the gate admitted runs with no lease", i, r)
+		}
+		if r.Reason == "late" {
+			late++
+		}
+	}
+	if late != 1 {
+		t.Errorf("%d confirms said late, want exactly the one whose lease had lapsed", late)
+	}
+	if n := d.table.InUse(); n != 3 {
+		t.Errorf("in use %d after three confirms, want 3", n)
+	}
+	// Written after the reply, so it is polled for.
+	waitFor(t, 2*time.Second, func() bool {
+		return strings.Contains(log.String(), "budget confirm-late session="+session)
+	})
+
+	// Nothing lapsed in this session: a resumed subagent's confirm is answered as before.
+	r := call(t, endpoint, confirmReq("S-other", "", "agent-resumed", pid, startedAt))
+	if r.OK == nil || *r.OK || r.Reason != "no_pending_lease" {
+		t.Errorf("a confirm with nothing pending or lapsed answered %+v, want no_pending_lease", r)
 	}
 }
 

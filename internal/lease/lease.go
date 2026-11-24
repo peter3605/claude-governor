@@ -82,7 +82,11 @@ type Lease struct {
 	// subagent was still working (GOV-B50), or zero if it never has been. Liveness.Working
 	// asks for transcript activity since this, or since GrantedAt before the first renewal,
 	// so a subagent that has stopped writing stops being renewed.
-	RenewedAt    time.Time
+	RenewedAt time.Time
+	// LapsedAt is set on an Agent lease that Confirm reinstated after its tentative lease had
+	// already been reaped (GOV-B55, design.md section 5.6f): it is when that tentative lease
+	// lapsed. Zero on every lease confirmed on time. Carried so the daemon can say so.
+	LapsedAt     time.Time
 	ExpiresAt    time.Time
 	AgentID      string
 	OwnerPID     int

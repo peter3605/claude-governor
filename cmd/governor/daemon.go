@@ -1868,6 +1868,17 @@ func (d *daemon) confirm(req request) any {
 		// (design.md section 4.3), so there is nothing to bind and v1 does not govern it.
 		return ackReply{V: d.speaks, Reason: "no_pending_lease", InUse: d.table.InUse()}
 	}
+	if !l.LapsedAt.IsZero() {
+		// Its tentative lease was reaped before this SubagentStart arrived, and Confirm
+		// reinstated it (GOV-B55, design.md section 5.6f). Said on the wire, where the
+		// confirm hook's stderr lands in the subagent's transcript, and in daemon.log, so
+		// the next late spawn is a measurement rather than an inference.
+		reply := ackReply{V: d.speaks, OK: true, Reason: "late", Lease: l.ID, InUse: d.table.InUse()}
+		late := l.GrantedAt.Sub(l.LapsedAt).Round(time.Millisecond) // granted = reinstated
+		return loggedReply{reply: reply, after: func() {
+			d.event("confirm-late session=%s lease=%s agent=%s lapsed=%s ago", l.Session, l.ID, l.AgentID, late)
+		}}
+	}
 	return ackReply{V: d.speaks, OK: true, Lease: l.ID, InUse: d.table.InUse()}
 }
 
