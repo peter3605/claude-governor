@@ -157,7 +157,7 @@ func resolvePaths() (paths, error) {
 // It is diagnostics, not measurement: unlike samples.jsonl it is removed by a plain
 // uninstall, as daemon.log always has been.
 var stateFiles = []string{"sock", "statusline.json", daemonPIDFile, daemonLogFile, daemonLogFile + daemonLogRotatedSuffix,
-	daemonStartFile, onboardMarker, surfaceFile, surfaceTempFile, config.File, hookHistoryFile, hookHistoryTempFile}
+	daemonStartFile, onboardMarker, surfaceFile, surfaceTempFile, config.File, hookHistoryFile, hookHistoryTempFile, rateLimitsFile}
 
 // stateGlobs are patterns rather than names, for the residue whose name is not known in
 // advance. They are matched inside the state directory only, and never recursively.
@@ -175,7 +175,12 @@ var stateFiles = []string{"sock", "statusline.json", daemonPIDFile, daemonLogFil
 // should not rest on every writer on the machine having been perfect for the life of the
 // install. A machine that already accumulated residue under the old code still has to come
 // clean under the new.
-var stateGlobs = []string{"statusline.json.*"}
+//
+// rate_limits.json.* (GOV-B57) is the usage export's staging name. Its writer follows GOV-33's
+// rule and cannot be abandoned mid-write, so nothing should ever match it; it is listed for
+// the reason above, and because every session writes that file, a fixed staging name was not
+// an option.
+var stateGlobs = []string{"statusline.json.*", rateLimitsFile + ".*"}
 
 // ---------------------------------------------------------------------------
 // the plugin's files

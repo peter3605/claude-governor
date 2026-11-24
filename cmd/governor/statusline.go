@@ -58,17 +58,25 @@ const statuslineCacheTTL = time.Second
 const statuslineCacheFile = "statusline.json"
 
 // statusLinePayload is the JSON Claude Code writes to this command's stdin, decoded for the
-// two fields this command has any business with.
+// few fields this command has any business with.
 //
-// Measured against 2.1.265 in docs/hook-surface.md section 14. Decoded loosely, like the
-// hook payloads: a harness upgrade that renames a field must degrade to a thinner line,
-// never to a failed render. Everything else in that payload — the transcript path, the cost
-// totals, the context window, the model — is deliberately not read. This process reports on
-// the fleet budget and has no business with the contents of anyone's session.
+// Measured against 2.1.265 in docs/hook-surface.md section 14, and rate_limits against
+// 2.1.331 in section 14.3. Decoded loosely, like the hook payloads: a harness upgrade that
+// renames a field must degrade to a thinner line, never to a failed render. Everything else
+// in that payload — the transcript path, the cost totals, the context window, the model — is
+// deliberately not read. This process reports on the fleet budget and has no business with
+// the contents of anyone's session. Account-wide usage figures are not the contents of
+// anyone's session, so reading rate_limits to pass them on (GOV-B57) leaves that true.
 type statusLinePayload struct {
 	// SessionID is what separates "the machine is holding 3 slots" from "you are holding
 	// 2 of them", which is the number a person in this session actually wants.
 	SessionID string `json:"session_id"`
+	// Version and RateLimits are carried, not rendered: they are exported to
+	// rate_limits.json after the line is printed (GOV-B57, see writeRateLimits). Both are raw
+	// so that a shape this binary does not expect costs the export and nothing else — a typed
+	// field that failed to decode would fail the whole payload, session id included.
+	Version    json.RawMessage `json:"version"`
+	RateLimits json.RawMessage `json:"rate_limits"`
 }
 
 // statusRequest is the status message of design.md section 7.
@@ -202,11 +210,16 @@ func runStatusline(_ []string, stdout, stderr io.Writer) int {
 // and why the budget not covering it is acceptable rather than merely tolerable. The budget
 // exists for the failures a socket deadline cannot see — a stdin that never closes, a daemon
 // that never answers — and both of those are behind us by the time the line is printed.
+//
+// rate_limits.json is written here too, and for every reason above (GOV-B57).
 func statuslineCommand(stdin io.Reader, stdout, stderr io.Writer, dialer transport.Dialer, budget time.Duration, width int) int {
-	line, pending := statusline(stdin, stderr, dialer, budget, width)
+	line, pending, rates := statusline(stdin, stderr, dialer, budget, width)
 	fmt.Fprintln(stdout, line)
 	if pending != nil {
 		writeCache(stderr, *pending)
+	}
+	if rates != nil {
+		writeRateLimits(stderr, *rates, time.Now())
 	}
 	return 0
 }
@@ -218,7 +231,12 @@ func statuslineCommand(stdin io.Reader, stdout, stderr io.Writer, dialer transpo
 // the function whose work can be abandoned mid-flight, so it is the function that must not
 // be holding a temp file when that happens — see statuslineCommand. A nil second return is
 // "nothing to cache": the cache was fresh, or the budget expired before an answer arrived.
-func statusline(stdin io.Reader, stderr io.Writer, dialer transport.Dialer, budget time.Duration, width int) (string, *cachedStatus) {
+//
+// The third return is the payload's usage windows, to be exported by the caller, or nil when
+// the payload carried none or could not be read in time. It is handed out on its own channel
+// as soon as stdin is decoded, so a slow or absent daemon does not cost the export: the
+// figures come from Claude Code, not from the daemon, and headroom wants them either way.
+func statusline(stdin io.Reader, stderr io.Writer, dialer transport.Dialer, budget time.Duration, width int) (string, *cachedStatus, *rateLimits) {
 	deadline := time.Now().Add(budget)
 
 	// Diagnostics go to stderr, which Claude Code captures into its debug log and never
@@ -235,6 +253,16 @@ func statusline(stdin io.Reader, stderr io.Writer, dialer transport.Dialer, budg
 		pending *cachedStatus
 	}
 	done := make(chan result, 1)
+	// Buffered, and sent to at most once, so the worker never blocks on it.
+	decoded := make(chan *rateLimits, 1)
+	rates := func() *rateLimits {
+		select {
+		case r := <-decoded:
+			return r
+		default:
+			return nil
+		}
+	}
 	go func() {
 		defer func() {
 			if r := recover(); r != nil {
@@ -248,6 +276,7 @@ func statusline(stdin io.Reader, stderr io.Writer, dialer transport.Dialer, budg
 		if !decodePayload(stdin, diag, &p) {
 			fmt.Fprintf(diag, "governor statusline: continuing without a session id\n")
 		}
+		decoded <- parseRateLimits(p)
 		v, pending := fetch(diag, dialer, deadline, p.SessionID)
 		done <- result{line: render(v, width), pending: pending}
 	}()
@@ -256,7 +285,7 @@ func statusline(stdin io.Reader, stderr io.Writer, dialer transport.Dialer, budg
 	defer timer.Stop()
 	select {
 	case r := <-done:
-		return r.line, r.pending
+		return r.line, r.pending, rates()
 	case <-timer.C:
 		// The backstop, for the failures no socket deadline can see — chiefly a stdin that
 		// is never closed, which happens before there is a socket to put a deadline on.
@@ -265,7 +294,7 @@ func statusline(stdin io.Reader, stderr io.Writer, dialer transport.Dialer, budg
 		// late to be worth a second of every session's status line, and the goroutine that
 		// might still be carrying one is about to be abandoned.
 		fmt.Fprintf(diag, "governor statusline: budget of %v expired\n", budget)
-		return render(statusView{}, width), nil
+		return render(statusView{}, width), nil, rates()
 	}
 }
 
