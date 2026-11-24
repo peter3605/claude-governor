@@ -813,6 +813,51 @@ Not measured here: a Team/Enterprise account (documented to send no `rate_limits
 account (documented to send `seven_day` only), and the moment a window is dropped after its
 `resets_at` passes.
 
+### 14.4 A status line still running at the next refresh is killed (GOV-B58)
+
+**Read out of the binary, then observed.** Claude Code `2.1.331` (`claude --version`),
+macOS/arm64, 2026-11-24.
+
+**What the binary says.** The status line controller starts every refresh by aborting the run
+still in flight (`this.#i?.abort()` on a fresh `AbortController`), whether the refresh came
+from an event or from `refreshInterval`, after the same 300 ms debounce §14.2 fact 5
+describes. The command runs through the hooks' executor, `detached` (its own process group).
+An abort sends **`SIGTERM` to the process group**, then **`SIGKILL` to the group 1500 ms
+later** if it is still alive. An aborted run's output is discarded (`if (Y.aborted) return`).
+The harness waits for the process to **exit** before reading stdout. A status line is not
+killed for having printed. It is killed for still being alive when the next refresh begins. On
+exit, Claude Code's exit sweep also kills any status line still running.
+
+**What was observed.** Two probe status lines, each run by the interactive CLI under `expect`
+(the §14.3 method: own `--settings` with `refreshInterval: 1`, `--setting-sources ""`, the
+parent's `CLAUDE*` variables unset, workspace trust accepted, one message sent about 20 s in).
+Each probe logged its start, the moment it printed, and every signal. It then stayed alive for
+3 s after printing, so the next refresh always found it running.
+
+| probe | runs | got `SIGTERM` | finished | notes |
+|---|---|---|---|---|
+| A: traps TERM/PIPE/HUP/INT, logs, carries on | 37 | 37 | 0 | gone 1.13-1.63 s after the TERM: the 1.5 s `SIGKILL` |
+| B: no handlers (Go's default) | 30 | (died) | 0 | 29 printed; not one reached its post-print `finished` line |
+
+- `SIGTERM` came 0.136 to 1.225 s after the run's own start (p50 1.022 s, n=37). It arrived
+  as the next run started, so with `refreshInterval: 1` it came about a second in. The 0.136 s
+  case is a message event superseding a timer refresh, so the interval is not a floor.
+- No `SIGPIPE`, `SIGHUP` or `SIGINT` arrived. stdout stays open until the process exits.
+- No probe's line ever reached the screen (`probeA` is absent from the terminal capture).
+  Every run was aborted, so every output was discarded.
+
+**What it means for `governor statusline`.** The post-print writes (GOV-33's fix) run inside a
+process Claude Code may `SIGTERM` at any moment after the next refresh begins. Go exits on
+`SIGTERM` without running deferred functions, so a TERM between `os.CreateTemp` and
+`os.Rename` strands `statusline.json.<random>` or `rate_limits.json.<random>`. That is the
+0-byte stray of 2026-11-22 21:50:17, in the hour the status line was missing its 50 ms
+deadline under load (GOV-B49). A normal run takes milliseconds and finishes long before the
+next refresh, which is why it is rare. design.md §13.3 (under `statusline.json`) records the guard.
+
+Not measured: Linux (the same code path, `process.kill(-pgid)`, so expected identical), and
+whether a `refreshInterval` above the run's duration ever produces a TERM without an
+intervening event.
+
 ---
 
 ## 15. Where a plugin has to live for its hooks to fire

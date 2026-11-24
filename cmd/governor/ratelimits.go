@@ -134,8 +134,10 @@ func rateLimitsPath() (string, bool) {
 //
 // The staging name is random, unlike surface.json.tmp, because every session on the machine
 // writes this file and a fixed staging name would let two of them write into one temp file.
-// The random name is covered by stateGlobs, and nothing here can be abandoned between create
-// and rename.
+// The random name is covered by stateGlobs. Nothing here is on the abandonable goroutine, and
+// the process is guarded against Claude Code's SIGTERM while this runs (GOV-B58,
+// statusline_signals.go). A SIGKILL can still strand the staging file; the next cache write
+// sweeps it once it is a minute old.
 func writeRateLimits(diag io.Writer, r rateLimits, now time.Time) {
 	path, ok := rateLimitsPath()
 	if !ok {
@@ -167,6 +169,7 @@ func writeRateLimits(diag io.Writer, r rateLimits, now time.Time) {
 		return
 	}
 	defer os.Remove(tmp.Name())
+	stallStatuslineWriteForTest()
 	if _, err := tmp.Write(raw); err != nil {
 		tmp.Close()
 		fmt.Fprintf(diag, "governor statusline: write rate limits: %v\n", err)

@@ -2930,6 +2930,13 @@ read from `agent_id` and that the harness enforces nothing. §7 gains no new fie
 `tool_use_id` in `acquire` is still what the daemon keys a tentative lease on; it is simply
 never echoed back by `SubagentStart`.
 
+The status line is not a hook, but it runs through the same executor and its kill behaviour is
+measured in [hook-surface.md](hook-surface.md) §14.4 (GOV-B58, `2.1.331`). A run still alive
+when the next refresh starts gets `SIGTERM` to its process group, then `SIGKILL` 1.5 s later,
+and its output is discarded. §13.3 (under `statusline.json`) records what `governor statusline` does about it. The hooks
+share that executor, but whether a hook is ever aborted the same way mid-run was not
+measured.
+
 ### 10.3 Still unmeasured
 
 Named so they are not mistaken for settled:
@@ -3578,7 +3585,10 @@ it added" and "removes things it did not":
   and it must not rest on every writer having been correct for the life of the install — a
   machine that accrued residue under the old binary still has to come clean under the new one.
   A new random-suffixed path therefore goes in `stateGlobs` and in this table, not in
-  `stateFiles`.
+  `stateFiles`. **It happened once more after GOV-33**: one 0-byte stray on 2026-11-22. That
+  time the cause was Claude Code `SIGTERM`ing the status line process mid-write, not an
+  abandoned goroutine. GOV-B58 guards the write against the signal, and a later run sweeps
+  anything older than a minute (below, under `statusline.json`).
 - **The trace log survives a plain uninstall, and uninstall says so by name and size.** GOV-B26
   re-decided this once Phase 0 closed (2026-09-12) and kept it. The old reason was that the
   file was the Phase 0 measurement. The reason now is that it is the user's only record of
@@ -3684,6 +3694,28 @@ also puts the disk after the reader, the same ordering `trace.Append` takes on t
 path and for the same reason: a wedged disk must not delay the thing the user is waiting for.
 The cost is that the cache write is outside the budget, which is acceptable precisely because
 the render is already finished when it starts.
+
+**The process is abandonable too, not just the goroutine (GOV-B58).** GOV-33 assumed a process
+that had printed would live until its writes finished. It does not have to. Claude Code
+`SIGTERM`s the process group of a status line still running when the next refresh starts, and
+`SIGKILL`s it 1.5 s later ([hook-surface.md](hook-surface.md) §14.4). A TERM between
+`CreateTemp` and `Rename` stranded a 0-byte `statusline.json.<random>` on 2026-11-22, on a
+binary with GOV-33's fix. Two layers, because one signal can be caught and the other cannot:
+
+- `runStatusline` handles `SIGTERM`, `SIGHUP`, `SIGINT` and `SIGPIPE`. A signal that arrives
+  during a post-print write waits for that write (`statuslineWriting`), then exits. One that
+  arrives at any other time exits at once, as before, so the guard never keeps alive a status
+  line that is not writing. It can delay an exit by at most one write, and the `SIGKILL`
+  1.5 s behind the TERM bounds even a wedged disk. It is installed in the process entry point
+  only, never in `statuslineCommand`, which tests call in-process.
+- A run that writes the cache removes any `statusline.json.*` or `rate_limits.json.*` older
+  than a minute. That covers `SIGKILL`, a power cut, and strays from before this fix. A live
+  writer holds its staging file for milliseconds, and no writer outlives its TERM by more
+  than 1.5 s, so a minute-old staging file has no owner. The sweep runs after the print and
+  only on a cache write, at most once a second machine-wide.
+
+`stateGlobs` still sweeps both patterns at uninstall. That stays, for the reason the residue
+bullet above gives.
 
 What the cache actually buys was measured for GOV-B07 and is narrower than the paragraph above
 assumed. A cache hit costs 5.1 ms at p50 and a miss 5.7 ms, so it saves 0.6 ms of a 5.7 ms
