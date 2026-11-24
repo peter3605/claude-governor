@@ -39,14 +39,20 @@ import (
 // exiting, so it waits for a write in flight and for nothing else.
 var statuslineWriting sync.Mutex
 
-// statuslineStopSignals are the ones that end a status line. SIGPIPE is among them because a
-// write to a stdout Claude Code has closed would otherwise kill the process on the spot; handled,
-// it becomes an EPIPE from the write, and the process exits through the same path.
-var statuslineStopSignals = []os.Signal{syscall.SIGTERM, syscall.SIGHUP, syscall.SIGINT, syscall.SIGPIPE}
+// statuslineStopSignals are the ones that end a status line.
+//
+// NOT SIGPIPE. Go ignores a SIGPIPE from any descriptor but stdout and stderr, so a broken
+// daemon socket is an EPIPE from the write. Notify for SIGPIPE delivers every one of them here,
+// and the status line would then exit before printing because its daemon went away. Claude Code
+// keeps stdout open until the process exits (hook-surface.md §14.4), and the print comes before
+// the writes, so a SIGPIPE on stdout cannot strand a staging file anyway.
+var statuslineStopSignals = []os.Signal{syscall.SIGTERM, syscall.SIGHUP, syscall.SIGINT}
 
-// guardStatuslineSignals installs the handler. It is called from runStatusline, the process
-// entry point, and never from statuslineCommand: tests call that in-process, and a test binary
-// must not have its signals redirected.
+// guardStatuslineSignals installs the handler. It is called from main, only for the statusline
+// subcommand, and never from runStatusline or statuslineCommand: tests call both in-process,
+// and a test binary must not have its signals redirected. Doing so is what broke CI on the first
+// version of this change: TestStatuslineExitsZero installed it, and a later test's SIGPIPE on
+// Linux exited the whole test binary with status 141.
 func guardStatuslineSignals() {
 	ch := make(chan os.Signal, 1)
 	signal.Notify(ch, statuslineStopSignals...)

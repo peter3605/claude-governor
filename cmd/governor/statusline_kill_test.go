@@ -2,6 +2,9 @@ package main
 
 import (
 	"bufio"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -210,5 +213,40 @@ func TestAStagingFileStrandedBySIGKILLIsSweptByALaterRun(t *testing.T) {
 	if _, err := os.Stat(young); err != nil {
 		t.Errorf("the sweep removed %s, which is younger than %v and may be a write in flight: %v",
 			filepath.Base(young), statuslineTempMaxAge, err)
+	}
+}
+
+// The signal guard is installed by main and nowhere else. Anywhere a test can reach would put
+// the handler into the test binary, where the next stray signal exits the whole package run:
+// the first version of GOV-B58 did that from runStatusline, and CI died with status 141.
+func TestTheStatuslineSignalGuardIsInstalledOnlyByMain(t *testing.T) {
+	fset := token.NewFileSet()
+	pkgs, err := parser.ParseDir(fset, ".", func(fi os.FileInfo) bool {
+		return !strings.HasSuffix(fi.Name(), "_test.go")
+	}, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var callers []string
+	for _, pkg := range pkgs {
+		for _, f := range pkg.Files {
+			for _, d := range f.Decls {
+				fn, ok := d.(*ast.FuncDecl)
+				if !ok || fn.Body == nil {
+					continue
+				}
+				ast.Inspect(fn.Body, func(n ast.Node) bool {
+					if c, ok := n.(*ast.CallExpr); ok {
+						if id, ok := c.Fun.(*ast.Ident); ok && id.Name == "guardStatuslineSignals" {
+							callers = append(callers, fn.Name.Name)
+						}
+					}
+					return true
+				})
+			}
+		}
+	}
+	if len(callers) != 1 || callers[0] != "main" {
+		t.Fatalf("guardStatuslineSignals is called from %v, want exactly [main]", callers)
 	}
 }

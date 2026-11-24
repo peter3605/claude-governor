@@ -3702,12 +3702,15 @@ that had printed would live until its writes finished. It does not have to. Clau
 `CreateTemp` and `Rename` stranded a 0-byte `statusline.json.<random>` on 2026-11-22, on a
 binary with GOV-33's fix. Two layers, because one signal can be caught and the other cannot:
 
-- `runStatusline` handles `SIGTERM`, `SIGHUP`, `SIGINT` and `SIGPIPE`. A signal that arrives
+- `governor statusline` handles `SIGTERM`, `SIGHUP` and `SIGINT`. A signal that arrives
   during a post-print write waits for that write (`statuslineWriting`), then exits. One that
   arrives at any other time exits at once, as before, so the guard never keeps alive a status
   line that is not writing. It can delay an exit by at most one write, and the `SIGKILL`
-  1.5 s behind the TERM bounds even a wedged disk. It is installed in the process entry point
-  only, never in `statuslineCommand`, which tests call in-process.
+  1.5 s behind the TERM bounds even a wedged disk. It is installed in `main`, only for the
+  `statusline` subcommand, and never in `runStatusline`, which tests call in-process. A
+  test binary with the handler exits on any later signal, which is how the first version broke
+  CI. `SIGPIPE` is left out on purpose: Go ignores it on sockets, and catching it would let a
+  broken daemon socket end the status line before it prints.
 - A run that writes the cache removes any `statusline.json.*` or `rate_limits.json.*` older
   than a minute. That covers `SIGKILL`, a power cut, and strays from before this fix. A live
   writer holds its staging file for milliseconds, and no writer outlives its TERM by more

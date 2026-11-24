@@ -189,7 +189,6 @@ type cachedStatus struct {
 }
 
 func runStatusline(_ []string, stdout, stderr io.Writer) int {
-	guardStatuslineSignals()
 	return statuslineCommand(os.Stdin, stdout, stderr, transport.Dial{}, statuslineBudget, terminalWidth())
 }
 
