@@ -417,6 +417,81 @@ measured how often it happens elsewhere.
 
 **A run whose repetitions are wrong together still gets through**, as §8.4's escape did. The
 agreement check bounds how much the probe can disagree with itself, not how wrong it can be.
-Re-running calibrate gives a fresh draw. Nothing yet compares a new answer against the stored
-one, so a single run can still move b_max by a slot. Whether calibrate should refuse a move
-that a second probe does not confirm is the obvious next question, and it is not answered here.
+Re-running calibrate gives a fresh draw. When this was written nothing compared a new answer
+with the stored one, so a single run could still move b_max by a slot. §8.7 adds that check
+for answers that land low.
+
+### 8.7 Checked against this host's history (GOV-B59)
+
+The agreement check asks whether the probe gave the same answer twice. It cannot ask whether
+the answer is plausible for this host. Sustained contention produces readings that are
+consistently low, and readings that are consistently low agree with each other very well. So
+the bound is weakest exactly when the machine is worst. Every piece of evidence behind §8.3
+comes from inside one run. This section adds a comparison across runs.
+
+**The first field observations against a bound set from 30 bench trials.** Three
+calibrations moved b_max down by a slot or more on one run. All three passed the agreement
+bound.
+
+| date | loadavg1 | reps usable | answer | gap | below 5.64 | wrote | what happened |
+|---|---|---|---|---|---|---|---|
+| 2026-11-02 | not recorded | not recorded | 4.73 | 5.7% | 16% | b_max **3** over 4 | a re-run at 1.0% returned 5.65 and restored 4 |
+| 2026-11-24 15:17Z | 2.44 | 5 of 5, attempt 2 | 4.55 | 1.6% | 19% | b_max **3** over 4 | written to this host's config, and still there when the story started |
+| 2026-11-24 | 12.72 | **3 of 5** | 3.31 | 3.6% | 41% | b_max **2**, would have | only `--dry-run` stopped it |
+
+The third run's repetitions were 3.31, 4.58†, 3.46†, 4.76 and 3.19 († marks a repetition the
+drift check rejected). The second run was taken on a quiet machine, so the
+ambient-load guard was never going to see it. That is consistent with §8.5: load does not
+predict the probe. Three dry-runs taken on the same afternoon, on battery with another session
+busy, read 5.20 (accepted, b_max 4) and then declined twice on disagreement. Whatever
+depressed the 15:17 reading, it was not a lasting change in the machine.
+
+**The bound: an answer more than 12% below the last trusted reading is not used**
+(`ProbeMaxShortfall`). The probe measures once more, then declines, and `Resolve` keeps the
+stored b_max through the path §8.3 built. The 12% comes from the spread of answers this host
+accepts. Over the 61 recorded attempts in §8.2, §8.4 and the six after the escape, 57 were
+accepted, and every accepted answer lay between 5.12 and 5.80. The largest fall from any
+accepted answer to any other is 5.80 to 5.12, which is 11.7%. So at 12%, no pair of readings
+the bench accepted would refuse each other, whichever of the two was stored.
+`TestTheShortfallBoundRefusesNothingTheBenchAccepted` runs that claim against the recorded data.
+All three field readings are refused.
+
+Why not the levers that already existed:
+
+- **Tightening `ProbeMaxDisagreement`** would not have caught any of the three, which passed at
+  5.7%, 1.6% and 3.6%. It would also reject good answers.
+- **Lowering `ProbeSkipAbove`** would not have caught them either. The readings were taken at
+  1.59 per core and below, and a guard tight enough to fire there would stop the probe on an
+  ordinary working laptop.
+
+**The basis** is the trusted reading the stored b_max came from, recorded as
+`probe_effective_cores`. A config written before that key existed is read back from its
+`calibrated_from` note. That covers the first calibrate after an upgrade, which install runs
+unattended. A note from a machine with a different core count gives no basis. With no basis
+there is no bound, and the probe behaves as before. A kept b_max keeps its basis.
+
+The bound is one-sided:
+
+- **A depressed basis heals at the next good reading.** A reading above the basis is never
+  refused. This host's config held 4.55 when the story started, so its floor is 4.00, and an
+  ordinary 5.6 replaces it.
+- **A basis from a high escape heals too.** §8.4's 6.30 would refuse readings under 5.54,
+  which is the lower quarter of this host's distribution. The median passes and replaces it.
+
+**Surviving at the minimum now forces a retry** (`ProbeMinUsableReps` 3 → 4). Three is the
+fewest repetitions the estimator can be computed from. But an attempt that keeps exactly three
+has lost two of five to the drift check, and that is a machine moving under the measurement.
+None of the 61 recorded attempts kept fewer than four. The only attempts known to have kept
+three are run B of §8.1 and the 41%-low reading above.
+
+**A machine that really has become slower** (different hardware behind the same config, a
+degraded battery, a thermal fault) is lowered by `governor calibrate --accept-lower`. The
+refusal prints that command. Agreement across separate calibrations was considered and not
+adopted. The contention that depresses one run is usually a workload still running at the next,
+so two low readings agreeing is the same weak evidence as two repetitions agreeing, a step
+further apart. A different machine with a different core count needs nothing, because it has
+no basis.
+
+**What this does not do.** It bounds only answers that land low. A high escape like §8.4's
+6.30 still gets through, and can raise b_max by a slot until the next calibration. That is
+the over-admitting direction, and it is left for a story with data on it.

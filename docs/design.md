@@ -3858,7 +3858,8 @@ The keys, and who owns each:
 | `run_queue_max` | `calibrate` | the daemon, into `budget.Controller` | the compiled-in `RunQueueMax` |
 | `b_max` | `calibrate` | the daemon, as a **cap** on `floor(capacity / 1.2)` | the per-tick derivation alone |
 | `calibrated_at` | `calibrate` | `doctor` | this host has never been measured |
-| `calibrated_from` | `calibrate` | `doctor`, and a person reading the file | as above |
+| `calibrated_from` | `calibrate` | `doctor`, `calibrate` (the basis below, on a config that predates its key), and a person reading the file | as above |
+| `probe_effective_cores` | `calibrate`, on a trusted probe only | `calibrate`, as the basis a new probe is checked against (calibration.md §8.7) | read from `calibrated_from`; failing that, no bound |
 | `setpoint` | nothing | nothing | — |
 | `wait_max_ms` | the user, by hand | — | the compiled-in wait budget |
 

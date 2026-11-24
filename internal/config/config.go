@@ -51,6 +51,12 @@ type Config struct {
 	CalibratedFrom string
 	// WaitMax is how long the gate will wait for a slot before refusing.
 	WaitMaxMS int
+	// ProbeEffectiveCores is the trusted probe reading the stored BMax was derived from, and
+	// the basis the next calibration's probe is checked against (GOV-B59, calibrate's
+	// ProbeMaxShortfall). It is carried forward unchanged when a calibration keeps BMax.
+	// Zero means no trusted reading is recorded; `calibrate` then reads one back out of
+	// CalibratedFrom if it can, and otherwise checks the probe against nothing.
+	ProbeEffectiveCores float64
 	// Unknown holds keys this binary does not recognise, so a round trip through an older
 	// version preserves a newer version's settings.
 	//

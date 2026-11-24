@@ -2,6 +2,7 @@ package calibrate
 
 import (
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -70,6 +71,29 @@ func Provenance(m Measurement, o Outcome) string {
 		fmt.Fprintf(&b, "; run-queue cut = ambient + %.2f headroom, floored at the shipped 2.0", BuildHeadroom)
 	}
 	return b.String()
+}
+
+// EffectiveCoresInProvenance reads back the trusted probe reading a provenance note records,
+// for a config written before probe_effective_cores existed. It lives beside Provenance so the
+// format and its one reader change together.
+//
+// A note this cannot parse — a probe that failed or was skipped, a b_max kept from an earlier
+// run, a format from another version — yields no basis, which is no bound: the probe then
+// behaves as it did before GOV-B59, never stricter on a guess.
+func EffectiveCoresInProvenance(note string) (float64, bool) {
+	_, rest, found := strings.Cut(note, "; probe measured ")
+	if !found {
+		return 0, false
+	}
+	num, _, found := strings.Cut(rest, " effective cores")
+	if !found {
+		return 0, false
+	}
+	v, err := strconv.ParseFloat(strings.TrimSpace(num), 64)
+	if err != nil || v <= 0 {
+		return 0, false
+	}
+	return v, true
 }
 
 func orUnknown(s string) string {

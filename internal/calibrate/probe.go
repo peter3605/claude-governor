@@ -34,13 +34,58 @@ const (
 )
 
 // ProbeMinUsableReps is how many repetitions must survive the drift check for the probe to
-// report a result.
+// report a result. An attempt with fewer is not used: the probe measures again
+// (ProbeAttempts), and then declines.
 //
-// Three, because that is the fewest the estimator and its check can be computed from: the
-// highest is discarded, the second-highest is the answer, and the third is what the answer is
-// checked against (ProbeMaxDisagreement). In 30 recorded trials on this host the median trial
-// kept all five and none kept fewer than four, so three costs nothing on the hardware it is for.
-const ProbeMinUsableReps = 3
+// FOUR, ONE MORE THAN THE ESTIMATOR NEEDS, AND THE DIFFERENCE IS THE POINT (GOV-B59). Three
+// is the fewest the estimator and its check can be computed from: the highest is discarded,
+// the second-highest is the answer, the third is what it is checked against. But an attempt
+// that keeps exactly three has lost two of five repetitions to ProbeMaxDrift, and the drift
+// check firing twice in four seconds says the machine was moving under the measurement. The
+// survivors of a moving machine are not a fair sample of a still one, and the agreement check
+// cannot see that: on 2026-11-24 three survivors read 3.31, 3.19 and 4.76, the two the answer
+// rested on agreed within 3.6%, and the answer was 41% below this host's centre.
+//
+// It costs nothing on the hardware it is for. Across every attempt recorded on this host — 61,
+// in docs/calibration.md §8.2, §8.4 and the six after the escape — none kept fewer than four.
+// The only attempts known to have kept three are run B of §8.1 and the 2026-11-24 field
+// reading. So the drift rejection count is an input to whether the answer is trusted, not
+// only a filter on which repetitions feed it.
+const ProbeMinUsableReps = 4
+
+// ProbeMaxShortfall is how far below this host's last trusted reading (Basis) an answer may
+// land, as a fraction of that reading, before it is not trusted. ProbeAttempts says what
+// happens then, as it does for a disagreement.
+//
+// THE AGREEMENT CHECK ASKS WHETHER THE PROBE GAVE THE SAME ANSWER TWICE. IT CANNOT ASK WHETHER
+// THE ANSWER IS PLAUSIBLE FOR THIS HOST, and sustained contention produces consistently LOW
+// readings, which agree with each other very well — so that bound is weakest exactly when the
+// machine is worst. This is the missing comparison: a run against the host's own history
+// rather than against itself. It is a different quantity from ProbeMaxDisagreement the way
+// that one is from ProbeMaxDrift, and tightening either of those would not have caught what
+// this catches (the 2026-11-24 reading passed the agreement bound at 3.6% against 6%).
+//
+// 12%, FROM THE SPREAD OF ANSWERS THIS HOST ACCEPTS. Over the 61 attempts recorded in
+// docs/calibration.md §8, every answer the probe accepted lay between 5.12 and 5.80. The
+// largest fall from any accepted answer to any other is therefore 5.80 to 5.12, 11.7%: so at
+// 12% no pair of readings the bench accepted would refuse each other, whichever of them was
+// the one stored. The three field readings that moved b_max down on one run were 16%, 19% and
+// 41% below the 5.64 centre (§8.7), and all three are refused.
+//
+// ONE-SIDED, AND ONLY AGAINST A READING THIS HOST TOOK. A reading above the basis is never
+// refused by this, so a basis that was itself depressed heals at the next good reading. A
+// basis from a high escape (§8.4's 6.30) refuses readings under 5.54, which on this host's
+// distribution is the lower quarter; the median reading passes, and replaces it. With no basis
+// — a first calibration, or a config from a machine with another core count — there is no
+// bound and the probe behaves as it did before.
+//
+// IT DOES NOT STOP A MACHINE BECOMING SLOWER. A host that genuinely is — different hardware
+// behind the same config, a degraded battery, a thermal fault — is lowered by
+// `governor calibrate --accept-lower` (Basis.Waived), which the refusal names. Not by
+// agreement across separate calibrations: the contention that depresses one run is usually a
+// workload that is still running at the next, so two low readings agreeing is the same weak
+// evidence as two repetitions agreeing, a step further apart.
+const ProbeMaxShortfall = 0.12
 
 // ProbeMaxDisagreement is how far apart the two repetitions an answer rests on — the second-
 // and third-highest usable — may be, as a fraction of the second, before the answer is not
@@ -146,8 +191,12 @@ type ProbeResult struct {
 	// whether the figure is trusted; see ProbeMaxDisagreement.
 	Disagreement float64
 	// Attempts is how many times the whole probe ran: a second attempt follows a first whose
-	// repetitions disagreed.
+	// answer was not trusted.
 	Attempts int
+	// BelowBasis is whether the last attempt was refused for landing more than
+	// ProbeMaxShortfall below the host's last trusted reading. It is what tells the command
+	// to say how a machine that really is slower accepts the lower figure.
+	BelowBasis bool
 	// Duration is how long one phase ran.
 	Duration time.Duration
 	// Samples is every repetition in the order it ran, usable or not. It is what Spread and
@@ -166,6 +215,25 @@ type RepSample struct {
 	Usable bool
 	// Attempt is which attempt of the probe it belongs to, from 1.
 	Attempt int
+}
+
+// Basis is what this host measured before: the trusted reading the stored b_max came from, and
+// when. A new answer is checked against it (ProbeMaxShortfall). The zero value is no basis and
+// no bound.
+type Basis struct {
+	EffectiveCores float64
+	// At is when that reading was taken, RFC3339, for the refusal to name.
+	At string
+	// Waived accepts an answer below the bound: `governor calibrate --accept-lower`, for a
+	// machine that really has become slower.
+	Waived bool
+}
+
+func (b Basis) floor() float64 {
+	if b.Waived || b.EffectiveCores <= 0 {
+		return 0
+	}
+	return b.EffectiveCores * (1 - ProbeMaxShortfall)
 }
 
 // Probe measures how many cores this host actually delivers under parallel load.
@@ -214,7 +282,8 @@ type RepSample struct {
 // they let contention back in.
 //
 // AND IT IS CHECKED BEFORE IT IS USED. The second-highest is only trusted when the third-highest
-// agrees with it (ProbeMaxDisagreement); otherwise the probe measures again, and then declines
+// agrees with it (ProbeMaxDisagreement) and it is not implausibly far below what this host has
+// measured before (ProbeMaxShortfall); otherwise the probe measures again, and then declines
 // (ProbeAttempts). A probe that cannot produce a trusted figure reports that, and Derive writes
 // nothing from it.
 //
@@ -236,6 +305,10 @@ func Probe(ctx context.Context, cores int, ambient float64, opts Options) ProbeR
 	}
 	reps := opts.probeRepetitions()
 	r := ProbeResult{Workers: workers, Duration: d, Reps: reps}
+	rep := oneRep
+	if opts.Repetition != nil {
+		rep = opts.Repetition
+	}
 
 	if workers < 2 {
 		// Nothing to measure: parallel throughput over single throughput on one core is 1
@@ -271,11 +344,11 @@ func Probe(ctx context.Context, cores int, ambient float64, opts Options) ProbeR
 			if ctx.Err() != nil {
 				break
 			}
-			eff, drift, ok := oneRep(ctx, workers, d)
+			eff, drift, ok := rep(ctx, workers, d)
 			samples = append(samples, RepSample{Eff: eff, Drift: drift, Usable: ok, Attempt: attempt})
 		}
 		r.Samples = append(r.Samples, samples...)
-		if summarise(&r, samples) {
+		if summarise(&r, samples, opts.Basis) {
 			return r
 		}
 	}
@@ -288,7 +361,7 @@ func Probe(ctx context.Context, cores int, ambient float64, opts Options) ProbeR
 // summarise judges one attempt's repetitions, filling r, and reports whether they produced a
 // figure that can be trusted. It is pure so the decision can be tested against repetitions
 // recorded on real hardware rather than against whatever the test machine happens to do.
-func summarise(r *ProbeResult, samples []RepSample) bool {
+func summarise(r *ProbeResult, samples []RepSample, basis Basis) bool {
 	var usable []RepSample
 	for _, s := range samples {
 		if s.Usable {
@@ -298,12 +371,14 @@ func summarise(r *ProbeResult, samples []RepSample) bool {
 	sort.Slice(usable, func(i, j int) bool { return usable[i].Eff > usable[j].Eff })
 	r.UsableReps = len(usable)
 	r.OK, r.EffectiveCores, r.Spread, r.Drift, r.Disagreement = false, 0, 0, 0, 0
+	r.BelowBasis = false
 
 	if len(usable) < ProbeMinUsableReps {
 		// Distinguished from a skip: the probe ran and the machine would not hold still for
 		// it. A skip is a decision and this is a failed measurement; the provenance note
 		// says which happened.
-		r.Reason = "the machine would not hold still: too few repetitions survived the drift check"
+		r.Reason = fmt.Sprintf("the machine would not hold still: %d of %d repetitions survived the drift check, "+
+			"fewer than the %d an answer is trusted from", len(usable), len(samples), ProbeMinUsableReps)
 		return false
 	}
 	est, next := usable[1], usable[2]
@@ -312,6 +387,14 @@ func summarise(r *ProbeResult, samples []RepSample) bool {
 	if r.Disagreement > ProbeMaxDisagreement {
 		r.Reason = fmt.Sprintf("the repetitions disagreed: the two the answer rests on are %.0f%% apart, "+
 			"more than the %.0f%% a figure is trusted at", r.Disagreement*100, ProbeMaxDisagreement*100)
+		return false
+	}
+	if floor := basis.floor(); est.Eff < floor {
+		r.BelowBasis = true
+		r.Reason = fmt.Sprintf("the answer, %.2f effective cores, is %.0f%% below the %.2f this host measured at %s, "+
+			"more than the %.0f%% a reading may fall before it is not trusted",
+			est.Eff, (1-est.Eff/basis.EffectiveCores)*100, basis.EffectiveCores, orUnknown(basis.At),
+			ProbeMaxShortfall*100)
 		return false
 	}
 	r.EffectiveCores = round2(est.Eff)
