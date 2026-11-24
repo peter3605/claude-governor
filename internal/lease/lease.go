@@ -74,8 +74,9 @@ type Lease struct {
 	// BackgroundAgent is the subagent that backgrounded the command, or empty when the main
 	// thread did. It is NOT AgentID: that field indexes an Agent lease for SubagentStop's
 	// release, and a build is not an agent. It is kept apart because the two end differently.
-	// A subagent's background tasks are killed when the subagent stops (hook-surface.md
-	// section 26), and the main thread's are reported by a task notification.
+	// A foreground subagent's background tasks are killed when it stops (hook-surface.md
+	// section 26), a background subagent's run on through its idle stops (section 29), and
+	// the main thread's are reported by a task notification.
 	BackgroundAgent string
 	GrantedAt       time.Time
 	// RenewedAt is when the reaper last renewed this Agent lease at its TTL because its
@@ -86,7 +87,18 @@ type Lease struct {
 	// LapsedAt is set on an Agent lease that Confirm reinstated after its tentative lease had
 	// already been reaped (GOV-B55, design.md section 5.6f): it is when that tentative lease
 	// lapsed. Zero on every lease confirmed on time. Carried so the daemon can say so.
-	LapsedAt     time.Time
+	LapsedAt time.Time
+	// Resume is the agent_id a SendMessage resume targets, set on the tentative lease the
+	// gate took for it (GOV-B56, design.md section 5.6g). Confirm binds such a lease to that
+	// agent's SubagentStart and to nothing else, and FIFO passes over it, because it was
+	// admitted for one particular subagent. Empty on every Agent-tool spawn, and from a gate
+	// that predates the field.
+	Resume string
+	// Woken is set on an Agent lease that Confirm minted for a subagent this table had
+	// already governed and whose lease was gone: a background subagent woken by its own task
+	// after its SubagentStop released it (GOV-B56, design.md section 5.6g). Carried so the
+	// daemon can say so.
+	Woken        bool
 	ExpiresAt    time.Time
 	AgentID      string
 	OwnerPID     int

@@ -74,6 +74,10 @@ type hookRequest struct {
 	// confirm, release, background
 	AgentID string `json:"agent_id,omitempty"`
 
+	// release (GOV-B56): see the daemon's request struct.
+	BackgroundAgent bool     `json:"background_agent,omitempty"`
+	Running         []string `json:"running,omitempty"`
+
 	// confirm, session start
 	PID          int   `json:"pid,omitempty"`
 	PIDStartedAt int64 `json:"pid_started_at,omitempty"`
@@ -123,6 +127,19 @@ type lifecyclePayload struct {
 	// <task-notification> Claude Code submits when a main-thread background task ends
 	// (hook-surface.md section 26).
 	Prompt string `json:"prompt"`
+	// BackgroundTasks is SubagentStop's list of live work (hook-surface.md sections 26 and
+	// 29), decoded for three fields. It is read by release for one decision: whether the
+	// stopping subagent is a BACKGROUND one, which lists itself here as type "subagent" and
+	// whose tasks run on through the stop, or a foreground one, which does not and whose
+	// tasks are killed (GOV-B56).
+	BackgroundTasks []backgroundTask `json:"background_tasks"`
+}
+
+// backgroundTask is one entry of a Stop or SubagentStop payload's background_tasks.
+type backgroundTask struct {
+	ID     string `json:"id"`
+	Type   string `json:"type"`
+	Status string `json:"status"`
 }
 
 func runConfirm(_ []string, _ io.Writer, stderr io.Writer) int {
@@ -193,12 +210,27 @@ func buildConfirm(p lifecyclePayload, diag io.Writer) (hookRequest, bool) {
 // buildRelease returns a lease at SubagentStop. It keys off agent_id, which that payload
 // always carries, so it needs no correlation.
 func buildRelease(p lifecyclePayload, _ io.Writer) (hookRequest, bool) {
-	return hookRequest{
+	r := hookRequest{
 		V: protocolVersion, Op: "release",
 		Principal: localPrincipal(),
 		Session:   p.SessionID,
 		AgentID:   p.AgentID,
-	}, true
+	}
+	// A background subagent's SubagentStop lists the subagent itself among the session's
+	// live tasks, and its own tasks beside it, still running: it has gone idle, and those
+	// tasks will wake it (hook-surface.md section 29). A foreground subagent's does not list
+	// itself, and its tasks are killed a moment later (section 26). The release still drops
+	// the agent's own lease either way; what this decides is whether its backgrounded builds
+	// go too (GOV-B56).
+	for _, bt := range p.BackgroundTasks {
+		switch {
+		case bt.Type == "subagent" && bt.ID != "" && bt.ID == p.AgentID:
+			r.BackgroundAgent = true
+		case bt.Type != "subagent" && bt.Status == "running" && taskIDShaped(bt.ID):
+			r.Running = append(r.Running, bt.ID)
+		}
+	}
+	return r, true
 }
 
 // buildFinish returns a Build lease at PostToolUse, IF the command has actually finished.

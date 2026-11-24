@@ -140,6 +140,11 @@ type acquireRequest struct {
 	Kind  string  `json:"kind,omitempty"`
 	Class string  `json:"class,omitempty"`
 	Slots float64 `json:"slots,omitempty"`
+	// Resume is the agent_id a SendMessage resume targets (GOV-B56, design.md section 5.6g),
+	// so the daemon binds this lease to that subagent's SubagentStart rather than to the
+	// oldest pending spawn. Additive for Tool's reason: an older daemon ignores it and binds
+	// FIFO, as before.
+	Resume string `json:"resume,omitempty"`
 }
 
 // acquireResponse is the granted and refused replies of design.md section 7, decoded into
@@ -881,6 +886,15 @@ func escalation(denials int) string {
 	}
 }
 
+// resumeTarget is the subagent a SendMessage resume puts back on the CPU, or "" for every
+// other call. governsSpawn has already decided the call is a resume when this is non-empty.
+func resumeTarget(p hookPayload) string {
+	if p.ToolName == "SendMessage" && agentIDShape.MatchString(p.ToolInput.To) {
+		return p.ToolInput.To
+	}
+	return ""
+}
+
 // acquireRequestFor builds the wire request from the hook payload and the gate's decision.
 func acquireRequestFor(p hookPayload, in intent, speaks int) acquireRequest {
 	// Depth is sent for a spawn only (design.md section 6.3, GOV-B35). The depth rule exists
@@ -903,6 +917,7 @@ func acquireRequestFor(p hookPayload, in intent, speaks int) acquireRequest {
 		Class:     in.class,
 		Slots:     in.weight,
 		Depth:     depth,
+		Resume:    resumeTarget(p),
 		// What the gate is willing to be held for. The daemon parks the request for at most
 		// this long and answers either way; a gate that cannot perform a wait sends zero,
 		// which is what GOV-07 did and what an older binary still does.

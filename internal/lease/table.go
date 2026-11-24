@@ -3,6 +3,7 @@ package lease
 import (
 	"fmt"
 	"math"
+	"slices"
 	"sort"
 	"sync"
 	"time"
@@ -183,7 +184,14 @@ type Table struct {
 	pending map[string][]string // session -> FIFO of tentative lease IDs
 	// lapsed is, per session, the FIFO of tentative Agent leases reaped at their TTL whose
 	// SubagentStart may yet arrive (GOV-B55). It holds no weight. Swept by Reap.
-	lapsed   map[string][]lapse
+	lapsed map[string][]lapse
+	// governed is, per session, every subagent this table has confirmed a lease for, with
+	// the request that lease was granted on (GOV-B56). A SubagentStart for one of them that
+	// finds no live lease is that subagent being woken, not a new spawn: a background
+	// subagent's SubagentStop fires each time it goes idle and releases its lease, and its
+	// own background task wakes it later with no PreToolUse (design.md section 5.6g). It
+	// holds no weight and goes when its session goes.
+	governed map[string]map[string]Request
 	sessions map[string]Session
 	// demanding remembers when a session was last refused, which is how a session that is
 	// not the current caller still counts as contending for fair share. Swept by Reap.
@@ -216,6 +224,7 @@ func NewTable(opt Options) *Table {
 		byTool:    map[string]string{},
 		pending:   map[string][]string{},
 		lapsed:    map[string][]lapse{},
+		governed:  map[string]map[string]Request{},
 		sessions:  map[string]Session{},
 		demanding: map[string]time.Time{},
 		opt:       opt,
@@ -249,6 +258,9 @@ type Request struct {
 	ToolUseID string
 	// Class is carried onto the lease for the release log only (Lease.Class).
 	Class string
+	// Resume is the agent_id a SendMessage resume targets (Lease.Resume). Ignored for a
+	// Build lease.
+	Resume string
 }
 
 // Fits reports whether Acquire would admit this request right now, WITHOUT taking a lease,
@@ -641,6 +653,7 @@ func (t *Table) grantLocked(r Request, w float64) Lease {
 		}
 	} else {
 		l.State = Tentative
+		l.Resume = r.Resume
 		l.ExpiresAt = now.Add(t.opt.TentativeTTL)
 		t.pending[r.Session] = append(t.pending[r.Session], l.ID)
 	}
@@ -706,19 +719,26 @@ func (t *Table) MarkBackground(session, toolUseID, taskID, agentID string) bool 
 }
 
 // ReleaseBackgroundOf drops every backgrounded Build lease that subagent agentID started
-// (GOV-B41).
+// (GOV-B41), except those whose task is named in keep (GOV-B56).
 //
-// It is SubagentStop's second job, and it rests on a measured fact rather than an
-// assumption: a subagent's background shell tasks are killed when the subagent stops. In
+// It is SubagentStop's second job, and it rests on a measured fact that holds for a
+// FOREGROUND subagent only: its background shell tasks are killed when it stops. In
 // hook-surface.md section 26 a heartbeat loop started in the background by a subagent wrote
 // its last beat 0.13 s before SubagentStop fired and never wrote another, and its output file
 // ends in "[killed]". The CPU is gone, so the slot is free.
+//
+// A BACKGROUND subagent is different (hook-surface.md section 29). Its SubagentStop fires
+// every time it goes idle, its tasks keep running through it, and the task's end wakes it
+// again. The caller passes, as keep, the tasks that SubagentStop's background_tasks lists as
+// running for such a subagent, and those leases stay: the reaper's task-file Liveness, or a
+// later SubagentStop that no longer lists them, releases them. keep is nil for a foreground
+// subagent, whose tasks are listed as running and then killed.
 //
 // A foreground build cannot be running at SubagentStop, because a subagent does not stop
 // while one of its own tool calls is still in progress. That is why only BACKGROUNDED leases
 // are dropped here: a foreground lease with this agent's name would be one whose PostToolUse
 // is still on its way.
-func (t *Table) ReleaseBackgroundOf(session, agentID string) []Released {
+func (t *Table) ReleaseBackgroundOf(session, agentID string, keep []string) []Released {
 	if agentID == "" {
 		return nil
 	}
@@ -727,7 +747,8 @@ func (t *Table) ReleaseBackgroundOf(session, agentID string) []Released {
 
 	var out []Released
 	for _, l := range t.leasesForLocked(session) {
-		if l.Kind == Build && l.BackgroundTask != "" && l.BackgroundAgent == agentID {
+		if l.Kind == Build && l.BackgroundTask != "" && l.BackgroundAgent == agentID &&
+			!slices.Contains(keep, l.BackgroundTask) {
 			out = append(out, t.dropLocked(l, ""))
 		}
 	}
@@ -771,6 +792,16 @@ func (t *Table) BackgroundTasks(session string) []string {
 //     mode a spawn starts only when its message has finished streaming, which can be after
 //     the tentative TTL reaped its lease. Then the oldest lapse inside lateConfirmWindow is
 //     reinstated and confirmed, and the lease says when it lapsed (Lease.LapsedAt).
+//   - A BACKGROUND subagent's SubagentStop fires each time it goes idle, and its own
+//     background task wakes it later with a SubagentStart and no PreToolUse (GOV-B56,
+//     design.md section 5.6g, hook-surface.md section 29). So before FIFO, two exact answers
+//     are tried: the pending lease a SendMessage resume took for this agent_id
+//     (Lease.Resume), and then, for an agent_id this session has confirmed before, a lease
+//     minted from its earlier request (Lease.Woken). The second never pops the FIFO, whose
+//     leases belong to spawns that have not started yet.
+//
+// The order is therefore: a live lease for this agent_id; a resume taken for it; a wake of a
+// governed agent; the FIFO; a lapse; nothing.
 //
 // leaseID is honoured when it names a tentative lease of this session, and ignored
 // otherwise. It costs nothing to prefer an exact answer when the wire happens to carry one,
@@ -793,8 +824,31 @@ func (t *Table) Confirm(session, leaseID, agentID string, pid int, pidStarted ti
 		delete(t.byAgent, agentID)
 	}
 
-	id := t.takePendingLocked(session, leaseID)
-	var lapsedAt time.Time
+	var (
+		id       string
+		lapsedAt time.Time
+		woken    bool
+	)
+	if agentID != "" {
+		// A SendMessage resume admitted for exactly this subagent (GOV-B56). Taken first and
+		// by name, because the gate took it for this agent and no other.
+		id = t.takeResumeLocked(session, agentID)
+		if id == "" {
+			if req, ok := t.governed[session][agentID]; ok {
+				// A subagent this table already governed, whose lease is gone: a background
+				// subagent woken by its own task after its idle SubagentStop released it
+				// (design.md section 5.6g). Minted unadmitted, like a late confirm, because
+				// SubagentStart cannot refuse it. It must NOT pop the FIFO: every pending
+				// lease there was admitted for a spawn still to start, and taking one would
+				// leave that spawn to start unleased.
+				id, woken = t.grantLocked(req, normalWeight(req.Weight)).ID, true
+				t.takePendingLocked(session, id)
+			}
+		}
+	}
+	if id == "" {
+		id = t.takePendingLocked(session, leaseID)
+	}
 	if id == "" {
 		// Nothing pending, so either this spawn's tentative lease was reaped before its
 		// SubagentStart arrived (auto mode, GOV-B55) or there never was one (a resumed
@@ -810,6 +864,7 @@ func (t *Table) Confirm(session, leaseID, agentID string, pid int, pidStarted ti
 	now := t.opt.Now()
 	l := t.byID[id]
 	l.LapsedAt = lapsedAt
+	l.Woken = woken
 	l.State = Confirmed
 	l.AgentID = agentID
 	l.OwnerPID = pid
@@ -817,8 +872,31 @@ func (t *Table) Confirm(session, leaseID, agentID string, pid int, pidStarted ti
 	l.ExpiresAt = now.Add(t.opt.ConfirmedTTL)
 	if agentID != "" {
 		t.byAgent[agentID] = id
+		if t.governed[session] == nil {
+			t.governed[session] = map[string]Request{}
+		}
+		t.governed[session][agentID] = Request{Session: l.Session, Depth: l.Depth, Kind: Agent, Weight: l.Weight}
 	}
 	return *l, true
+}
+
+// takeResumeLocked removes and returns the tentative lease a SendMessage resume took for
+// agentID in this session, or "" if there is none (GOV-B56).
+func (t *Table) takeResumeLocked(session, agentID string) string {
+	queue := t.pending[session]
+	for i, id := range queue {
+		l, ok := t.byID[id]
+		if ok && l.State == Tentative && l.Resume == agentID {
+			rest := append(append([]string(nil), queue[:i]...), queue[i+1:]...)
+			if len(rest) == 0 {
+				delete(t.pending, session)
+			} else {
+				t.pending[session] = rest
+			}
+			return id
+		}
+	}
+	return ""
 }
 
 // takePendingLocked removes and returns one tentative lease ID for the session, preferring
@@ -834,15 +912,23 @@ func (t *Table) takePendingLocked(session, want string) string {
 		if !ok || l.State != Tentative {
 			continue // reaped, or somehow already confirmed
 		}
-		if found == "" && (want == "" || id == want) {
+		// A lease a SendMessage resume took for one named subagent is never the FIFO answer
+		// (GOV-B56): takeResumeLocked hands it to that subagent, or the TTL collects it.
+		if found == "" && ((want == "" && l.Resume == "") || id == want) {
 			found = id
 			continue
 		}
 		keep = append(keep, id)
 	}
 	// An explicit want that did not match anything still deserves the FIFO answer.
-	if found == "" && want != "" && len(keep) > 0 {
-		found, keep = keep[0], keep[1:]
+	if found == "" && want != "" {
+		for i, id := range keep {
+			if t.byID[id].Resume == "" {
+				found = id
+				keep = append(keep[:i:i], keep[i+1:]...)
+				break
+			}
+		}
 	}
 
 	if len(keep) == 0 {
@@ -934,6 +1020,7 @@ func (t *Table) ReleaseSession(session string) []Released {
 	delete(t.sessions, session)
 	delete(t.pending, session)
 	delete(t.lapsed, session)
+	delete(t.governed, session)
 	return out
 }
 
@@ -1041,6 +1128,7 @@ func (t *Table) Reap() []Released {
 		delete(t.sessions, id)
 		delete(t.pending, id)
 		delete(t.lapsed, id)
+		delete(t.governed, id)
 		delete(t.demanding, id)
 	}
 	// Lapses nobody claimed in time: a spawn that really was abandoned. Swept here so the

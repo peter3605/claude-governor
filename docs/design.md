@@ -210,8 +210,9 @@ found that this was 66% of all build slot-seconds in a week. [hook-surface.md](h
 `tool_use_id`. An ordinary prompt is dropped before any I/O, so the hook costs a process start
 and nothing more. It is one of three release paths for a backgrounded build, and the only one
 that needs a registration of its own. The other two are `SubagentStop` and the reaper's
-task-file check (§4.3, §5.6c). A subagent's background tasks need neither, because Claude Code kills
-them at `SubagentStop`, which `release` already handles (§4.3).
+task-file check (§4.3, §5.6c). A foreground subagent's background tasks need neither, because
+Claude Code kills them at `SubagentStop`, which `release` already handles (§4.3). A background
+subagent's run on through its idle stops and end through the task-file check (§5.6g).
 
 `timeout` is set explicitly rather than inherited: the default was measured at over 150 s with
 no established ceiling (§10.1), which is not a number to build a wait window on. 30 s gives the
@@ -329,8 +330,10 @@ There are two, because the two gated tools give the governor completely differen
 ```
 PreToolUse    → acquire TENTATIVE lease   ttl 30s, keyed by session_id
 SubagentStart → CONFIRM lease             bind agent_id + owning pid
+                (an agent_id this session already confirmed, with no live lease: a background
+                 subagent woken by its own task; lease it again, unadmitted,     GOV-B56, §5.6g)
                 (none pending: reinstate a tentative lease lapsed < 10 min ago,   GOV-B55, §5.6f)
-SubagentStop  → release
+SubagentStop  → release   (for a BACKGROUND subagent, every time it goes idle)
 SessionEnd    → release all for session
 reaper (2s)   → drop leases past ttl, whose SESSION is gone, or whose owning pid is gone
 ```
@@ -345,6 +348,8 @@ PostToolUse        → release, IFF tool_response.backgroundTaskId is ABSENT
 PostToolUseFailure → release
 UserPromptSubmit   → release, for each <task-notification> naming its tool_use_id   (GOV-B41)
 SubagentStop       → release background leases that subagent started                (GOV-B41)
+                     except, for a background subagent, those its background_tasks
+                     still lists as running                                          (GOV-B56)
 SessionEnd         → release all for session
 reaper (2s)        → drop leases past ttl, or whose SESSION is gone, or (background
                      leases) whose task's output file ends in its status line        (GOV-B41)
@@ -366,7 +371,11 @@ Three differences from the agent path, all of them measured rather than chosen:
 - **A backgrounded build is released by its real end, and each end has its own event
   (GOV-B41, `hook-surface.md` §26).** A main-thread task that exits is announced by a
   `<task-notification>` prompt carrying the original `tool_use_id`, so the release is as exact
-  as `PostToolUse`'s. A subagent's tasks are killed when it stops, so `SubagentStop` ends them.
+  as `PostToolUse`'s. A foreground subagent's tasks are killed when it stops, so `SubagentStop`
+  ends them. A **background** subagent's are not: its `SubagentStop` fires each time it goes
+  idle, lists itself and its still-running tasks in `background_tasks`, and those tasks run on
+  and wake it (`hook-surface.md` §29). Their leases stay, for the task-file check below or a
+  later stop that no longer lists them (GOV-B56).
   A subagent task that ends while the subagent works on, and a task killed by `TaskStop`, are
   announced by no hook at all. Both leave `[exited with code N]` or `[killed]` as the last line
   of the task's output file, and the reaper reads that through the existing
@@ -415,9 +424,17 @@ Two measured hazards the implementation MUST handle:
   produce several. **Confirm MUST be idempotent per `agent_id`**: a confirm for an `agent_id`
   that already holds a confirmed lease is a no-op, not a second lease and not a FIFO pop.
   `SubagentStop` likewise fires more than once; release MUST tolerate it.
-- A resumed subagent reaches the CPU with **no `PreToolUse(Agent)` at all**. The gate cannot
-  see it and v1 does not govern it. A confirm with an empty tentative queue MUST be dropped
-  quietly rather than treated as an error.
+- A `SendMessage` resume is gated (§4.1), and its acquire names the agent it resumes
+  (`resume`, §7), so its tentative lease is bound to that agent's `SubagentStart` and FIFO
+  passes over it (GOV-B56).
+- A **background** subagent is woken by its own background task with a `SubagentStart` and
+  **no `PreToolUse` at all**, after an idle `SubagentStop` released its lease
+  (`hook-surface.md` §29). The daemon remembers every `agent_id` it confirmed in the session,
+  and a confirm for one of them with no live lease mints a lease from its earlier request,
+  unadmitted and without popping the FIFO (GOV-B56, §5.6g).
+- A confirm for an `agent_id` the daemon never confirmed, with an empty tentative queue and
+  nothing lapsed, is still not governed (a daemon restarted under a running subagent, for
+  instance). It MUST be dropped quietly rather than treated as an error.
 
 **Where the owning PID comes from** (settled in GOV-07). No lifecycle payload carries one —
 §10.1 and `hook-surface.md` §5 — so `confirm` and `session start` resolve it from the hook
@@ -1526,8 +1543,8 @@ from the call to the task notification in the subagent's own transcript, were 19
 unknown). 28 of the 30 known ran longer than 120 s, and 4 ran longer than 300 s.
 
 **What ends a backgrounded build, measured on 2.1.327 (hook-surface.md §26):** a
-`<task-notification>` prompt on the main thread only, `SubagentStop` (which kills the
-subagent's tasks), and the status line Claude Code appends to the task's output file when the
+`<task-notification>` prompt on the main thread only, `SubagentStop` (which kills a
+foreground subagent's tasks; a background subagent's survive it, §5.6g), and the status line Claude Code appends to the task's output file when the
 task ends, by any route. A subagent's task that ends while the subagent works on raises **no
 hook at all**: its notification goes into the subagent's context. That is the earbrief case
 exactly, and only the output file sees it.
@@ -1804,21 +1821,102 @@ What it keeps:
 
 - **The 30 s tentative TTL still does its job (GOV-09).** A spawn that never happened returns
   its slot at 30 s as before. Only the zero-weight record waits.
-- **A resumed subagent is still ungoverned (§4.3).** A confirm with nothing pending and nothing
-  lapsed answers `no_pending_lease` exactly as before.
+- **A confirm with nothing to bind still answers `no_pending_lease` (§4.3)** when nothing is
+  pending, nothing is lapsed, and the `agent_id` was never confirmed here. A *woken* subagent,
+  whose `agent_id` was, is GOV-B56's case (§5.6g).
 - **Lapses are per session.** One session's confirm never claims another's.
 - **A lapse goes when its session goes**: SessionEnd, or the reaper finding the session dead.
 
 What it risks, accepted: within a session, a confirm that should have found nothing — a
-subagent woken by its own background task (`hook-surface.md` §28.4 consequence 6), or a spawn
-the classifier refused after its gate granted — can claim a lapse left by another spawn. That
-governs a subagent that is running and would otherwise run free. Its `SubagentStop`, or the
+subagent the daemon never confirmed, or a spawn the classifier refused after its gate granted —
+can claim a lapse left by another spawn. (A subagent woken by its own background task was this
+section's first example; since GOV-B56 it is matched by its `agent_id` before the lapses are
+consulted, §5.6g.) Claiming one governs a subagent that is running and would otherwise run
+free. Its `SubagentStop`, or the
 confirmed TTL, releases it. The budget can be exceeded by a reinstated lease, by at most one
 lease per spawn the gate already admitted, which is what an on-time confirm would have held.
 
 `TestAConfirmLaterThanTheTentativeTTLStillLeasesEverySpawn` replays the 18:13 burst against
 the real 30 s TTL with the reaper ticking every 2 s. Before this change, 2 of its 3 subagents
 end up leased. `TestALateConfirmReinstatesTheLapsedLease` checks the same over the wire.
+
+### 5.6g A background subagent woken by its own task (GOV-B56, decided 2026-11-23)
+
+**The question.** §28.4 consequence 6 found a subagent whose later `SubagentStart`s were all
+answered `no_pending_lease`. GOV-B56 asked what those starts are, what released the lease
+before them, and whether the subagent should be governed after them.
+
+**Measured (`hook-surface.md` §29).** A background subagent fires `SubagentStop` every time it
+ends a turn. A background task it left running survives that stop, and the task's end wakes it
+with a `SubagentStart` for the same `agent_id` and no `PreToolUse`. 17 of the machine's 130
+background subagents did this, 36 times, and every one of those wakes ran unleased: 1.5 hours
+of subagent work in all, idle gaps of p50 129 s and up to 71 min. None of the 245 foreground
+subagents ever did.
+
+**The cause (clause 2): the idle `SubagentStop` released the lease, by `agent_id`.** It was not
+the confirmed-TTL reaper and not a new `agent_id`. Confirm was already idempotent per
+`agent_id`: a wake that found its lease still live would have been a no-op. In `a3a16c4a` the
+release answered `ok=true` at 20:26:55 and the wake 28 s later found nothing.
+
+**The second half: the same stop released the subagent's backgrounded builds.** GOV-B41 drops
+them at `SubagentStop` because §26 measured that a subagent's tasks are killed then. That was a
+measurement of foreground subagents. A background subagent's tasks run on (S1, S2: 40 of 40
+heartbeats), so its builds were being released early, at its first idle stop, while still
+burning CPU.
+
+**What a hook can tell apart.** A background subagent lists *itself* in its `SubagentStop`'s
+`background_tasks` (`type: "subagent"`, `id` its own `agent_id`); a foreground one does not.
+The tasks listed beside it as `running` are the ones that will wake it. Its final stop lists
+itself too, so nothing marks a stop as the last one.
+
+**The options for the agent lease, and what each costs:**
+
+| | A woken subagent | An idle subagent | The final stop |
+|---|---|---|---|
+| **leave it ungoverned, like §4.3's "never confirmed"** | runs unleased, 1.5 h measured | holds nothing (correct) | releases (correct) |
+| **keep the lease across a stop that lists a running task** | already leased (correct) | holds 0.08 slot for up to 71 min while using no CPU | releases only when no task is listed. A wake from anything else (a `Monitor`, §29.6) after a stop listing nothing would still be unleased |
+| **keep the lease across every background subagent's stop** | already leased | as above | **never releases**: the final stop lists itself like an idle one. Left to the reaper, and §5.6e renews a lease whose subagent is still writing |
+| **release at every stop; lease again on a wake of a known `agent_id`** | leased from the wake on, unadmitted | holds nothing (correct) | releases (correct). The record of the `agent_id` holds no weight and goes with the session |
+
+**Decided: release at every stop, and lease a known `agent_id` again on its wake.**
+
+- **The table remembers every `agent_id` it confirmed in a session**, with the request its lease
+  was granted on. No weight. It goes when the session goes (SessionEnd, or the reaper finding
+  the session dead), as lapses do.
+- **Confirm tries, in order:** a live lease for this `agent_id` (the existing no-op); a pending
+  lease a `SendMessage` resume took for this `agent_id`; a wake of a known `agent_id`, minted
+  from its earlier request; the FIFO; a lapse (§5.6f); nothing.
+- **A wake never pops the FIFO.** Every pending lease there was admitted for a spawn that has
+  not started yet. Taking one would leave that spawn to start unleased, which is the bug in
+  another place. `TestAWakeDoesNotTakeTheLeaseOfASpawnStillToStart` failed on 7b9b169 for
+  exactly this.
+- **A wake is not admitted again.** `SubagentStart` cannot refuse anything, and the subagent is
+  already running. It holds what its first confirm held, so a wake can take the budget over by
+  one agent lease (0.08 slot), as a late confirm can.
+- **A `SendMessage` resume names its target.** The gate sends `resume: <to>` on that acquire
+  (§7). Its tentative lease is bound to that `agent_id`'s confirm, and FIFO passes over it, so
+  a resume of a known agent does not leave an orphaned pending lease beside a minted one. An
+  older gate sends no `resume`; then a resume of a known agent is minted as a wake, and its
+  untargeted pending lease is taken by the next spawn's confirm or lapses at 30 s.
+- **The reply says `ok=true reason="wake"`**, which lands in the subagent's transcript, and
+  `daemon.log` gets `budget confirm-wake session=... lease=... agent=...`.
+
+**For the backgrounded builds:** the `release` hook reads `background_tasks`. When it lists the
+stopping agent itself, it sends `background_agent: true` and the ids listed as `running`, and the
+daemon keeps those of the agent's background build leases. They are released by the task-file
+check of §5.6c when the task ends, or by a later stop that no longer lists them, or by the TTL.
+A foreground subagent's stop sends `background_agent: false`, and its builds are released as
+GOV-B41 decided. A stop without `background_tasks` (an older Claude Code) is the foreground case.
+
+**Why not treat a woken subagent like §4.3's ungoverned resume?** That case was never a
+choice: a subagent the daemon has no record of offers nothing to bind. A woken one does, its
+`agent_id`, and leaving it free would leave the one long-running shape this machine measured
+(an agent waiting on its own build, then testing) ungoverned for most of its life.
+
+`TestABackgroundSubagentWokenByItsOwnTaskIsLeasedAgain` replays `a3a16c4a`'s three idle/wake
+cycles with the reaper ticking, and fails on 7b9b169 at the first wake.
+`TestABackgroundSubagentIsLeasedAgainWhenItsTaskWakesIt` drives the measured S1 payloads
+through the real hooks, a backgrounded build included.
 
 ## 6. Allocation
 
@@ -2066,6 +2164,13 @@ per connection. Deliberately boring — this is a hot path.
 // -> acquire
 {"v":1,"op":"acquire","principal":{"user":"peter","team":null},
  "session":"abc123","tool_use_id":"toolu_01...","depth":0,"wait_ms":20000}
+// -> acquire for a SendMessage resume (GOV-B56, §5.6g). `resume` is the agent_id it targets,
+//    so the lease is bound to that agent's confirm and FIFO passes over it. Sent only for a
+//    SendMessage whose `to` has the agent_id shape. Additive: an older daemon ignores it and
+//    binds FIFO; a daemon reading an older gate gets "" and binds FIFO.
+{"v":1,"op":"acquire","principal":{"user":"peter","team":null},
+ "session":"abc123","tool_use_id":"toolu_01...","depth":0,"wait_ms":20000,"tool":"SendMessage",
+ "kind":"agent","slots":0.08,"resume":"ab6d25847dc0e2b9f"}
 // <- granted
 {"v":1,"ok":true,"lease":"L-0d41","budget":6,"in_use":4,"share":2,"source":"local"}
 // <- waiting (GOV-08: interim, sent immediately when the daemon parks the request;
@@ -2100,8 +2205,18 @@ per connection. Deliberately boring — this is a hot path.
 // -> confirm
 {"v":1,"op":"confirm","session":"abc123","lease":"L-0d41","agent_id":"ag_77",
  "pid":48213,"pid_started_at":1757212800}
+// <- confirmed. `reason` is "" on time, "late" for a reinstated lapse (§5.6f), "wake" for a
+//    subagent this session already governed, woken after an idle stop released it (§5.6g).
+//    Nothing to bind answers ok=false reason="no_pending_lease".
+{"v":1,"ok":true,"reason":"wake","lease":"L-0d42","in_use":2}
 // -> release
 {"v":1,"op":"release","session":"abc123","agent_id":"ag_77"}
+// -> release from a BACKGROUND subagent's SubagentStop (GOV-B56, §5.6g). `background_agent`
+//    says its background_tasks listed the agent itself; `running` is the task ids listed
+//    running beside it, whose background build leases are kept. Both additive: an older hook
+//    sends neither and every background build of the agent is released, as before.
+{"v":1,"op":"release","session":"abc123","agent_id":"ag_77","background_agent":true,
+ "running":["br8i8xjdp"]}
 // -> finish (a Build lease, keyed by the tool_use_id its acquire carried). `hook_event` is
 //    PostToolUse or PostToolUseFailure, for the daemon's release log only (GOV-B29): never
 //    acted on, read from a closed set, and absent from an older hook, which is logged as
@@ -2821,9 +2936,13 @@ Named so they are not mistaken for settled:
 - The default hook timeout's true ceiling (only that it exceeds 150 s).
 - Whether interactive `default` mode, `plan` or `dontAsk` hold a message's tools until it
   ends, as `auto` does (`hook-surface.md` §28.6). Confirm-late covers it either way.
-- A subagent woken by its own background task fires `SubagentStart` again and is answered
-  `no_pending_lease` (`hook-surface.md` §28.4 consequence 6). How often, and whether it should
-  be governed, is not yet measured.
+- Whether a background subagent can be woken by something other than a background task's
+  end (a `Monitor` event, say) after a `SubagentStop` that listed no running task
+  (`hook-surface.md` §29.6). Such a wake is still leased if its `agent_id` was confirmed
+  before (§5.6g); only its builds' handling at the stop before it would be wrong.
+- Whether a background subagent's `background_tasks` can list another agent's tasks. Every
+  probe ran one subagent. `release` keeps only tasks of leases the stopping agent started, so
+  a foreign id in the list keeps nothing.
 - Whether `SubagentStart` fires for a subagent restored by session resume.
 - Whether a user **declining the permission prompt interactively** behaves like the refusal
   §25 measured headlessly: there, a `Bash` call refused permission raised `PreToolUse` and
@@ -2832,10 +2951,9 @@ Named so they are not mistaken for settled:
 - What `PostToolUseFailure` does for a command the user **interrupts** (`is_interrupt: true`).
   `finish` releases on it, which is correct only if an interrupted command is also killed.
 - Whether the `backgroundTaskId` discriminator of §19.3 holds for tools other than `Bash`.
-- Whether `SubagentStop` kills the background tasks of an agent that is later resumed with
-  `SendMessage` (§26 measured only agents that were never resumed). If it does not, a resumed
-  agent's backgrounded build is released at its first stop while still running. The task-file
-  check would not catch that, because it only ever releases.
+- Whether `SubagentStop` kills the background tasks of a **foreground** agent that is later
+  resumed with `SendMessage` (§26 measured only agents that were never resumed). For a
+  *background* agent it does not (`hook-surface.md` §29), and §5.6g keeps those leases.
 - Several `<task-notification>`s in one prompt. Every one observed arrived alone; `settle`
   reads every `<tool-use-id>` regardless.
 - A background task's output-file layout anywhere but `/tmp/claude-<uid>`, and on Linux at all.
@@ -2844,6 +2962,16 @@ Named so they are not mistaken for settled:
   resumed with `SendMessage` (hook-surface.md §27.4). All 370 on this machine are depth 1.
   `Working` reads "not found" as "not working", so the cost of being wrong is today's TTL.
 - Linux: every measurement above is macOS. Re-run the probe on Linux before trusting §10 there.
+
+**No longer on this list, measured 2026-11-23 on 2.1.331 (probes) and 2.1.316 to 2.1.330
+(transcripts) for GOV-B56** (`hook-surface.md` §29): a subagent woken by its own background task
+is a **background** subagent (`run_in_background: true` on its `Agent` call). It fires
+`SubagentStop` each time it ends a turn; its background tasks survive that stop; and a task's end
+wakes it with a `SubagentStart` for the same `agent_id`, a new `prompt_id`, and no `PreToolUse`.
+Its `SubagentStop` lists the agent itself in `background_tasks`, idle or final; a foreground
+subagent's never does. 36 of 37 wakes on this machine were of this kind, all unleased before
+§5.6g. None of 245 foreground subagents was ever woken. In `-p` with no held-open stdin the wake
+never happens.
 
 **No longer on this list, measured 2026-11-23 on 2.1.331 for GOV-B55** (`hook-surface.md`
 §28): the `PreToolUse`/`SubagentStart` interleaving does not hold in `auto` permission mode.
