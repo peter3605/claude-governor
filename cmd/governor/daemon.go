@@ -1302,6 +1302,9 @@ func (d *daemon) step(s signals.Sample, demand, inUse bool, away time.Duration) 
 			Stale:         !fresh,
 			SwapIn:        swapIn,
 			SwapInKnown:   s.SwapInKnown,
+			PClockKnown:   s.PClock.Known,
+			PClockActive:  s.PClock.Active,
+			PClockFrac:    s.PClock.Frac,
 		})
 		// Formatted under the lock, because it reads the controller. Written after it,
 		// because liveBudget takes this lock on every acquire and a file write does not

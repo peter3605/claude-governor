@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/peter3605/claude-governor/internal/budget"
 	"github.com/peter3605/claude-governor/internal/signals"
 	"github.com/peter3605/claude-governor/internal/trace"
 )
@@ -82,5 +83,19 @@ func TestAnUnknownClockIsAbsentFromTheTrace(t *testing.T) {
 	raw, _ = json.Marshal(s)
 	if !strings.Contains(string(raw), `"p_mhz":1850`) || !strings.Contains(string(raw), `"p_top_mhz":3204`) {
 		t.Errorf("known clock not recorded: %s", raw)
+	}
+}
+
+// A clock cut is logged with the windowed clock it was judged on and the level it cut under,
+// so a reader of daemon.log can check it against the trace like any other cut.
+func TestAClockCutIsLoggedWithItsReading(t *testing.T) {
+	c := &budget.Controller{Max: 3}
+	from := c.Budget()
+	for i := 0; i < 40 && c.Moved() != budget.MovedClock; i++ {
+		c.Step(budget.Reading{RunQueue: 0.2, InUse: true, PClockKnown: true, PClockActive: 1, PClockFrac: 0.6})
+	}
+	line := budgetLine(from, c.Budget(), c.Moved(), c, 0.2, "nominal", 3)
+	if !strings.HasPrefix(line, "cut 3->1 cause=clock p_frac=0.") || !strings.Contains(line, "cut=0.78 ceiling=3") {
+		t.Errorf("clock cut logged as %q", line)
 	}
 }
