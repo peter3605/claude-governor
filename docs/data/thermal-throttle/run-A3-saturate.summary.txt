@@ -1,0 +1,13 @@
+window          2026-11-27T20:46:27Z .. 2026-11-27T21:16:27Z (30m0s)
+intervals       1776 powermetrics, 1774 busy P-cluster (residency >= 95%), 0 without a governor sample
+P-cluster       reference 2988 MHz (nominal max 3204), lowest sustained 1823 MHz, 1735 busy seconds under the cut
+first vs last   P 2297 -> 1837 MHz   kernel_task 56.8 -> 67.8 ms/s   loadavg1 11.7 -> 41.7
+pressure (pm)   Nominal=1776
+thermal (gov)   nominal=1776
+budget          1=114 3=1662
+verdict         THROTTLES: busy P-cluster under 2689 MHz (90% of 2988) from 39s, confirmed by 1m10s, bottoming at 1823 MHz (61% of the reference)
+probe           1800 readings, 1773 joined to busy seconds, 100% of those on a P-core
+probe vs pm     median error +0 MHz, median |error| 2 MHz, correlation 0.995 over 1773 seconds
+probe cost      mean 0.23% of a core, max 0.38%  (sampler budget: 1%)
+probe verdict   TRACKS: probe under 90% of its 3204 MHz reference from 27s, confirmed by 59s (powermetrics: 39s, 1m10s)
+probe temp      1773 busy seconds; 62.5 C at start, 98.6 C at first below, 97.1 C at confirmed, peak 100.0 C; correlation with pm frequency -0.083

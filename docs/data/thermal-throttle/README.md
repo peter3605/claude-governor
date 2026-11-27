@@ -1,4 +1,4 @@
-# Thermal throttle measurements (GOV-B54)
+# Thermal throttle measurements (GOV-B54, GOV-B60)
 
 Analysed in `docs/design.md` §5.3. M1 MacBook Air (MacBookAir10,1), macOS 25E253, 2026-11-27.
 
@@ -9,6 +9,8 @@ Analysed in `docs/design.md` §5.3. M1 MacBook Air (MacBookAir10,1), macOS 25E25
 | `run-B-fanout.*` | 4 workers looping cold `go build` + `go test`, 06:53:04Z – 07:24:19Z |
 | `run-A2-saturate.*` | 8× FP spin with `tools/clockprobe` alongside, 07:51:08Z – 08:21:08Z |
 | `probe-A2.jsonl` | clockprobe's output for run A2 (calibration record, then one reading a second) |
+| `run-A3-saturate.*` | 8× FP spin with `tools/clusterwatch` alongside, 20:46:27Z – 21:16:27Z (GOV-B60) |
+| `watch-A3.jsonl` | clusterwatch's output for run A3 (IOReport P-cluster clock and IOHID P-cluster temperature, one reading a second) |
 
 `*.tsv` is one row per `powermetrics` second joined to the governor's nearest 1 Hz sample
 (`throttlecheck -tsv`); `*.summary.txt` is `throttlecheck`'s verdict. The raw `powermetrics`

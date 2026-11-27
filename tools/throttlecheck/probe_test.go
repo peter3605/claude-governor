@@ -2,6 +2,7 @@ package main
 
 import (
 	"math"
+	"strings"
 	"testing"
 	"time"
 )
@@ -80,5 +81,41 @@ func TestIdleSecondsAreNotScored(t *testing.T) {
 	ps := probesFor(rows, func(int, float64) (string, float64) { return "P", 1000 })
 	if sc := scoreProbe(rows, ps, defaultThresholds); sc.Joined != 0 || sc.ProbeThrottled {
 		t.Errorf("idle seconds were scored: %+v", sc)
+	}
+}
+
+// A temperature is scored against the clock's drop, not as a clock: a sensor that heats as
+// the P-cluster slows reads strongly negative, and the report gives its value at the drop.
+func TestATemperatureIsScoredAgainstTheDrop(t *testing.T) {
+	rows := busyRun(runAShape(900))
+	s := analyse(rows, defaultThresholds, 3204)
+	ps := probesFor(rows, func(i int, pm float64) (string, float64) { return "P", pm })
+	for i := range ps {
+		c := 40 + (2988-rows[i].PFreqMHz)/20 // 40 C cool, about 104 C at the 1700 floor
+		ps[i].PTempC = &c
+	}
+	sc := scoreProbe(rows, ps, defaultThresholds)
+	if len(sc.Temps) != 900 || sc.TempCorr > -0.999 {
+		t.Fatalf("%d temperatures, correlation %.3f; want 900 and about -1", len(sc.Temps), sc.TempCorr)
+	}
+	if c := tempNear(sc.Temps, s.FirstBelow); c < 50 || c > 60 {
+		t.Errorf("temperature at first below %.1f C, want the ~55 C the shape gives there", c)
+	}
+	var b strings.Builder
+	printProbe(&b, sc, s)
+	if !strings.Contains(b.String(), "probe temp") {
+		t.Errorf("no temperature line in:\n%s", b.String())
+	}
+}
+
+// A probe with no temperature prints no temperature line, rather than a line of zeros.
+func TestNoTemperatureNoLine(t *testing.T) {
+	rows := busyRun(runAShape(300))
+	s := analyse(rows, defaultThresholds, 3204)
+	sc := scoreProbe(rows, probesFor(rows, func(int, float64) (string, float64) { return "P", 2988 }), defaultThresholds)
+	var b strings.Builder
+	printProbe(&b, sc, s)
+	if strings.Contains(b.String(), "probe temp") {
+		t.Errorf("temperature line without temperatures:\n%s", b.String())
 	}
 }
