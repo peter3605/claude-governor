@@ -1,0 +1,12 @@
+window          2026-11-27T07:51:08Z .. 2026-11-27T08:21:08Z (30m0s)
+intervals       1776 powermetrics, 1775 busy P-cluster (residency >= 95%), 0 without a governor sample
+P-cluster       reference 2988 MHz (nominal max 3204), lowest sustained 1538 MHz, 1751 busy seconds under the cut
+first vs last   P 2085 -> 1558 MHz   kernel_task 31.0 -> 38.9 ms/s   loadavg1 10.0 -> 15.5
+pressure (pm)   Moderate=273 Nominal=1503
+thermal (gov)   fair=273 nominal=1503
+budget          3=1776
+verdict         THROTTLES: busy P-cluster under 2689 MHz (90% of 2988) from 24s, confirmed by 1m0s, bottoming at 1538 MHz (51% of the reference)
+probe           1800 readings, 1774 joined to busy seconds, 1% of those on a P-core
+probe vs pm     median error +90 MHz, median |error| 126 MHz, correlation 0.844 over 21 seconds
+probe cost      mean 0.50% of a core, max 0.61%  (sampler budget: 1%)
+probe verdict   MISSED: powermetrics saw a throttle the probe did not

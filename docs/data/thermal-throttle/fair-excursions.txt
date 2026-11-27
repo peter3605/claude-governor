@@ -1,0 +1,31 @@
+# Every non-nominal thermalState excursion in ~/.claude/governor/samples.jsonl.gz
+# (1,637,748 samples, 2026-09-08T17:26:58Z .. 2026-11-01T19:29:53Z; 20,185 fair, 0 serious/critical).
+# Excursions split on a >30 s gap. cpu/rq are means over the excursion; 'before' is the 600 samples preceding it.
+# Produced by GOV-B54 step 0. Longest first.
+2026-09-08T17:33:33.578894Z   116.7 min  n= 6983  cpu=0.99  rq=20.53  rqmax=47.11  | 10min-before cpu=0.82 rq=1.27
+2026-09-24T01:38:06.111277Z    94.8 min  n= 5681  cpu=0.64  rq=3.92  rqmax=21.36  | 10min-before cpu=0.73 rq=2.35
+2026-09-08T19:34:27.869124Z    29.5 min  n= 1738  cpu=0.87  rq=13.96  rqmax=49.23  | 10min-before cpu=1.00 rq=45.39
+2026-09-16T03:26:16.207533Z    25.5 min  n= 1516  cpu=0.77  rq=5.17  rqmax=23.90  | 10min-before cpu=0.73 rq=2.34
+2026-09-14T05:01:37.154838Z    12.2 min  n=  732  cpu=0.39  rq=0.98  rqmax=4.30  | 10min-before cpu=0.39 rq=0.53
+2026-09-20T22:28:31.338079Z    10.8 min  n=  650  cpu=0.44  rq=1.03  rqmax=2.48  | 10min-before cpu=0.47 rq=0.90
+2026-09-20T22:50:08.343081Z     9.9 min  n=  595  cpu=0.38  rq=0.77  rqmax=1.38  | 10min-before cpu=0.35 rq=0.71
+2026-09-24T03:14:41.437534Z     7.4 min  n=  443  cpu=0.54  rq=3.14  rqmax=11.56  | 10min-before cpu=0.52 rq=2.15
+2026-09-24T03:26:14.388498Z     6.9 min  n=  417  cpu=0.56  rq=3.52  rqmax=13.84  | 10min-before cpu=0.54 rq=2.78
+2026-09-20T23:28:30.419766Z     4.7 min  n=  282  cpu=0.46  rq=0.70  rqmax=1.03  | 10min-before cpu=0.47 rq=0.84
+2026-09-14T05:16:20.079815Z     3.9 min  n=  229  cpu=0.48  rq=6.85  rqmax=12.14  | 10min-before cpu=0.44 rq=1.84
+2026-11-01T19:15:53.159568Z     3.4 min  n=  206  cpu=0.42  rq=0.84  rqmax=1.34  | 10min-before cpu=0.41 rq=1.37
+2026-09-24T03:38:07.345097Z     3.1 min  n=  188  cpu=0.51  rq=4.38  rqmax=9.74  | 10min-before cpu=0.56 rq=2.53
+2026-10-15T21:30:51.315037Z     2.6 min  n=   75  cpu=0.38  rq=2.24  rqmax=3.87  | 10min-before cpu=0.30 rq=0.53
+2026-09-20T23:23:45.428785Z     2.4 min  n=  143  cpu=0.36  rq=0.96  rqmax=1.56  | 10min-before cpu=0.52 rq=0.96
+2026-09-08T19:31:31.402307Z     1.6 min  n=   88  cpu=1.00  rq=48.73  rqmax=49.25  | 10min-before cpu=1.00 rq=44.80
+2026-09-14T04:56:04.192033Z     1.5 min  n=   90  cpu=0.28  rq=0.65  rqmax=0.94  | 10min-before cpu=0.41 rq=0.52
+2026-09-20T22:23:10.346657Z     1.4 min  n=   87  cpu=0.28  rq=0.62  rqmax=0.88  | 10min-before cpu=0.42 rq=0.78
+2026-11-01T18:46:24.634251Z     0.9 min  n=   34  cpu=0.27  rq=0.68  rqmax=0.73  | 10min-before cpu=0.35 rq=0.60
+2026-10-27T21:31:49.854159Z     0.0 min  n=    1  cpu=0.71  rq=1.53  rqmax=1.53  | 10min-before cpu=0.48 rq=1.10
+2026-10-24T02:57:59.651986Z     0.0 min  n=    1  cpu=0.58  rq=3.24  rqmax=3.24  | 10min-before cpu=0.27 rq=0.54
+2026-10-15T19:52:16.691205Z     0.0 min  n=    1  cpu=0.26  rq=0.53  rqmax=0.53  | 10min-before cpu=0.26 rq=0.38
+2026-09-22T21:02:55.303793Z     0.0 min  n=    1  cpu=0.55  rq=5.58  rqmax=5.58  | 10min-before cpu=0.51 rq=9.64
+2026-09-17T23:37:17.844288Z     0.0 min  n=    1  cpu=0.78  rq=4.34  rqmax=4.34  | 10min-before cpu=0.46 rq=0.96
+2026-09-17T01:33:13.33705Z     0.0 min  n=    1  cpu=0.49  rq=3.67  rqmax=3.67  | 10min-before cpu=0.34 rq=0.59
+2026-09-16T19:35:39.541061Z     0.0 min  n=    1  cpu=0.35  rq=2.05  rqmax=2.05  | 10min-before cpu=0.51 rq=1.26
+2026-09-13T21:45:52.553403Z     0.0 min  n=    1  cpu=0.62  rq=6.03  rqmax=6.03  | 10min-before cpu=0.40 rq=1.05
