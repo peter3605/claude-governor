@@ -120,7 +120,10 @@ type statusResponse struct {
 	// daemon started without one.
 	CPU     *float64        `json:"cpu"`
 	Thermal signals.Thermal `json:"thermal"`
-	Sources []sourceStat    `json:"sources"`
+	// PClock is the P-cluster clock (GOV-B61); nil from a daemon older than that story, and
+	// then nothing is printed for it rather than a guess.
+	PClock  *pclockStatus `json:"p_clock,omitempty"`
+	Sources []sourceStat  `json:"sources"`
 	// The governance fields (GOV-29). A daemon from before that story sends none of them,
 	// which reads as SessionsKnown false — "this daemon cannot tell me" — and every consumer
 	// then says nothing rather than guessing. That is the whole reason they are additive

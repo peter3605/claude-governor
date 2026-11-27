@@ -81,6 +81,10 @@ type hostSampler struct {
 	swapIn   uint64
 	swapAt   time.Time
 	swapSeen bool
+
+	// pclock reads the P-cluster clock. Built on the first Sample rather than at construction,
+	// so a sampler that is made and never ticked never touches IOReport.
+	pclock *pclock
 }
 
 // NewSampler returns a Sampler for this host.
@@ -261,6 +265,10 @@ func (s *hostSampler) Sample(ctx context.Context) (Sample, error) {
 		}
 	}
 	out.SwapInBytesPerSec, out.SwapInKnown = s.swapRate(ctx, start)
+	if s.pclock == nil {
+		s.pclock = newPClock(newPClockSource())
+	}
+	out.PClock = s.pclock.next()
 	out.Tree, out.TreeFresh = s.treeCached(ctx, start)
 
 	out.CostMS = float64(time.Since(start).Microseconds()) / 1000
