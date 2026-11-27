@@ -1,0 +1,8 @@
+window          2026-11-27T06:53:04Z .. 2026-11-27T07:24:19Z (31m15s)
+intervals       1851 powermetrics, 854 busy P-cluster (residency >= 95%), 0 without a governor sample
+P-cluster       reference 3071 MHz (nominal max 3204), lowest sustained 2566 MHz, 320 busy seconds under the cut
+first vs last   P 2854 -> 2775 MHz   kernel_task 94.7 -> 98.4 ms/s   loadavg1 11.8 -> 7.4
+pressure (pm)   Nominal=1851
+thermal (gov)   nominal=1851
+budget          3=1851
+verdict         THROTTLES: busy P-cluster under 2764 MHz (90% of 3071) from 4m5s, confirmed by 4m51s, bottoming at 2566 MHz (84% of the reference)

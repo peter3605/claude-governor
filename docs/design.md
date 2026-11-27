@@ -1165,6 +1165,75 @@ GOV-15 the thing that determines whether the governor is any good. Do not tune t
 expecting thermal to intervene, and do not read a steady `nominal` as evidence the machine is
 comfortable. One machine, one run — but the direction is clear enough to design against.
 
+**It throttles, and nothing the governor reads can see it (GOV-B54, measured 2026-11-27).**
+GOV-13 established that `thermalState` does not move. It did not establish whether the chip
+slows down anyway, which is the question that matters for a budget. GOV-B54 answered it with
+`powermetrics` run by hand under `sudo` as a **one-off instrument** — never by the product, which
+the no-sudo rule still forbids — next to the governor's own 1 Hz trace, on the same fanless M1
+Air (4 P-cores at 2988 MHz all-core / 3204 single-core, 4 E-cores capped at 2064).
+`tools/throttlecheck` joins the two and calls a throttle when a 60-second median of the busy
+P-cluster's frequency stays below 90% of its opening peak. Per-second rows and summaries are
+in `docs/data/thermal-throttle/`.
+
+| Run | Load | P-cluster | First under 90% | `thermalState` | `kernel_task` | Budget |
+|---|---|---|---|---|---|---|
+| Idle | none, 60 s | 7% busy | — | nominal | 28 ms/s | 3 |
+| A | GOV-13's 8× FP spin, 30 min | 2988 → **1682 MHz (56%)** | 17 s, confirmed 1 min | nominal for 23m51s, then `fair`; never `serious` | 22–34 ms/s, flat | 3 throughout |
+| A2 | the same, repeated with the probe, 30 min | 2988 → **1538 MHz (51%)** | 24 s, confirmed 1 min | nominal for 25m24s, then `fair` | 31 → 39 ms/s | 3 throughout |
+| B | 4 workers looping cold `go build` + `go test`, 31 min | bursts dip to ~2550 (84%) and recover | 4m5s | nominal throughout | 55–125 ms/s, follows the bursts | 3 throughout |
+
+What that says:
+
+- **The throttle is real, fast and deep.** Under saturation the P-cluster is below 90% within
+  half a minute and at about 1700 MHz by minute seven: the four P-cores deliver roughly 56% of
+  their cool throughput for the rest of the run. The E-cluster held 2064 MHz throughout; it is
+  the P-cluster that is cut.
+- **`thermalState` lags it by ~24 minutes and never reaches the cut level.** `fair` arrived 24–25
+  minutes into each saturating run; `serious`, the level §5.2 floors on, never came. The
+  archived trace (1.64 M samples, Sep 8 – Nov 1) has 20,185 `fair` samples and zero
+  `serious` or `critical` (`fair-excursions.txt`). GOV-03's 150-minute `fair` excursion is the
+  same phenomenon, not noise: it sat on two hours of cpu 0.99 and run queue 8–45.
+- **It is clock scaling, not stolen CPU.** `kernel_task` did not rise under the saturating runs
+  (22–39 ms/s against 28 idle), so the thermal response here is DVFS, not `kernel_task`
+  occupying cores. Nothing extra shows up in loadavg or the run queue, and CPU utilisation reads
+  0.998 whether a core is at 2988 MHz or 1682: **a throttled core is still a busy core**, so
+  none of §5.2's inputs can see the loss. In run A the run queue stayed 1.4–4.6 against a cut at
+  5.07, so the budget never moved off 3.
+- **A real build fan-out throttles mildly.** Cold builds are bursty (mean CPU 0.40); bursts
+  pull the busy P-cluster from ~2970 to ~2550 MHz and it recovers between them. This is the
+  load the governor actually manages, and the cost there is about 15% in the bursts, not 45%.
+
+Done-when clause 2 asked for a sudo-free signal to be evaluated against the same run. The
+candidate was `tools/clockprobe`: once a second, a user-interactive-QoS thread spins 2 ms to be
+moved to a P-core, then times a 3-cycle-per-iteration integer chain in thread CPU time (an
+absolute clock reading, immune to scheduling contention) and a 16-lane FP block whose ratio to
+the chain says which kind of core ran it (P 0.084, E 0.167, whatever the clock). Against run
+A2 it **missed the throttle**:
+
+- **Its readings are right when it lands on a P-core.** The 21 it got during the load ran
+  2987 → 2387 → 1943 → 1728 → 1500 MHz, on the M1's actual P-cluster frequency steps, tracking
+  `powermetrics` (median error +90 MHz).
+- **It almost never lands there under load.** 21 of 1,801 ticks (1%) reached a P-core; the
+  rest ran on E-cores and read a flat 2063 MHz. Even idle the spin won only 39% of ticks before
+  the load and 13% after it. With eight threads holding the four P-cores the scheduler keeps a
+  once-a-second thread on the E-cluster whatever its QoS, and macOS gives unprivileged code no
+  affinity call to override it. This is the trap the story named: the probe cannot control its
+  placement, so it is blind exactly when it would matter.
+- **Cost was within budget** — mean 0.50% of a core, max 0.61%, against the sampler's 1%.
+
+The private IOReport (per-cluster frequency-state residency) and IOHID (die temperature
+sensors) interfaces need no sudo and no placement, and were **not evaluated**. They are the
+follow-up's candidates, and being private frameworks, any use of them must fail open to
+"unknown".
+
+**Consequence.** The thermal trigger is unchanged: it still floors at `serious`, and on this
+chassis that is effectively never. The governor's budget does not account for a P-cluster
+running at half speed after the first minute of sustained load — it will grant the same
+concurrency to a machine delivering 56% of its throughput. That is a real gap, but no
+sudo-free signal measured here closes it, and wiring one is a separate story. Reproduce with
+`tools/clockprobe`, `sudo powermetrics -i 1000 --samplers cpu_power,thermal,tasks` and
+`go run ./tools/throttlecheck -pm … -marks … -run … [-probe …]`.
+
 **The cgo constraint has a release consequence.** `CGO_ENABLED=0` on darwin builds cleanly and
 is thermally blind — it reports `unknown` on a Mac, silently, and looks precisely like a cool
 machine. `make cross` builds exactly that binary, because a local cross-compile cannot link
