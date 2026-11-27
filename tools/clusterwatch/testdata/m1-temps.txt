@@ -1,0 +1,57 @@
+PMU tdev8	29.31
+gas gauge battery	24.00
+PMU tdev7	29.43
+GPU MTR Temp Sensor1	30.00
+PMU2 tdie4	36.00
+NAND CH0 temp	29.00
+PMU tdev4	30.95
+PMGR SOC Die Temp Sensor1	29.78
+PMU2 tdie8	36.22
+PMU2 tcal	51.85
+PMU tdev1	-21.64
+pACC MTR Temp Sensor2	41.25
+gas gauge battery	25.00
+pACC MTR Temp Sensor7	30.22
+PMGR SOC Die Temp Sensor0	29.42
+PMU2 tdie1	36.00
+PMU2 tdev4	30.26
+PMU tdie1	35.25
+PMU2 tdie5	34.50
+SOC MTR Temp Sensor2	30.14
+PMU tdev5	30.86
+PMU2 tdev1	-21.52
+pACC MTR Temp Sensor3	29.25
+PMU TP3w	34.72
+PMU tdev2	-21.64
+PMU2 tdie2	36.43
+eACC MTR Temp Sensor3	30.53
+PMU tdev3	29.10
+pACC MTR Temp Sensor8	31.27
+PMU tdie4	33.64
+gas gauge battery	25.20
+ISP MTR Temp Sensor5	30.00
+PMU2 tdie6	35.68
+PMU tdev6	-21.76
+PMU2 tdev2	29.38
+PMGR SOC Die Temp Sensor2	31.44
+PMU tdie8	32.57
+PMU tdie6	34.40
+PMU tdie5	33.64
+gas gauge battery	25.20
+PMU tdie2	33.43
+gas gauge battery	24.30
+gas gauge battery	25.20
+SOC MTR Temp Sensor1	26.92
+pACC MTR Temp Sensor9	26.78
+PMU2 tdie3	34.93
+PMU tdie7	34.40
+eACC MTR Temp Sensor0	31.00
+ANE MTR Temp Sensor1	30.00
+pACC MTR Temp Sensor4	37.33
+pACC MTR Temp Sensor5	31.88
+PMU2 tdie7	35.15
+PMU tcal	51.85
+GPU MTR Temp Sensor4	30.00
+PMU2 tdev3	-21.61
+PMU2 tdev5	29.52
+SOC MTR Temp Sensor0	25.55

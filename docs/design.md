@@ -1222,17 +1222,63 @@ A2 it **missed the throttle**:
 - **Cost was within budget** — mean 0.50% of a core, max 0.61%, against the sampler's 1%.
 
 The private IOReport (per-cluster frequency-state residency) and IOHID (die temperature
-sensors) interfaces need no sudo and no placement, and were **not evaluated**. They are the
-follow-up's candidates, and being private frameworks, any use of them must fail open to
-"unknown".
+sensors) interfaces need no sudo and no placement, and were not evaluated by GOV-B54; GOV-B60
+evaluated both, below.
 
-**Consequence.** The thermal trigger is unchanged: it still floors at `serious`, and on this
-chassis that is effectively never. The governor's budget does not account for a P-cluster
-running at half speed after the first minute of sustained load — it will grant the same
-concurrency to a machine delivering 56% of its throughput. That is a real gap, but no
-sudo-free signal measured here closes it, and wiring one is a separate story. Reproduce with
+**Consequence (as of GOV-B54).** The thermal trigger is unchanged: it still floors at
+`serious`, and on this chassis that is effectively never. The governor's budget does not
+account for a P-cluster running at half speed after the first minute of sustained load — it
+will grant the same concurrency to a machine delivering 56% of its throughput. Reproduce with
 `tools/clockprobe`, `sudo powermetrics -i 1000 --samplers cpu_power,thermal,tasks` and
 `go run ./tools/throttlecheck -pm … -marks … -run … [-probe …]`.
+
+**IOReport reads the throttle exactly, without sudo (GOV-B60, measured 2026-11-27).**
+`tools/clusterwatch` reads what the hardware counts rather than timing anything, so it needs no
+P-core:
+
+- **The clock**: IOReport's "CPU Stats" / "CPU Complex Performance States" channels give, per
+  cluster, cumulative 24 MHz ticks spent idle and in each DVFS state (`PCPU`: `IDLE` plus 15
+  states on the M1). Two samples a second apart, weighted by the frequencies in the IORegistry
+  `pmgr` entry's voltage-state tables, give the average active clock — the number powermetrics
+  prints as "HW active frequency". The table is matched to the cluster by state count
+  (`voltage-states5-sram`: 15 entries, 600–3204 MHz; `voltage-states1-sram`: 5, to 2064), not
+  by a hard-coded name, and a chip whose counts match no table or more than one is unknown.
+- **The temperature**: the hottest of the IOHID sensors named `pACC MTR Temp Sensor<n>`, the
+  P-cluster's own, ignoring readings outside 0–130 °C (some sensors report −21.6 °C
+  placeholders).
+
+Both run as an ordinary user with no entitlement. Both are private, so every symbol is
+resolved with `dlsym` at run time and every failure — library or symbol missing, no channel,
+an unmappable chip, a counter that went backwards, unparseable output — makes that second
+`unknown`, never a guess; thirteen such shapes are tested. Against run A3, a repeat of run A
+with powermetrics by hand:
+
+| | clockprobe (GOV-B54, run A2) | clusterwatch (run A3) |
+|---|---|---|
+| Busy seconds with a P-cluster reading | 21 of 1,774 (1%) | **1,773 of 1,773 (100%)** |
+| Error against powermetrics | median +90 MHz | **median 0, \|error\| 2 MHz** |
+| Correlation with powermetrics | 0.844 (21 s) | **0.995** (1,773 s) |
+| Saw the drop | no | **yes, the same second powermetrics did** |
+| Cost (of one core) | 0.50% mean | **0.23% mean, 0.38% max** |
+
+clusterwatch's own verdict put the drop at 27 s against powermetrics' 39 s, but only because
+its reference was the 3204 MHz single-second peak where powermetrics' 5-second median read
+2988; second by second the two agree to 2 MHz. A3 itself throttled less than A and A2 (to
+1823 MHz, 61%), and `thermalState` stayed nominal for all thirty minutes.
+
+**Temperature saturates, so it says "at the limit" but not how much.** The P-cluster went
+from 62 °C to 95 °C in 21 seconds and then held at 96–99 °C for the rest of the run while the
+clock fell from 3131 MHz (10–30 s) to 2381 (1–2 min), 2032 (5–10 min) and 1851 (20–30 min). The
+controller pins the die at its limit and pays for it in clock, so temperature correlates with
+the clock at only −0.08. It does lead — 95 °C arrived before the clock was 10% down — but a flag
+that is either on or off cannot say whether the machine is giving up 10% or 40%.
+
+**Decision: wire the clock, not the temperature.** IOReport frequency residency is the signal:
+it is exact against powermetrics, available every second however loaded the P-cores are, and
+costs a quarter of the sampler's budget. Temperature adds nothing the clock does not already
+show and is not wired. GOV-B61 wires the clock in behind the `Sampler` interface and decides
+what the budget does when the busy P-cluster runs slow. This story changes no budget behaviour;
+until GOV-B61 lands, the gap stated above stands.
 
 **The cgo constraint has a release consequence.** `CGO_ENABLED=0` on darwin builds cleanly and
 is thermally blind — it reports `unknown` on a Mac, silently, and looks precisely like a cool
