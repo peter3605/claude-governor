@@ -1343,6 +1343,27 @@ Why these choices:
   so the top, are that chip's own. Whether 0.78 suits a chip with a different multi-core cap is
   unmeasured; on a chip whose tables cannot be mapped the reading is unknown and the cut is off.
 
+**Verified on the M1 Air (GOV-B61, 2026-11-27).** This build's daemon, with this machine's
+calibrated config and `GOVERNOR_RUNQUEUE_MAX=1000` so the run-queue cut could not act and any
+cut had to be the clock's, in its own state directory beside the installed daemon:
+
+| Phase | P-cluster (busy seconds) | Budget | `daemon.log` |
+|---|---|---|---|
+| Idle, 5 min | never busy (8–15% active, 1060–1170 MHz) | 3, unchanged | — |
+| 8× FP load, 12 min | 2655 MHz (min 1) → 2173 → 1973 → 1777 (min 12), 0.55 of top | **1 from 67 s** | `cut 3->1 cause=clock … ceiling=3` at 67 s |
+| After, 3 min | idle | **3 again at 90 s** | `restore 1->3 cause=idle` |
+
+`governor status` read `cut clock (ceiling 3)` and `p-cluster 100% busy at 1813 MHz, 57% of its
+3204 MHz top` six minutes in; `thermalState` was nominal throughout and none of 1,204 clock
+readings was unknown. The 67 s matches the replay of runs A–A3 (61–92 s). Files:
+`docs/data/thermal-throttle/run-C-clockcut/`.
+
+With the run queue left on, as it is in normal use, it would have cut too: an earlier attempt
+at the same run recorded the run queue climbing to 26 per core by minute 11, as everything else
+on the machine (browser renderers holding a core between them) queued behind a P-cluster at
+half speed. The clock is first to see a sustained throttle, at about a minute; the run queue
+follows once the work it slows has piled up. Both name the same cut.
+
 **The cgo constraint has a release consequence.** `CGO_ENABLED=0` on darwin builds cleanly and
 is thermally blind — it reports `unknown` on a Mac, silently, and looks precisely like a cool
 machine. `make cross` builds exactly that binary, because a local cross-compile cannot link
