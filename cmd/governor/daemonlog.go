@@ -196,6 +196,7 @@ func daemonLogSink(stdout, stderr io.Writer, stateDir string) io.Writer {
 //
 //	cut 4->2 cause=run-queue rq=7.10 cut=6.59 ceiling=4
 //	cut 4->1 cause=thermal thermal=serious ceiling=4
+//	cut 3->1 cause=clock p_frac=0.774 cut=0.78 ceiling=3
 //	climb 2->3 cause=climb rq=3.20 climb=5.59 ceiling=4
 //	restore 1->4 cause=idle rq=0.40 climb=5.59 ceiling=4
 //	ceiling 4->6 cause=ceiling ceiling=4->6
@@ -214,6 +215,10 @@ func budgetLine(from, to int, cause string, c *budget.Controller, rq float64, th
 		return fmt.Sprintf("restore %d->%d cause=idle rq=%.2f climb=%.2f ceiling=%d", from, to, rq, c.ClimbAt(), c.Max)
 	case budget.MovedCeiling:
 		return fmt.Sprintf("ceiling %d->%d cause=ceiling ceiling=%d->%d", from, to, ceilingFrom, c.Max)
+	case budget.MovedClock:
+		// GOV-B61. p_frac is the windowed median the controller judged, against the table-top
+		// fraction it cuts under.
+		return fmt.Sprintf("cut %d->%d cause=clock p_frac=%.3f cut=%.2f ceiling=%d", from, to, c.ClockMedian(), budget.ClockCutFrac, c.Max)
 	case budget.MovedMemory:
 		return fmt.Sprintf("cut %d->%d cause=memory swapin=%.1fMB/s cut=%.1fMB/s ceiling=%d",
 			from, to, c.SwapIn()/1e6, budget.SwapInMax/1e6, c.Max)

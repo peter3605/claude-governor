@@ -356,6 +356,7 @@ func runTraceSample(stderr io.Writer) int {
 				CostMS:            s.CostMS,
 			},
 		}
+		rec.Sample.PMHz, rec.Sample.PActive, rec.Sample.PFrac, rec.Sample.PTopMHz = pclockFields(s.PClock)
 		if err := w.Write(rec); err != nil {
 			fmt.Fprintf(stderr, "governor trace sample: write: %v\n", err)
 		}
@@ -447,4 +448,14 @@ func swapInField(s signals.Sample) *float64 {
 	}
 	v := s.SwapInBytesPerSec
 	return &v
+}
+
+// pclockFields renders the P-cluster clock for a trace sample: four values when it was read,
+// four nils when it was not, so an unknown reading is absent from the record rather than a
+// zero that would read as a stopped clock.
+func pclockFields(p signals.PClock) (mhz, active, frac, top *float64) {
+	if !p.Known {
+		return nil, nil, nil, nil
+	}
+	return &p.MHz, &p.Active, &p.Frac, &p.TopMHz
 }

@@ -419,9 +419,12 @@ type statusReply struct {
 	// reported as two numbers rather than collapsed into one.
 	//
 	// These refresh every treeInterval rather than every tick; see sampleInterval.
-	TreeCPU      *float64     `json:"tree_cpu,omitempty"`
-	TreeCPURoots *float64     `json:"tree_cpu_roots,omitempty"`
-	Sources      []sourceStat `json:"sources"`
+	TreeCPU      *float64 `json:"tree_cpu,omitempty"`
+	TreeCPURoots *float64 `json:"tree_cpu_roots,omitempty"`
+	// PClock is the P-cluster's clock (GOV-B61, design.md section 5.3), absent until the
+	// first sample. Additive, no protocol bump, for the reason given above BinaryVersion.
+	PClock  *pclockStatus `json:"p_clock,omitempty"`
+	Sources []sourceStat  `json:"sources"`
 	// BinaryVersion is the version of the binary running this daemon, as `governor version`
 	// reports it. Additive like the governance fields below, and for the same reason: an
 	// older reader ignores what it does not know.
@@ -1299,6 +1302,9 @@ func (d *daemon) step(s signals.Sample, demand, inUse bool, away time.Duration) 
 			Stale:         !fresh,
 			SwapIn:        swapIn,
 			SwapInKnown:   s.SwapInKnown,
+			PClockKnown:   s.PClock.Known,
+			PClockActive:  s.PClock.Active,
+			PClockFrac:    s.PClock.Frac,
 		})
 		// Formatted under the lock, because it reads the controller. Written after it,
 		// because liveBudget takes this lock on every acquire and a file write does not
@@ -2216,6 +2222,27 @@ func (d *daemon) fillSignals(out *statusReply) {
 	out.SwapInBytesPerSec = &swapIn
 	out.TreeCPU = &treeCPU
 	out.TreeCPURoots = &treeRoots
+	pc := pclockStatusOf(s.PClock)
+	out.PClock = &pc
+}
+
+// pclockStatus is the P-cluster clock as the status reply carries it. Known false comes with
+// a Reason and no numbers: a machine that would not say is reported as such, not as a clock
+// of zero.
+type pclockStatus struct {
+	Known  bool    `json:"known"`
+	MHz    float64 `json:"mhz,omitempty"`
+	Active float64 `json:"active,omitempty"`
+	Frac   float64 `json:"frac,omitempty"`
+	TopMHz float64 `json:"top_mhz,omitempty"`
+	Reason string  `json:"reason,omitempty"`
+}
+
+func pclockStatusOf(p signals.PClock) pclockStatus {
+	if !p.Known {
+		return pclockStatus{Reason: p.Reason}
+	}
+	return pclockStatus{Known: true, MHz: p.MHz, Active: p.Active, Frac: p.Frac, TopMHz: p.TopMHz}
 }
 
 // sourceName names the binding source for the "source" wire field. With one source it is

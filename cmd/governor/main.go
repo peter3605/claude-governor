@@ -172,6 +172,9 @@ func printStatus(stdout io.Writer, c cachedStatus) {
 		fmt.Fprintf(stdout, "cpu %.2f\n", *v.CPU)
 	}
 	fmt.Fprintf(stdout, "thermal %s\n", v.Thermal)
+	if pc := c.Reply.PClock; pc != nil {
+		fmt.Fprintf(stdout, "p-cluster %s\n", pclockLine(*pc))
+	}
 	// THE PER-SESSION SHARES, which GOV-B01's acceptance criteria name and which this command
 	// did not print until it did. The machine-wide totals above answer "is the budget full";
 	// only this answers "full of whose work", which is the question somebody runs `status`
@@ -263,4 +266,20 @@ func usage(w io.Writer) {
 	for _, c := range commands {
 		fmt.Fprintf(w, "  %-11s %s\n", c.name, c.summary)
 	}
+}
+
+// pclockLine renders the P-cluster clock for `governor status`. Busy share comes first because
+// it is what makes the clock mean anything: an idle cluster clocks itself down by design, so
+// "1100 MHz" alone would read as a throttle that is not happening.
+func pclockLine(p pclockStatus) string {
+	if !p.Known {
+		if p.Reason == "" {
+			return "unknown"
+		}
+		return "unknown (" + p.Reason + ")"
+	}
+	if p.Active == 0 {
+		return "idle"
+	}
+	return fmt.Sprintf("%.0f%% busy at %.0f MHz, %.0f%% of its %.0f MHz top", 100*p.Active, p.MHz, 100*p.Frac, p.TopMHz)
 }

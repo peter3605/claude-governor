@@ -1,0 +1,10 @@
+budget 1
+in use 0
+slots held 0
+agents 0
+waiting 0
+cut clock (ceiling 3)
+cpu 1.00
+thermal nominal
+p-cluster 100% busy at 1813 MHz, 57% of its 3204 MHz top
+session 746f95dd-dc15-4311-845b-81793c4924ce weight 1 tentative 0 confirmed 0 registered with a daemon that has since been replaced

@@ -747,6 +747,8 @@ run_queue = loadavg1 / usable_cores
 
 if thermal is serious or critical:    B = B_min                # hard floor
 elif run_queue > 2.0:                 B = max(B_min, B // 2)   # multiplicative decrease
+elif clock slow:                      B = max(B_min, B // 2)   # clock cut (GOV-B61, §5.3)
+elif clock not yet clear after a cut: B = B                    # clock hysteresis: hold
 elif swap_in > SWAP_IN_MAX:           B = max(B_min, B // 2)   # memory cut (GOV-B53, §5.3a)
 elif memory clear < 30 ticks:         B = B                    # memory hysteresis: hold
 elif run_queue <= 1.5 and demand_waiting:
@@ -1258,13 +1260,15 @@ with powermetrics by hand:
 | Busy seconds with a P-cluster reading | 21 of 1,774 (1%) | **1,773 of 1,773 (100%)** |
 | Error against powermetrics | median +90 MHz | **median 0, \|error\| 2 MHz** |
 | Correlation with powermetrics | 0.844 (21 s) | **0.995** (1,773 s) |
-| Saw the drop | no | **yes, the same second powermetrics did** |
+| Saw the drop | no | **yes** (but read high above the all-core cap; see GOV-B61 below) |
 | Cost (of one core) | 0.50% mean | **0.23% mean, 0.38% max** |
 
-clusterwatch's own verdict put the drop at 27 s against powermetrics' 39 s, but only because
-its reference was the 3204 MHz single-second peak where powermetrics' 5-second median read
-2988; second by second the two agree to 2 MHz. A3 itself throttled less than A and A2 (to
-1823 MHz, 61%), and `thermalState` stayed nominal for all thirty minutes.
+clusterwatch's own verdict put the drop at 27 s against powermetrics' 39 s. GOV-B60 called
+that a reference artefact; GOV-B61 found it is a reading error, confined to the top of the
+range: for the first 21 fully-busy seconds clusterwatch read 3204 MHz where powermetrics read
+2988, and the 2 MHz median holds only below that (see *The all-core cap*, below). A3 itself
+throttled less than A and A2 (to 1823 MHz, 61%), and `thermalState` stayed nominal for all
+thirty minutes.
 
 **Temperature saturates, so it says "at the limit" but not how much.** The P-cluster went
 from 62 °C to 95 °C in 21 seconds and then held at 96–99 °C for the rest of the run while the
@@ -1278,7 +1282,87 @@ it is exact against powermetrics, available every second however loaded the P-co
 costs a quarter of the sampler's budget. Temperature adds nothing the clock does not already
 show and is not wired. GOV-B61 wires the clock in behind the `Sampler` interface and decides
 what the budget does when the busy P-cluster runs slow. This story changes no budget behaviour;
-until GOV-B61 lands, the gap stated above stands.
+GOV-B61's rule follows.
+
+**The all-core cap: IOReport reports the requested state (GOV-B61, measured 2026-11-27).**
+Comparing clusterwatch with powermetrics second by second over A3's opening: for the first 21
+fully-busy seconds IOReport put the P-cluster in its top DVFS state, 3204 MHz, while
+powermetrics reported 2988 — a steady +216 MHz. The per-core channels (`CPU Core Performance
+States`) say the same: all four cores in the top state with all four busy. The M1 delivers
+3204 only with one or two P-cores active and caps the cluster at 2988 with more, and IOReport
+reports the state requested, not the cap applied. Below the cap they agree: median |error| 3
+MHz over seconds 30–120, 2 MHz over the last twenty minutes. No unprivileged source reports the
+cap, and the voltage-state table does not mark it. So the sampler's `p_frac` is the clock over
+the TABLE TOP (3204, read from the silicon), a cool fully-busy M1 reads 1.00 where the truth is
+0.93, and every reading below 0.93 is exact. A throttle is by definition below the cap, so a
+cut level set under it is untouched by the error.
+
+**The clock cut (GOV-B61).** When the busy P-cluster runs slow, the budget is cut exactly the
+way the run queue cuts it: a new cause, `clock`, in the §5.2 loop.
+
+```
+# per tick: the P-cluster's contribution to a 60-tick window
+f = p_frac  if p_clock known and p_active >= 0.95
+f = 1.0     otherwise            # idle, or unknown: never slow, by construction
+
+clock slow  = median(f over the last 60 ticks) < 0.78     # cut:   B = max(B_min, B // 2)
+clock clear = median(f over the last 60 ticks) >= 0.84    # until clear after a cut: hold, no climb
+```
+
+The constants are the GOV-B54/B60 runs, not a guess (`docs/data/thermal-throttle/`). Below the
+cap IOReport and powermetrics agree, so powermetrics' per-second clock stands in for both.
+Holding a 60-second median of the busy clock below each candidate level:
+
+| Cut level | of table top | Run A | Run A2 | Run A3 | Run B (real build fan-out) |
+|---|---|---|---|---|---|
+| 2689 MHz (GOV-B54's "90% of 2988") | 0.84 | cut at 60 s | 60 s | 69 s | **6 cuts**, 148 s held |
+| **2500 MHz** | **0.78** | **60 s** | **70 s** | **90 s** | **never** |
+| 2390 MHz | 0.75 | 69 s | 84 s | 115 s | never |
+
+0.78 is the highest level that never cut during the build fan-out, which loses about 15% in
+bursts and recovers between them — the governor's ordinary load, which this cut must not
+fight. It still catches every saturating run within 90 s and holds through all thirty
+minutes. Clearing at 0.84, the old 90%-of-2988 line, is the hysteresis: a clock hovering at the
+cut level does not flap the budget.
+
+Why these choices:
+
+- **A cut, not a ceiling scale.** It is the same machinery, wording and AIMD shape as the run
+  queue's — `cut clock (ceiling N)` in `governor status`, `cause=clock` in `daemon.log` — and a
+  ceiling scale would need the all-core cap, which nothing unprivileged reports. On this Air
+  (ceiling 3) both land at one slot within two ticks of a sustained throttle. Decided with
+  Peter, 2026-11-27.
+- **Composes by OR** with the run queue, swap-in and thermal: any cause cuts, and the budget
+  climbs only when none is holding it. The clock sees what those cannot (CPU 0.998 and a run
+  queue under its cut throughout run A); it does not replace them.
+- **Only a busy cluster counts.** An idle P-cluster clocks itself down to 600–1400 MHz by
+  design; counting it would cut an idle machine. Below 95% active, a tick contributes 1.0.
+- **Unknown never cuts.** Linux, a CGO_ENABLED=0 build, a macOS without IOReport and every
+  failed read contribute 1.0, the way thermal's `unknown` is nominal.
+- **Relative to the table top, which comes from the machine.** On another chip the table, and
+  so the top, are that chip's own. Whether 0.78 suits a chip with a different multi-core cap is
+  unmeasured; on a chip whose tables cannot be mapped the reading is unknown and the cut is off.
+
+**Verified on the M1 Air (GOV-B61, 2026-11-27).** This build's daemon, with this machine's
+calibrated config and `GOVERNOR_RUNQUEUE_MAX=1000` so the run-queue cut could not act and any
+cut had to be the clock's, in its own state directory beside the installed daemon:
+
+| Phase | P-cluster (busy seconds) | Budget | `daemon.log` |
+|---|---|---|---|
+| Idle, 5 min | never busy (8–15% active, 1060–1170 MHz) | 3, unchanged | — |
+| 8× FP load, 12 min | 2655 MHz (min 1) → 2173 → 1973 → 1777 (min 12), 0.55 of top | **1 from 67 s** | `cut 3->1 cause=clock … ceiling=3` at 67 s |
+| After, 3 min | idle | **3 again at 90 s** | `restore 1->3 cause=idle` |
+
+`governor status` read `cut clock (ceiling 3)` and `p-cluster 100% busy at 1813 MHz, 57% of its
+3204 MHz top` six minutes in; `thermalState` was nominal throughout and none of 1,204 clock
+readings was unknown. The 67 s matches the replay of runs A–A3 (61–92 s). Files:
+`docs/data/thermal-throttle/run-C-clockcut/`.
+
+With the run queue left on, as it is in normal use, it would have cut too: an earlier attempt
+at the same run recorded the run queue climbing to 26 per core by minute 11, as everything else
+on the machine (browser renderers holding a core between them) queued behind a P-cluster at
+half speed. The clock is first to see a sustained throttle, at about a minute; the run queue
+follows once the work it slows has piled up. Both name the same cut.
 
 **The cgo constraint has a release consequence.** `CGO_ENABLED=0` on darwin builds cleanly and
 is thermally blind — it reports `unknown` on a Mac, silently, and looks precisely like a cool

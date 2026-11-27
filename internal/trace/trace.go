@@ -191,6 +191,17 @@ type Sample struct {
 	// API. Unknown is not a hot machine and must never be read as one.
 	Thermal string `json:"thermal"`
 
+	// PMHz is the P-cluster's average active clock (IOReport residency, GOV-B61), PActive how
+	// much of the second the cluster was busy, and PFrac PMHz over PTopMHz, the top of this
+	// machine's DVFS table. All four are absent where the reading is unknown — Linux, a
+	// CGO_ENABLED=0 build, a failed read — and absent is not zero: an unread clock is not a
+	// stopped one. A low PMHz means something only when PActive is high; an idle cluster
+	// clocks down by design.
+	PMHz    *float64 `json:"p_mhz,omitempty"`
+	PActive *float64 `json:"p_active,omitempty"`
+	PFrac   *float64 `json:"p_frac,omitempty"`
+	PTopMHz *float64 `json:"p_top_mhz,omitempty"`
+
 	// ClaudeRoots is the number of `claude` session processes.
 	ClaudeRoots int `json:"claude_roots"`
 	// ClaudeProcs is ClaudeRoots plus every transitive descendant.
@@ -211,6 +222,11 @@ type Sample struct {
 
 // RecordV is the current record schema version.
 //
+// Bumped to 5 by GOV-B61, which added the P-cluster clock (p_mhz, p_active, p_frac,
+// p_top_mhz) to samples. Backward compatible; versioned because "no clock before this line"
+// is a fact about the instrument, not a machine that never throttled — which every trace
+// before it says of a machine that did.
+//
 // Bumped to 4 by GOV-B53, which added swap_in_bytes_per_sec to samples. Backward compatible
 // like the bumps before it, and versioned for the same reason: before v4 no trace carried
 // swap-in at all — and on darwin the sampler could not read it — so "no swap-in before this
@@ -228,7 +244,7 @@ type Sample struct {
 // every v1 field means what it always did — but the file is read as a whole by Phase 0
 // analysis and "no PostToolUse records before this line" is a fact about the instrument
 // rather than about the machine. That distinction is the entire reason this field exists.
-const RecordV = 4
+const RecordV = 5
 
 // StateDir is the directory holding the governor's state, per design.md section 13.3.
 func StateDir() (string, error) {

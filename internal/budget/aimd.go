@@ -1,6 +1,9 @@
 package budget
 
-import "math"
+import (
+	"math"
+	"sort"
+)
 
 // The control loop (design.md section 5.2, GOV-15 clauses 2 and 3).
 //
@@ -54,7 +57,45 @@ type Reading struct {
 	// SwapInKnown is whether SwapIn was read at all. False never cuts: an unreadable memory
 	// signal fails open (GOV-B53 clause 5), the way thermal's `unknown` is nominal.
 	SwapInKnown bool
+	// PClockKnown, PClockActive and PClockFrac are the P-cluster clock (GOV-B61): whether it
+	// was read, how busy the cluster was, and its clock over the top of this machine's DVFS
+	// table. See ClockCutFrac. Unknown, or a cluster under ClockBusyActive, never cuts.
+	PClockKnown  bool
+	PClockActive float64
+	PClockFrac   float64
 }
+
+// ClockCutFrac is the P-cluster clock, as a fraction of the DVFS table top, below which a
+// sustained throttle cuts the budget (GOV-B61, design.md section 5.3).
+//
+// MEASURED, from GOV-B54 and GOV-B60's runs (docs/data/thermal-throttle/). Holding a
+// 60-second median of the busy P-cluster clock under each candidate level:
+//
+//	2689 MHz (0.84)  saturating runs cut at 60-69 s   real build fan-out: 6 cuts
+//	2500 MHz (0.78)  saturating runs cut at 60-90 s   real build fan-out: never
+//	2390 MHz (0.75)  saturating runs cut at 69-115 s  real build fan-out: never
+//
+// 0.78 is the highest level that never cut during the build fan-out — the governor's ordinary
+// load, which loses ~15% in bursts and recovers between them — and it still catches every
+// saturating run within 90 s. It is a fraction of the TABLE top (3204 MHz on the M1) because
+// that is what the machine reports: IOReport shows the requested state, so a cool, fully busy
+// M1 reads 1.00 although the hardware caps it at 2988 (0.93). The level is under that cap,
+// where the reading is exact.
+const ClockCutFrac = 0.78
+
+// ClockClearFrac is the level the median must regain before a clock cut stops holding the
+// budget: GOV-B54's "90% of 2988" line, 2689 MHz on the M1. The gap to ClockCutFrac is the
+// hysteresis that keeps a clock hovering at the cut level from flapping the budget.
+const ClockClearFrac = 0.84
+
+// ClockWindowTicks is the median window. 60 s is the "sustained" of GOV-B54's throttle
+// verdict, long enough that a build's bursts (which recover between them) do not cut.
+const ClockWindowTicks = 60
+
+// ClockBusyActive is how busy the P-cluster must be for its clock to count. An idle cluster
+// clocks itself down to 600-1400 MHz by design; below this a tick contributes 1.0, so an idle
+// machine can never read as a throttled one.
+const ClockBusyActive = 0.95
 
 // Setpoint is the host utilisation the loop aims to sit under.
 //
@@ -381,7 +422,56 @@ type Controller struct {
 	// woke is the budget a wake restored on the most recent Step, or zero when that Step
 	// restored nothing. See Woke.
 	woke int
+
+	// clockWin is the last ClockWindowTicks contributions of the P-cluster clock, a ring
+	// indexed by clockAt; clockFull says it has been initialised to 1.0, which is what lets a
+	// fresh daemon need a majority of genuinely slow ticks before it can cut. clockHeld is set
+	// by a clock cut and cleared when the median regains ClockClearFrac. clockMed is the most
+	// recent median, for the log line.
+	clockWin  [ClockWindowTicks]float64
+	clockAt   int
+	clockFull bool
+	clockHeld bool
+	clockMed  float64
 }
+
+// ClockMedian is the windowed P-cluster clock fraction the most recent Step judged, for the
+// daemon's log line. 1.0 when nothing slow has been seen.
+func (c *Controller) ClockMedian() float64 { return c.clockMed }
+
+// clockContribution is one tick's entry in the window: the clock fraction when the cluster was
+// read and busy, 1.0 otherwise. Unknown and idle are never slow, by construction, rather than
+// by a branch someone could later forget.
+func clockContribution(r Reading) float64 {
+	if !r.PClockKnown || r.PClockActive < ClockBusyActive || r.PClockFrac <= 0 {
+		return 1.0
+	}
+	return r.PClockFrac
+}
+
+func (c *Controller) resetClock() {
+	for i := range c.clockWin {
+		c.clockWin[i] = 1.0
+	}
+	c.clockAt, c.clockFull, c.clockHeld, c.clockMed = 0, true, false, 1.0
+}
+
+// observeClock pushes this tick and returns the window's median.
+func (c *Controller) observeClock(r Reading) float64 {
+	if !c.clockFull {
+		c.resetClock()
+	}
+	c.clockWin[c.clockAt] = clockContribution(r)
+	c.clockAt = (c.clockAt + 1) % ClockWindowTicks
+	w := c.clockWin
+	sort.Float64s(w[:])
+	c.clockMed = (w[ClockWindowTicks/2-1] + w[ClockWindowTicks/2]) / 2
+	return c.clockMed
+}
+
+// ClockSlow is the clock cut's condition, exported for the same reason Cutting is: the
+// branch the controller takes and anything that reports on it read one definition.
+func ClockSlow(median float64) bool { return median < ClockCutFrac }
 
 // The causes Moved reports. They are the vocabulary of the daemon's budget log (GOV-B29),
 // where each one is the answer to "what did that": a line with no cause is a line nobody
@@ -394,6 +484,7 @@ const (
 	MovedCeiling  = "ceiling"   // the ceiling moved and carried the budget with it
 	MovedWake     = "wake"      // the machine slept; a pre-sleep cut does not survive it (GOV-B48)
 	MovedMemory   = "memory"    // swap-in crossed SwapInMax: multiplicative decrease (GOV-B53)
+	MovedClock    = "clock"     // the busy P-cluster ran under ClockCutFrac: multiplicative decrease (GOV-B61)
 )
 
 // Moved names what changed the budget on the last Step, or "" if it did not change.
@@ -421,7 +512,7 @@ func (c *Controller) ClimbAt() float64 { return c.climbRunQueue() }
 func (c *Controller) SwapIn() float64 { return c.swapIn }
 
 // Cut names the signal currently holding the budget below its ceiling: "run queue",
-// "thermal", "memory", or "" when nothing is.
+// "thermal", "memory", "clock", or "" when nothing is.
 func (c *Controller) Cut() string {
 	if !c.started || c.b >= c.Max {
 		return ""
@@ -617,6 +708,15 @@ func (c *Controller) Step(r Reading) int {
 	if r.Woke {
 		// Whether or not anything was restored: the swap-in that follows a wake is the wake.
 		c.memGrace = MemoryWakeGraceTicks
+		// And the clock window describes the machine before it slept. A pre-sleep cut does
+		// not survive the sleep (GOV-B48), so neither does the evidence for one.
+		c.resetClock()
+	}
+	clockSlow := ClockSlow(c.observeClock(r))
+	if clockSlow {
+		c.clockHeld = true
+	} else if c.clockMed >= ClockClearFrac {
+		c.clockHeld = false
 	}
 	c.swapIn = r.SwapIn
 	pressed := false
@@ -633,7 +733,7 @@ func (c *Controller) Step(r Reading) int {
 	memHeld := !pressed && c.memClear < MemoryClearTicks
 
 	climbing := !r.Stale && Climbing(r, c.climbRunQueue())
-	idle := climbing && !r.DemandWaiting && !r.InUse && !r.ThermalSevere && !pressed && !memHeld
+	idle := climbing && !r.DemandWaiting && !r.InUse && !r.ThermalSevere && !pressed && !memHeld && !c.clockHeld
 	if idle {
 		c.quiet++
 	} else {
@@ -683,6 +783,17 @@ func (c *Controller) Step(r Reading) int {
 		}
 		c.cut = "run queue"
 		mark(MovedRunQueue)
+	case clockSlow:
+		// MULTIPLICATIVE DECREASE ON THE CLOCK (GOV-B61): the P-cluster has run under
+		// ClockCutFrac for most of a minute while busy. CPU and the run queue cannot see this
+		// — a throttled core is still a busy core — so it is its own cause. After the run
+		// queue, so a tick both would cut halves once and names the setpoint, as memory does.
+		c.b = c.b / 2
+		if c.b < Floor {
+			c.b = Floor
+		}
+		c.cut = "clock"
+		mark(MovedClock)
 	case pressed:
 		// MULTIPLICATIVE DECREASE ON MEMORY, the same halving as the run queue's and for the
 		// same reason. It sits after the run-queue case so that a tick both signals would cut
@@ -702,6 +813,10 @@ func (c *Controller) Step(r Reading) int {
 	case memHeld:
 		// Coming back from a memory cut: hold until swap-in has been quiet for
 		// MemoryClearTicks. Memory is still what keeps the budget here, so the cut stays named.
+	case c.clockHeld:
+		// Coming back from a clock cut: hold until the median regains ClockClearFrac. The
+		// clock is what keeps the budget here.
+		c.cut = "clock"
 	case climbing && r.DemandWaiting:
 		// DemandWaiting gates the increase while the machine is in use: do not climb when
 		// nobody is asking, or the next arrival gets room the loop never saw the machine cope
@@ -728,7 +843,7 @@ func (c *Controller) Step(r Reading) int {
 	default:
 		// The hold band: busy and coping. If memory cut the budget and has since cleared, it is
 		// the run queue that holds it here now, and the name follows what holds it (GOV-46).
-		if c.cut == "memory" {
+		if c.cut == "memory" || c.cut == "clock" {
 			c.cut = "run queue"
 		}
 	}

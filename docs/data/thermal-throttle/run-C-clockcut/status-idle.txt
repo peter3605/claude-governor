@@ -1,0 +1,9 @@
+budget 3
+in use 0
+slots held 0
+agents 0
+waiting 0
+cpu 0.17
+thermal nominal
+p-cluster 8% busy at 1173 MHz, 37% of its 3204 MHz top
+session 746f95dd-dc15-4311-845b-81793c4924ce weight 1 tentative 0 confirmed 0 registered with a daemon that has since been replaced

@@ -56,6 +56,16 @@ type Sample struct {
 	// macOS — and nothing could tell.
 	SwapInKnown bool
 
+	// PClock is the performance cluster's average active clock and how busy it was, from
+	// IOReport frequency residency (GOV-B61, design.md section 5.3). Known is false on Linux,
+	// in a CGO_ENABLED=0 build, on the priming tick, and on any failure; false never cuts.
+	//
+	// It is the reading that sees a throttle nothing else here can: under sustained load the
+	// P-cluster runs at half speed within a minute while CPU, RunQueue and Thermal all read as
+	// they would on a cool machine. A low MHz means something only when Active is high: an
+	// idle cluster clocks itself down by design.
+	PClock PClock
+
 	// The fields below are the raw readings the derived ones above are computed from.
 	// They are recorded rather than discarded because Phase 0's whole purpose is to tune
 	// the setpoint against real traces (design.md section 5.2), and a trace that stores
